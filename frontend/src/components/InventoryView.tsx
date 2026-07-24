@@ -11,6 +11,7 @@ import {
   type InventoryOptimization,
 } from "../api";
 import { AzureIcon, friendlyLocation, friendlyResourceType } from "./AzureIcon";
+import { AutopilotModal } from "./AutopilotModal";
 import { INVENTORY_NAV, type InventoryTab } from "./navConfig";
 import { DnsDebugModal } from "./DnsDebugModal";
 import { formatError } from "../utils/format";
@@ -1262,6 +1263,8 @@ function DetailDrawer({
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [dnsDebug, setDnsDebug] = useState(false);
+  // Seed-mode Autopilot: trace the workload this resource belongs to.
+  const [seedTrace, setSeedTrace] = useState(false);
   const r = resource;
 
   // Reset transient state when switching resources.
@@ -1379,6 +1382,13 @@ function DetailDrawer({
               </Field>
 
               <a href={portalUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 text-[12px] font-medium text-gray-600 hover:bg-gray-50">↗ Open in Azure Portal</a>
+              <button
+                onClick={() => setSeedTrace(true)}
+                title="Reverse-engineer the workload this resource belongs to"
+                className="ml-2 inline-flex items-center gap-1 rounded-lg border border-brand/40 px-3 py-1.5 text-[12px] font-medium text-brand hover:bg-brand/5"
+              >
+                🎯 Find its workload
+              </button>
               {peEligible && (
                 <button onClick={() => setDnsDebug(true)} className="ml-2 inline-flex items-center gap-1 rounded-lg border border-sky-300 bg-sky-50 px-3 py-1.5 text-[12px] font-medium text-sky-700 hover:bg-sky-100">🧭 Debug resolution</button>
               )}
@@ -1392,6 +1402,9 @@ function DetailDrawer({
       </div>
       {dnsDebug && (
         <DnsDebugModal architectureId="" preset={{ fqdn: r.name }} onClose={() => setDnsDebug(false)} />
+      )}
+      {seedTrace && (
+        <AutopilotModal seedResourceId={r.id} onClose={() => setSeedTrace(false)} onSaved={() => setSeedTrace(false)} />
       )}
     </div>
   );

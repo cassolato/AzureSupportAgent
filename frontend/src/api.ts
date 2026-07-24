@@ -10069,6 +10069,14 @@ export interface SculptConfig {
   confidence_floor?: number;
   max_ai_calls?: number;
   naming_hint?: string;
+  // ---- Seed mode (scope_kind="resource"): one resource id -> one workload ----
+  seed_resource_id?: string;
+  max_hops?: number;
+  threshold?: number;
+  hub_fanin?: number;
+  edge_kinds?: string[];
+  include_ids?: string[];
+  use_ai?: boolean;
 }
 
 export interface DiscoveryProfile {
@@ -10147,6 +10155,162 @@ export async function streamSurvey(
       if (event === "status") handlers.onStatus?.(parsed as { phase: string; message: string });
       else if (event === "survey") handlers.onSurvey?.(parsed as unknown as SurveyResult);
       else if (event === "error") handlers.onError?.((parsed.message as string) ?? "Survey failed.");
+    }
+  }
+}
+
+// === Seed-resource trace (bottom-up Autopilot) =============================
+// Given ONE resource id, the backend follows typed relationships outward and returns a
+// scored dependency graph: which resources belong to the same workload, which are merely
+// borderline, and which are shared platform infrastructure that must never be traversed.
+
+/** A weighted relationship between two resources in a seed trace. */
+export interface TraceEdge {
+  source: string;
+  target: string;
+  kind: string;
+  detail: string;
+  weight: number;
+}
+
+export interface TraceEvidence {
+  kind: string;
+  label: string;
+  detail: string;
+}
+
+export type TraceBucket = "member" | "borderline" | "shared" | "excluded";
+
+/** One resource reached by the trace, with its score, distance and supporting evidence. */
+export interface TraceNode {
+  id: string;
+  name: string;
+  resource_type: string;
+  resource_group: string;
+  subscription_id: string;
+  location: string;
+  score: number;
+  hop: number;
+  shared: boolean;
+  bucket: TraceBucket;
+  fanin: number;
+  is_seed: boolean;
+  path: string[];
+  evidence: TraceEvidence[];
+  capped?: boolean;
+}
+
+export interface TraceSeed {
+  id: string;
+  name: string;
+  resource_type: string;
+  resource_group: string;
+  subscription_id: string;
+  location: string;
+  tags: Record<string, string>;
+}
+
+export interface TraceStats {
+  members: number;
+  borderline: number;
+  shared: number;
+  excluded: number;
+  edges: number;
+  hubs: number;
+  universe: number;
+  max_hops: number;
+  threshold: number;
+}
+
+export interface TraceExistingWorkload {
+  id: string;
+  name: string;
+  overlap: number;
+  owns_seed: boolean;
+  new_resources: number;
+}
+
+export interface TraceResult {
+  seed: TraceSeed;
+  nodes: TraceNode[];
+  edges: TraceEdge[];
+  stats: TraceStats;
+  edge_kinds: { kind: string; label: string; weight: number }[];
+  existing_workload: TraceExistingWorkload | null;
+  meta: { max_hops: number; threshold: number; preset: string; universe: number };
+}
+
+export interface TraceHandlers {
+  onStatus?: (data: { phase: string; message: string; [k: string]: unknown }) => void;
+  onTrace?: (data: TraceResult) => void;
+  onError?: (msg: string) => void;
+}
+
+/** Stream the seed dependency trace (read-only, no AI) over SSE. */
+export async function streamTrace(
+  body: {
+    connection_id: string;
+    seed_resource_id: string;
+    preset?: string;
+    max_hops?: number;
+    threshold?: number;
+    hub_fanin?: number;
+    edge_kinds?: string[];
+  },
+  handlers: TraceHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/workloads/autopilot/trace`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    credentials: "include",
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b?.detail) detail = b.detail;
+    } catch {
+      /* ignore */
+    }
+    handlers.onError?.(detail);
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    let value: Uint8Array | undefined;
+    let done = false;
+    try {
+      ({ value, done } = await reader.read());
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
+      throw err;
+    }
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split(/\r\n\r\n|\n\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const rawLine of frame.split(/\r\n|\n/)) {
+        if (rawLine.startsWith("event:")) event = rawLine.slice(6).trim();
+        else if (rawLine.startsWith("data:")) data += rawLine.slice(5).trim();
+      }
+      if (!data) continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (event === "status") handlers.onStatus?.(parsed as { phase: string; message: string });
+      else if (event === "trace") handlers.onTrace?.(parsed as unknown as TraceResult);
+      else if (event === "error") handlers.onError?.((parsed.message as string) ?? "Trace failed.");
     }
   }
 }

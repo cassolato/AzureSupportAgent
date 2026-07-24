@@ -18,7 +18,13 @@ from app.core.azure_connections import resolve_connection
 from app.core.security import Principal, require_permission
 from app.workloads import discovery, discovery_profiles
 from app.workloads import registry as wl_registry
-from app.workloads.autopilot import compute_estimate, discover_workloads, survey_estate
+from app.workloads.autopilot import (
+    compute_estimate,
+    discover_from_seed,
+    discover_workloads,
+    survey_estate,
+    trace_from_seed,
+)
 from app.workloads.cache import discovery_cache
 
 router = APIRouter(prefix="/workloads", tags=["workloads"])
@@ -722,6 +728,14 @@ class AutopilotRequest(BaseModel):
     confidence_floor: float = 0.0             # hide candidates below this confidence
     max_ai_calls: int = 0                     # budget cap (0 = unbounded)
     naming_hint: str = ""                     # naming convention pattern for the prompt
+    # ---- Seed mode (scope_kind="resource"): reverse-engineer ONE workload from one id ----
+    seed_resource_id: str = ""                # the ARM id to trace outward from
+    max_hops: int = 0                         # 0 = take the preset's value
+    threshold: float = 0.0                    # link-strength floor (0 = preset)
+    hub_fanin: int = 0                        # shared-platform fan-in limit (0 = default)
+    edge_kinds: list[str] = Field(default_factory=list)   # empty = all relationship kinds
+    include_ids: list[str] = Field(default_factory=list)  # the user's explicit selection
+    use_ai: bool = True                       # AI naming/classification (off = deterministic)
 
 
 class SurveyRequest(BaseModel):
@@ -777,6 +791,46 @@ async def autopilot_estimate_endpoint(
     return result
 
 
+class TraceRequest(BaseModel):
+    """Pre-flight for SEED mode: trace outward from one resource id (read-only, no AI)."""
+
+    connection_id: str = ""
+    seed_resource_id: str = ""
+    preset: str = "balanced"   # tight | balanced | wide
+    max_hops: int = 0
+    threshold: float = 0.0
+    hub_fanin: int = 0
+    edge_kinds: list[str] = Field(default_factory=list)
+
+
+@router.post("/autopilot/trace")
+async def autopilot_trace_endpoint(
+    payload: TraceRequest, _: Principal = Depends(get_principal)
+):
+    """Stream the seed dependency trace: status events then one `trace` event (no AI)."""
+    conn = resolve_connection(payload.connection_id or None)
+    if not conn:
+        raise HTTPException(status_code=400, detail="Pick an Azure connection first.")
+    if not payload.seed_resource_id.strip():
+        raise HTTPException(status_code=400, detail="Provide a seed resource id.")
+
+    async def _gen():
+        try:
+            async for ev in trace_from_seed(
+                conn, payload.seed_resource_id,
+                preset=payload.preset, max_hops=payload.max_hops,
+                threshold=payload.threshold, hub_fanin=payload.hub_fanin,
+                edge_kinds=payload.edge_kinds,
+            ):
+                ev_type = ev.pop("type")
+                yield {"event": ev_type, "data": json.dumps(ev)}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Autopilot seed trace failed")
+            yield {"event": "error", "data": json.dumps({"message": str(exc)[:300]})}
+
+    return EventSourceResponse(_gen())
+
+
 @router.post("/autopilot/discover")
 async def autopilot_discover_endpoint(
     payload: AutopilotRequest, _: Principal = Depends(get_principal)
@@ -785,6 +839,29 @@ async def autopilot_discover_endpoint(
     conn = resolve_connection(payload.connection_id or None)
     if not conn:
         raise HTTPException(status_code=400, detail="Pick an Azure connection first.")
+
+    # Seed mode is a separate bottom-up code path: one resource id -> one workload.
+    if payload.scope_kind == "resource":
+        seed_id = payload.seed_resource_id or payload.scope_id
+        if not seed_id.strip():
+            raise HTTPException(status_code=400, detail="Provide a seed resource id.")
+
+        async def _seed_gen():
+            try:
+                async for ev in discover_from_seed(
+                    conn, seed_id,
+                    preset=payload.preset or "balanced", max_hops=payload.max_hops,
+                    threshold=payload.threshold, hub_fanin=payload.hub_fanin,
+                    edge_kinds=payload.edge_kinds, include_ids=payload.include_ids,
+                    use_ai=payload.use_ai,
+                ):
+                    ev_type = ev.pop("type")
+                    yield {"event": ev_type, "data": json.dumps(ev)}
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Autopilot seed discovery failed")
+                yield {"event": "error", "data": json.dumps({"message": str(exc)[:300]})}
+
+        return EventSourceResponse(_seed_gen())
 
     async def _gen():
         try:
