@@ -15,6 +15,8 @@ from typing import Any, AsyncIterator
 
 from app.agent.factory import build_provider_for
 from app.workloads import discovery, grouping_memory, sculpt
+from app.workloads import seed as seed_mod
+from app.workloads import seed_links
 from app.workloads.summarize import friendly_type, type_breakdown
 
 logger = logging.getLogger("app.workloads.autopilot")
@@ -75,6 +77,12 @@ async def _resolve_subs(connection: dict | None, scope_kind: str, scope_id: str)
         return subs, ""
     if scope_kind == "subscription":
         return [scope_id], ""
+    if scope_kind == "resource":
+        # Seed mode: the subscription is embedded in the seed's ARM id.
+        sub = seed_mod.arm_id_parts(scope_id).get("subscription_id", "")
+        if not sub:
+            return [], "That doesn't look like an Azure resource id."
+        return [sub], ""
     return [], "Autopilot runs at the subscription or management-group level."
 
 
@@ -1047,6 +1055,474 @@ def compute_estimate(
         "estimate": estimate,
         "filter_preview": {"kept": len(kept), "removed": len(resources) - len(kept), "reasons": reasons, "tag_seeded": seeded},
         "truncated": truncated,
+    }
+
+
+# ============================================================ seed-resource workload trace
+# Bottom-up discovery: start from ONE resource id and follow typed relationships outward
+# until the workload boundary is reached. Purely additive — the top-down scope flow above is
+# untouched; seed mode short-circuits before enumeration/sculpt/grouping ever runs.
+
+_TRACE_TTL = 900.0  # seconds
+_trace_cache: dict[str, tuple[float, dict[str, Any], dict[str, dict[str, Any]]]] = {}
+
+
+def _trace_key(tenant_id: str, connection_id: str, seed_id: str, max_hops: int) -> str:
+    return f"{tenant_id or 'default'}::{connection_id or ''}::{(seed_id or '').lower()}::{max_hops}"
+
+
+def _trace_cache_get(key: str) -> tuple[dict[str, Any], dict[str, dict[str, Any]]] | None:
+    import time
+
+    hit = _trace_cache.get(key)
+    if not hit:
+        return None
+    ts, raw, resources = hit
+    if time.monotonic() - ts > _TRACE_TTL:
+        _trace_cache.pop(key, None)
+        return None
+    return raw, resources
+
+
+def _trace_cache_put(key: str, raw: dict[str, Any], resources: dict[str, dict[str, Any]]) -> None:
+    import time
+
+    _trace_cache[key] = (time.monotonic(), raw, resources)
+    if len(_trace_cache) > 8:
+        oldest = sorted(_trace_cache.items(), key=lambda kv: kv[1][0])[:-8]
+        for k, _ in oldest:
+            _trace_cache.pop(k, None)
+
+
+def _seed_evidence(seedres: dict[str, Any], nodes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Aggregate the per-node trace evidence into workload-level evidence chips."""
+    from collections import Counter
+
+    out: list[dict[str, str]] = [{
+        "kind": "seed",
+        "detail": f"Traced from “{seedres.get('name', '?')}” ({friendly_type(seedres.get('resource_type'))})",
+    }]
+    counts: Counter[str] = Counter()
+    for n in nodes:
+        if n.get("is_seed"):
+            continue
+        for ev in n.get("evidence") or []:
+            counts[ev["kind"]] += 1
+    for kind, n in counts.most_common(4):
+        label = seed_mod.EDGE_LABELS.get(kind, kind).lower()
+        out.append({"kind": kind, "detail": f"{n} resource(s) linked by {label}"})
+    hops = max((int(n.get("hop", 0)) for n in nodes), default=0)
+    if hops:
+        out.append({"kind": "scope", "detail": f"Reached within {hops} relationship hop(s) of the seed"})
+    return out
+
+
+async def _ai_adjudicate_seed(
+    seedres: dict[str, Any],
+    members: list[dict[str, Any]],
+    borderline: list[dict[str, Any]],
+    shared: list[dict[str, Any]],
+    memory_hint: str = "",
+) -> dict[str, Any] | None:
+    """ONE LLM call: name + classify the traced workload and rule on the borderline members.
+
+    Grouping has already been decided by the trace, so the model's job is narrow: confirm or
+    reject the resources the crawl wasn't sure about, and label the result."""
+    def _lines(items: list[dict[str, Any]], base: int) -> str:
+        rows = []
+        for i, n in enumerate(items):
+            ev = "; ".join(e["detail"] for e in (n.get("evidence") or [])[:2])
+            rows.append(
+                f"[{base + i}] {n.get('name', '?')} | {friendly_type(n.get('resource_type'))} "
+                f"| rg={n.get('resource_group', '?')} | score={n.get('score', 0):.2f} "
+                f"| hop={n.get('hop', 0)}" + (f" | {ev}" if ev else "")
+            )
+        return "\n".join(rows)
+
+    sys_parts = [
+        "You are an Azure architect. A dependency trace started from ONE seed resource and "
+        "followed ARM id references, private endpoints, managed-identity role assignments, "
+        "deployment markers, tags, resource-group boundaries and naming to reverse-engineer "
+        "the WORKLOAD (application/product) that the seed belongs to.\n\n"
+        "The CONFIRMED members are already decided — do not remove them unless a resource is "
+        "obviously shared platform infrastructure. Your job is to:\n"
+        "1. Decide which BORDERLINE resources genuinely belong to this workload.\n"
+        "2. Give the workload a short, human, product-style name (not a resource name and not "
+        "a resource-group name if a better one exists).\n"
+        "3. Classify it.\n\n"
+        "SHARED PLATFORM resources (hub networking, central logging, shared DNS) are listed for "
+        "context only — never include them as members.\n\n"
+        'Reply with ONLY JSON: {"name": "...", "description": "...", "reasoning": "...", '
+        '"confidence": 0.0-1.0, "include_borderline": [indices], "exclude_members": [indices], '
+        '"workload_type": "...", "environment": "...", "criticality": "...", '
+        '"data_classification": "..."}',
+        _classify_ask(),
+    ]
+    if memory_hint:
+        sys_parts.append("\n\n" + memory_hint)
+
+    user = (
+        f"SEED: {seedres.get('name', '?')} | {friendly_type(seedres.get('resource_type'))} "
+        f"| rg={seedres.get('resource_group', '?')}\n\n"
+        f"CONFIRMED MEMBERS ({len(members)}, indices 0..{max(0, len(members) - 1)}):\n"
+        f"{_lines(members, 0) or '(none)'}\n\n"
+        f"BORDERLINE ({len(borderline)}, indices 1000..{1000 + max(0, len(borderline) - 1)}):\n"
+        f"{_lines(borderline, 1000) or '(none)'}\n\n"
+        f"SHARED PLATFORM (context only, {len(shared)}):\n"
+        f"{_lines(shared, 2000) or '(none)'}"
+    )
+    try:
+        text = await _complete([
+            {"role": "system", "content": "\n".join(sys_parts)},
+            {"role": "user", "content": user},
+        ])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Seed adjudication AI call failed: %s", exc)
+        return None
+    obj = _extract_json(text)
+    if not isinstance(obj, dict) or not obj.get("name"):
+        return None
+    try:
+        conf = float(obj.get("confidence", 0.7))
+    except (TypeError, ValueError):
+        conf = 0.7
+    return {
+        "name": str(obj.get("name", ""))[:120],
+        "description": str(obj.get("description", ""))[:400],
+        "reasoning": str(obj.get("reasoning", ""))[:800],
+        "confidence": max(0.0, min(1.0, conf)),
+        "include_borderline": [i - 1000 for i in (obj.get("include_borderline") or []) if _safe_int(i) >= 1000],
+        "exclude_members": [i for i in (obj.get("exclude_members") or []) if 0 <= _safe_int(i) < len(members)],
+        "workload_type": obj.get("workload_type"),
+        "environment": obj.get("environment"),
+        "criticality": obj.get("criticality"),
+        "data_classification": obj.get("data_classification"),
+    }
+
+
+async def _run_trace(
+    connection: dict | None,
+    seedres: dict[str, Any],
+    *,
+    max_hops: int,
+    tenant_id: str,
+    connection_id: str,
+    session: str | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[str]]:
+    """Collect (or reuse) the raw link graph for a seed. Returns ``(raw, resources, notes)``."""
+    key = _trace_key(tenant_id, connection_id, str(seedres.get("id", "")), max_hops)
+    cached = _trace_cache_get(key)
+    if cached is not None:
+        raw, resources = cached
+        return raw, resources, ["reused the cached trace"]
+    sub_ids, _err = await _resolve_subs(connection, "resource", str(seedres.get("id", "")))
+    resources, raw, notes = await seed_links.gather_universe(
+        connection, seedres, sub_ids, max_hops=max_hops, session=session
+    )
+    edges = seed_mod.build_edges(resources, raw)
+    raw = {**raw, "edges": edges}
+    _trace_cache_put(key, raw, resources)
+    return raw, resources, notes
+
+
+def _score_from_raw(
+    seed_id: str,
+    resources: dict[str, dict[str, Any]],
+    raw: dict[str, Any],
+    *,
+    max_hops: int,
+    threshold: float,
+    hub_fanin: int,
+    enabled_kinds: list[str] | None,
+) -> dict[str, Any]:
+    return seed_mod.score_graph(
+        seed_id, resources, raw.get("edges") or [],
+        max_hops=max_hops, threshold=threshold,
+        hub_fanin_limit=hub_fanin, enabled_kinds=enabled_kinds or None,
+    )
+
+
+async def trace_from_seed(
+    connection: dict | None,
+    resource_id: str,
+    *,
+    preset: str = "balanced",
+    max_hops: int = 0,
+    threshold: float = 0.0,
+    hub_fanin: int = 0,
+    edge_kinds: list[str] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """Stream a seed trace: status events, then ONE ``trace`` event with the scored graph.
+
+    No LLM is involved — this is the free pre-flight the user sculpts before naming."""
+    if connection is None:
+        yield {"type": "error", "message": "No Azure connection selected."}
+        return
+
+    cfg = seed_mod.preset_config(preset)
+    hops = int(max_hops or cfg["max_hops"])
+    thresh = float(threshold or cfg["threshold"])
+    fanin = int(hub_fanin or seed_mod.DEFAULT_HUB_FANIN)
+    tenant_id = connection.get("tenant_id", "") or "default"
+    connection_id = connection.get("id", "") or ""
+
+    yield _status("seed", "Resolving the seed resource…")
+    # A trace fires ~8-12 Resource Graph queries. ONE service-principal login is opened here
+    # and reused by every one of them — otherwise each query re-runs `az login` and the
+    # trace spends most of its wall clock authenticating.
+    from app.exec.command_runner import close_sp_session, open_sp_session
+
+    session, sess_err = await open_sp_session(connection)
+    try:
+        if sess_err:
+            yield {"type": "error", "message": sess_err}
+            return
+        seedres, err = await seed_links.resolve_seed(connection, resource_id, session=session)
+        if err or not seedres:
+            yield {"type": "error", "message": err or "Seed resource not found."}
+            return
+        yield _status(
+            "seed",
+            f"Seed: “{seedres.get('name')}” ({friendly_type(seedres.get('resource_type'))}) "
+            f"in resource group “{seedres.get('resource_group')}”.",
+            seed=seedres.get("id", ""),
+        )
+
+        yield _status("tracing", f"Following relationships up to {hops} hop(s) — references, private endpoints, identity grants, tags…")
+        raw, resources, notes = await _run_trace(
+            connection, seedres, max_hops=hops, tenant_id=tenant_id,
+            connection_id=connection_id, session=session,
+        )
+    finally:
+        close_sp_session(session)
+    for note in notes:
+        yield _status("tracing", f"Candidate universe — {note}.")
+    yield _status(
+        "tracing",
+        f"Built a {len(raw.get('edges') or [])}-edge graph over {len(resources)} candidate resource(s).",
+        universe=len(resources), edges=len(raw.get("edges") or []),
+    )
+
+    result = _score_from_raw(
+        str(seedres.get("id", "")).lower(), resources, raw,
+        max_hops=hops, threshold=thresh, hub_fanin=fanin, enabled_kinds=edge_kinds,
+    )
+    stats = result["stats"]
+    yield _status(
+        "scoring",
+        f"{stats['members']} member(s), {stats['borderline']} borderline, "
+        f"{stats['shared']} shared-platform dependency(ies).",
+        **{k: v for k, v in stats.items() if isinstance(v, (int, float))},
+    )
+
+    # Does the seed (or any proposed member) already live in a saved workload?
+    existing = _existing_workload_for(result["nodes"])
+    yield {
+        "type": "trace",
+        "seed": {
+            "id": seedres.get("id", ""),
+            "name": seedres.get("name", ""),
+            "resource_type": seedres.get("resource_type", ""),
+            "resource_group": seedres.get("resource_group", ""),
+            "subscription_id": seedres.get("subscription_id", ""),
+            "location": seedres.get("location", ""),
+            "tags": seedres.get("tags") or {},
+        },
+        "nodes": result["nodes"],
+        "edges": result["edges"],
+        "stats": stats,
+        "edge_kinds": [
+            {"kind": k, "label": seed_mod.EDGE_LABELS[k], "weight": seed_mod.EDGE_WEIGHTS[k]}
+            for k in seed_mod.EDGE_KINDS
+        ],
+        "existing_workload": existing,
+        "meta": {"max_hops": hops, "threshold": thresh, "preset": preset, "universe": len(resources)},
+    }
+
+
+def _existing_workload_for(nodes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The saved workload that already claims the seed (or most of the trace), if any."""
+    from app.workloads.registry import list_workloads
+
+    ids = {str(n.get("id", "")).lower() for n in nodes if n.get("bucket") == "member"}
+    seed_ids = {str(n.get("id", "")).lower() for n in nodes if n.get("is_seed")}
+    if not ids:
+        return None
+    best: dict[str, Any] | None = None
+    for wl in list_workloads():
+        owned = {
+            str(n.get("id", "")).lower()
+            for n in (wl.get("nodes") or [])
+            if n.get("kind") == "resource" and n.get("id")
+        }
+        overlap = owned & ids
+        if not overlap:
+            continue
+        entry = {
+            "id": wl.get("id", ""),
+            "name": wl.get("name", ""),
+            "overlap": len(overlap),
+            "owns_seed": bool(owned & seed_ids),
+            "new_resources": len(ids - owned),
+        }
+        if best is None or entry["overlap"] > best["overlap"] or (entry["owns_seed"] and not best["owns_seed"]):
+            best = entry
+    return best
+
+
+async def discover_from_seed(
+    connection: dict | None,
+    resource_id: str,
+    *,
+    preset: str = "balanced",
+    max_hops: int = 0,
+    threshold: float = 0.0,
+    hub_fanin: int = 0,
+    edge_kinds: list[str] | None = None,
+    include_ids: list[str] | None = None,
+    use_ai: bool = True,
+) -> AsyncIterator[dict[str, Any]]:
+    """Turn a seed trace into ONE workload candidate, optionally named/adjudicated by AI.
+
+    Emits the same ``status`` / ``candidate`` / ``done`` events as the top-down flow, so the
+    review + save path in the UI works unchanged."""
+    if connection is None:
+        yield {"type": "error", "message": "No Azure connection selected."}
+        return
+
+    cfg = seed_mod.preset_config(preset)
+    hops = int(max_hops or cfg["max_hops"])
+    thresh = float(threshold or cfg["threshold"])
+    fanin = int(hub_fanin or seed_mod.DEFAULT_HUB_FANIN)
+    tenant_id = connection.get("tenant_id", "") or "default"
+    connection_id = connection.get("id", "") or ""
+
+    yield _status("seed", "Resolving the seed resource…")
+    from app.exec.command_runner import close_sp_session, open_sp_session
+
+    session, sess_err = await open_sp_session(connection)
+    try:
+        if sess_err:
+            yield {"type": "error", "message": sess_err}
+            return
+        seedres, err = await seed_links.resolve_seed(connection, resource_id, session=session)
+        if err or not seedres:
+            yield {"type": "error", "message": err or "Seed resource not found."}
+            return
+
+        yield _status("tracing", "Rebuilding the dependency trace…")
+        raw, resources, _notes = await _run_trace(
+            connection, seedres, max_hops=hops, tenant_id=tenant_id,
+            connection_id=connection_id, session=session,
+        )
+    finally:
+        close_sp_session(session)
+    result = _score_from_raw(
+        str(seedres.get("id", "")).lower(), resources, raw,
+        max_hops=hops, threshold=thresh, hub_fanin=fanin, enabled_kinds=edge_kinds,
+    )
+    nodes = result["nodes"]
+    by_id = {str(n["id"]).lower(): n for n in nodes}
+
+    # The user's explicit selection (from the trace stage) wins over the scored buckets.
+    if include_ids:
+        wanted = {str(i).lower() for i in include_ids}
+        chosen = [by_id[i] for i in wanted if i in by_id]
+        borderline: list[dict[str, Any]] = []
+    else:
+        chosen = [n for n in nodes if n["bucket"] == "member"]
+        borderline = [n for n in nodes if n["bucket"] == "borderline"]
+    shared_nodes = [n for n in nodes if n["bucket"] == "shared"]
+    # The seed is always part of its own workload.
+    if not any(n.get("is_seed") for n in chosen):
+        seed_node = next((n for n in nodes if n.get("is_seed")), None)
+        if seed_node:
+            chosen.insert(0, seed_node)
+    if not chosen:
+        yield {"type": "done", "candidates": [], "meta": {"resource_count": 0, "seed": seedres.get("id", ""), "used_ai": False}}
+        return
+
+    yield _status("grouping", f"{len(chosen)} resource(s) selected for the workload.")
+
+    name = seed_mod.default_name(seedres, chosen)
+    description = f"Workload reverse-engineered from “{seedres.get('name')}”."
+    reasoning = (
+        f"Traced {len(chosen)} resource(s) within {hops} hop(s) of the seed using ARM id "
+        f"references, private endpoints, identity grants, deployment markers, tags and naming."
+    )
+    confidence = 0.75
+    workload_type = ""
+    environment = ""
+    criticality = ""
+    data_classification = ""
+    used_ai = False
+
+    if use_ai:
+        yield _status("grouping", "Naming and classifying the workload with AI…")
+        memory_hint = grouping_memory.prompt_hint(tenant_id, connection_id)
+        verdict = await _ai_adjudicate_seed(seedres, chosen, borderline, shared_nodes, memory_hint)
+        if verdict:
+            used_ai = True
+            name = verdict["name"] or name
+            description = verdict["description"] or description
+            reasoning = verdict["reasoning"] or reasoning
+            confidence = verdict["confidence"]
+            workload_type = _norm_class(verdict.get("workload_type"), VALID_TYPES, "")
+            environment = _norm_class(verdict.get("environment"), VALID_ENVS, "")
+            criticality = _norm_class(verdict.get("criticality"), VALID_CRIT, "")
+            data_classification = _norm_class(
+                verdict.get("data_classification"), ("confidential", "internal", "public", "unknown"), ""
+            )
+            dropped = {i for i in verdict["exclude_members"] if 0 <= i < len(chosen)}
+            added = [borderline[i] for i in verdict["include_borderline"] if 0 <= i < len(borderline)]
+            if dropped:
+                chosen = [n for i, n in enumerate(chosen) if i not in dropped or n.get("is_seed")]
+                yield _status("grouping", f"AI excluded {len(dropped)} resource(s) as shared platform or unrelated.", excluded=len(dropped))
+            if added:
+                chosen = chosen + added
+                yield _status("grouping", f"AI confirmed {len(added)} borderline resource(s) as part of the workload.", included=len(added))
+        else:
+            yield _status("grouping", "AI naming unavailable — using the deterministic name from the seed.")
+
+    members = [
+        {
+            "id": n["id"], "name": n["name"], "resource_type": n["resource_type"],
+            "location": n["location"], "resource_group": n["resource_group"],
+            "subscription_id": n["subscription_id"], "tags": resources.get(str(n["id"]).lower(), {}).get("tags") or {},
+        }
+        for n in chosen
+    ]
+    group = {
+        "name": name, "description": description, "reasoning": reasoning,
+        "confidence": confidence, "members": members,
+        "workload_type": workload_type, "environment": environment,
+        "criticality": criticality, "data_classification": data_classification,
+    }
+    cand = _candidate(group, {})
+    cand["evidence"] = _seed_evidence(seedres, chosen)
+    types_str = ", ".join(f"{t['label']} ({t['count']})" for t in cand["types"][:6])
+    yield {
+        "type": "candidate",
+        "candidate": cand,
+        "message": f"“{cand['name']}” — {cand['resource_count']} resources: {types_str}",
+    }
+    yield {
+        "type": "done",
+        "candidates": [cand],
+        "meta": {
+            "resource_count": len(resources),
+            "considered": len(nodes),
+            "ungrouped": 0,
+            "organized_pct": 100,
+            "used_ai": used_ai,
+            "truncated": False,
+            "seed": seedres.get("id", ""),
+            "seed_name": seedres.get("name", ""),
+            "max_hops": hops,
+            "threshold": thresh,
+            "shared_excluded": len(shared_nodes),
+            "preset": preset,
+        },
     }
 
 

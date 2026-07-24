@@ -28,6 +28,7 @@ import {
 import { GraphInspector } from "./graph/GraphInspector";
 import { AnalyticsPanel, AskPanel, Minimap, ViewsPanel, ZoomControl } from "./graph/GraphPanels";
 import { kindIconUri } from "./graph/graphIcons";
+import { AutopilotModal } from "./AutopilotModal";
 
 // Register the fcose layout once (far better node separation than the built-in cose for
 // our dense estate graphs). Guarded so HMR re-imports don't double-register.
@@ -90,6 +91,8 @@ export function GraphPanel() {
   const [hidden, setHidden] = useState<Set<GraphNodeKind>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [ctx, setCtx] = useState<CtxMenu>(null);
+  // Seed-mode Autopilot: reverse-engineer the workload around a resource node.
+  const [seedTrace, setSeedTrace] = useState("");
   const [quickCard, setQuickCard] = useState<QuickCard>(null);
   // Measured heights of the floating overlays, so we can clamp them inside the canvas (their
   // height is variable: the menu has a different item count for node vs canvas, the card varies
@@ -1145,6 +1148,17 @@ export function GraphPanel() {
                     ) : null;
                   })()}
                   {ctx.kind === "workload" && <MI label="Focus (overlays + drift)" onClick={() => void focus("workload", ctx.nodeId!.slice(3))} />}
+                  {ctx.kind === "resource" && (
+                    <MI
+                      label="🎯 Find its workload"
+                      onClick={() => {
+                        const n = nodeDataRef.current.get(ctx.nodeId!);
+                        const arm = String(n?.data?.arm_id || "");
+                        if (arm) setSeedTrace(arm);
+                        setCtx(null);
+                      }}
+                    />
+                  )}
                   {ctx.kind === "subscription" && <MI label="Focus subscription" onClick={() => void focus("subscription", ctx.nodeId!.slice(4))} />}
                   <MI label="Blast radius from here" onClick={() => { void runBlast(ctx.nodeId!); setCtx(null); }} />
                   <MI label="Path: set source" onClick={() => { setMode("path"); setPathSource(ctx.nodeId!); highlightNodes([ctx.nodeId!], "path"); setCtx(null); setStatus("Path: pick a target"); }} />
@@ -1165,7 +1179,9 @@ export function GraphPanel() {
           )}
 
           {/* Left side panels */}
-          {leftPanel === "analytics" && <AnalyticsPanel connectionId={effectiveConn} onFocus={(id) => { const n = nodeDataRef.current.get(id); if (n) focusNode(n); else { setSelected(id); cyRef.current?.animate({ center: { eles: cyRef.current!.getElementById(id) }, zoom: 1.2 }, { duration: 300 }); } }} onClose={() => setLeftPanel("none")} />}
+          {seedTrace && (
+            <AutopilotModal seedResourceId={seedTrace} onClose={() => setSeedTrace("")} onSaved={() => setSeedTrace("")} />
+          )}          {leftPanel === "analytics" && <AnalyticsPanel connectionId={effectiveConn} onFocus={(id) => { const n = nodeDataRef.current.get(id); if (n) focusNode(n); else { setSelected(id); cyRef.current?.animate({ center: { eles: cyRef.current!.getElementById(id) }, zoom: 1.2 }, { duration: 300 }); } }} onClose={() => setLeftPanel("none")} />}
           {leftPanel === "ask" && <AskPanel connectionId={effectiveConn} scopeKind={focusScope?.kind || "overview"} scopeId={focusScope?.id || ""} onMatched={onAskMatched} onClose={() => setLeftPanel("none")} />}
           {leftPanel === "views" && <ViewsPanel onApply={applyView} onSaveCurrent={saveCurrentView} onClose={() => setLeftPanel("none")} />}
 

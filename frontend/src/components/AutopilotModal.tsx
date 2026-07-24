@@ -4,12 +4,16 @@ import {
   api,
   streamAutopilot,
   streamSurvey,
+  streamTrace,
   type CostEstimate,
   type DiscoveryProfile,
   type FacetCount,
   type FilterPreview,
   type SculptConfig,
   type SurveyResult,
+  type TraceEvidence,
+  type TraceNode,
+  type TraceResult,
   type TreeNode,
   type TypeCount,
   type WorkloadCandidate,
@@ -101,7 +105,7 @@ export function TypeChips({ types, max = 8 }: { types: TypeCount[]; max?: number
   );
 }
 
-type Stage = "setup" | "survey" | "running" | "review";
+type Stage = "setup" | "survey" | "trace" | "running" | "review";
 
 // ---- Scope Sculptor presets: each maps to a coherent set of controls. ----
 type Granularity = "resource" | "resource_group" | "sample";
@@ -191,7 +195,212 @@ function ChipMultiSelect({ items, selected, onToggle, max = 12 }: {
   );
 }
 
-export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+// ---- Seed mode: reverse-engineer ONE workload from a single resource id. ----
+type SeedPresetId = "tight" | "balanced" | "wide" | "custom";
+const SEED_PRESET_DEFAULTS: Record<Exclude<SeedPresetId, "custom">, { hops: number; threshold: number; includeShared: boolean }> = {
+  tight: { hops: 1, threshold: 0.6, includeShared: false },
+  balanced: { hops: 2, threshold: 0.45, includeShared: false },
+  wide: { hops: 3, threshold: 0.3, includeShared: true },
+};
+const SEED_PRESET_BLURB: Record<Exclude<SeedPresetId, "custom">, string> = {
+  tight: "Direct dependencies only — highest precision, smallest workload.",
+  balanced: "Two hops with strong links — the best precision/completeness trade-off.",
+  wide: "Three hops including weak links and shared platform — most complete, noisiest.",
+};
+// The trace is always COLLECTED at maximum breadth so the hop / link-strength sliders can
+// re-filter the result instantly in the browser without another Azure round-trip.
+const TRACE_MAX_HOPS = 3;
+const TRACE_MIN_THRESHOLD = 0.3;
+const BORDERLINE_BAND = 0.15;
+
+/** Relative link-strength bar for one traced resource. */
+function StrengthBar({ score }: { score: number }) {
+  const pct = Math.round(Math.max(0, Math.min(1, score)) * 100);
+  const tone = score >= 0.75 ? "bg-green-500" : score >= 0.5 ? "bg-brand" : "bg-amber-400";
+  return (
+    <span
+      className="relative inline-block h-1.5 w-12 shrink-0 overflow-hidden rounded-full bg-gray-100"
+      title={`Link strength ${pct}%`}
+    >
+      <span className={`absolute inset-y-0 left-0 rounded-full ${tone}`} style={{ width: `${Math.max(6, pct)}%` }} />
+    </span>
+  );
+}
+
+/** The concrete reasons a resource was pulled into the trace. */
+function TraceEvidenceChips({ items, max = 3 }: { items: TraceEvidence[]; max?: number }) {
+  if (!items?.length) return null;
+  const shown = items.slice(0, max);
+  return (
+    <div className="mt-0.5 flex flex-wrap gap-1">
+      {shown.map((e, i) => (
+        <span
+          key={`${e.kind}-${i}`}
+          title={e.detail}
+          className="rounded-md border border-green-200 bg-green-50 px-1 py-0.5 text-[10px] text-green-700"
+        >
+          🔗 {e.label}
+        </span>
+      ))}
+      {items.length > shown.length && <span className="text-[10px] text-gray-400">+{items.length - shown.length}</span>}
+    </div>
+  );
+}
+
+/** One row in the trace stage: checkbox, strength, evidence and a re-seed action. */
+function TraceRow({
+  node,
+  checked,
+  onToggle,
+  onExpand,
+}: {
+  node: TraceNode;
+  checked: boolean;
+  onToggle: () => void;
+  onExpand: () => void;
+}) {
+  const why = node.path.length ? `Path from the seed: ${node.path.join(" → ")}` : "The seed resource";
+  return (
+    <div
+      className={`flex items-start gap-2 rounded-lg border px-2 py-1.5 ${
+        node.is_seed ? "border-brand/40 bg-brand/5" : "border-gray-100 hover:bg-gray-50"
+      }`}
+    >
+      <input type="checkbox" checked={checked} disabled={node.is_seed} onChange={onToggle} className="mt-1" />
+      <AzureIcon kind="resource" type={node.resource_type} className="mt-0.5 h-4 w-4" />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="truncate text-xs font-medium text-gray-800" title={node.id}>{node.name}</span>
+          {node.is_seed && <span className="rounded-full bg-brand/10 px-1.5 text-[10px] font-medium text-brand">seed</span>}
+          {node.shared && !node.is_seed && (
+            <span className="rounded-full bg-gray-100 px-1.5 text-[10px] text-gray-500" title={`Referenced by ${node.fanin} resources`}>
+              shared
+            </span>
+          )}
+          <StrengthBar score={node.score} />
+          <span className="text-[10px] text-gray-400" title={why}>hop {node.hop}</span>
+        </div>
+        <div className="truncate text-[10px] text-gray-400">
+          {node.resource_type} · {node.resource_group}
+        </div>
+        <TraceEvidenceChips items={node.evidence} />
+      </div>
+      {!node.is_seed && (
+        <button
+          onClick={onExpand}
+          title="Re-trace using this resource as the seed"
+          className="mt-0.5 rounded px-1 text-xs text-gray-300 hover:bg-white hover:text-brand"
+        >
+          ⤵
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** A collapsible group of trace rows with a select-all toggle. */
+function TraceSection({
+  title,
+  hint,
+  nodes,
+  selected,
+  onToggle,
+  onToggleAll,
+  onExpand,
+  defaultOpen = true,
+  tone = "",
+}: {
+  title: string;
+  hint?: string;
+  nodes: TraceNode[];
+  selected: Set<string>;
+  onToggle: (id: string) => void;
+  onToggleAll: (ids: string[], on: boolean) => void;
+  onExpand: (id: string) => void;
+  defaultOpen?: boolean;
+  tone?: string;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  if (!nodes.length) return null;
+  const ids = nodes.filter((n) => !n.is_seed).map((n) => n.id.toLowerCase());
+  const allOn = ids.length > 0 && ids.every((id) => selected.has(id));
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <button onClick={() => setOpen((v) => !v)} className={`text-[11px] font-medium uppercase tracking-wide ${tone || "text-gray-500"}`}>
+          {open ? "▾" : "▸"} {title} <span className="text-gray-400">({nodes.length})</span>
+        </button>
+        {ids.length > 0 && (
+          <button onClick={() => onToggleAll(ids, !allOn)} className="text-[10px] text-brand hover:underline">
+            {allOn ? "none" : "all"}
+          </button>
+        )}
+        {hint && <span className="truncate text-[10px] text-gray-400">{hint}</span>}
+      </div>
+      {open && (
+        <div className="mt-1 space-y-1">
+          {nodes.map((n) => (
+            <TraceRow
+              key={n.id}
+              node={n}
+              checked={n.is_seed || selected.has(n.id.toLowerCase())}
+              onToggle={() => onToggle(n.id.toLowerCase())}
+              onExpand={() => onExpand(n.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Concentric hop rings around the seed — a lightweight dependency map. */
+function TraceRings({ nodes, maxHops }: { nodes: TraceNode[]; maxHops: number }) {
+  const rings: TraceNode[][] = [];
+  for (let h = 0; h <= maxHops; h++) rings.push(nodes.filter((n) => n.hop === h));
+  return (
+    <div className="space-y-2 rounded-lg border bg-gray-50 p-3">
+      {rings.map((ring, h) =>
+        ring.length === 0 ? null : (
+          <div key={h} className="flex items-start gap-2">
+            <span className="mt-0.5 w-14 shrink-0 text-[10px] font-medium uppercase tracking-wide text-gray-400">
+              {h === 0 ? "seed" : `hop ${h}`}
+            </span>
+            <div className="flex flex-wrap gap-1">
+              {ring.map((n) => (
+                <span
+                  key={n.id}
+                  title={`${n.name} · ${n.resource_type} · strength ${Math.round(n.score * 100)}%`}
+                  className={`inline-flex max-w-[14rem] items-center gap-1 truncate rounded-full border px-2 py-0.5 text-[10px] ${
+                    n.is_seed
+                      ? "border-brand bg-brand/10 font-medium text-brand"
+                      : n.shared
+                        ? "border-gray-200 bg-white text-gray-400"
+                        : "border-gray-200 bg-white text-gray-700"
+                  }`}
+                >
+                  <AzureIcon kind="resource" type={n.resource_type} className="h-3 w-3" />
+                  <span className="truncate">{n.name}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        ),
+      )}
+    </div>
+  );
+}
+
+export function AutopilotModal({
+  onClose,
+  onSaved,
+  seedResourceId = "",
+}: {
+  onClose: () => void;
+  onSaved: () => void;
+  /** Open straight into SEED mode for this resource (Inventory / Graph / alert entry points). */
+  seedResourceId?: string;
+}) {
   // Always refetch the connection list when the modal opens — `azureConnections` carries a 5-min
   // staleTime default (it's requested by many screens), which otherwise serves a stale/empty list
   // right after the user adds their first connection.
@@ -199,8 +408,10 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
   const connections = connQ.data?.connections ?? [];
 
   const [connectionId, setConnectionId] = useState("");
-  const [scopeKind, setScopeKind] = useState<"subscription" | "mg">("subscription");
-  const [scopeId, setScopeId] = useState("");
+  const [scopeKind, setScopeKind] = useState<"subscription" | "mg" | "resource">(
+    seedResourceId ? "resource" : "subscription",
+  );
+  const [scopeId, setScopeId] = useState(seedResourceId);
   const [scopeName, setScopeName] = useState("");
   const [scopeOptions, setScopeOptions] = useState<TreeNode[]>([]);
   const [scopeLoading, setScopeLoading] = useState(false);
@@ -230,6 +441,22 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
   const [estimate, setEstimate] = useState<CostEstimate | null>(null);
   const [filterPreview, setFilterPreview] = useState<FilterPreview | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // ---- Seed-mode state (scope_kind = "resource") ----
+  const [seedQuery, setSeedQuery] = useState("");
+  const [seedResults, setSeedResults] = useState<TreeNode[]>([]);
+  const [seedSearching, setSeedSearching] = useState(false);
+  const [seedPreset, setSeedPreset] = useState<SeedPresetId>("balanced");
+  const [hops, setHops] = useState(SEED_PRESET_DEFAULTS.balanced.hops);
+  const [linkThreshold, setLinkThreshold] = useState(SEED_PRESET_DEFAULTS.balanced.threshold);
+  const [includeShared, setIncludeShared] = useState(false);
+  const [disabledKinds, setDisabledKinds] = useState<Set<string>>(new Set());
+  const [trace, setTrace] = useState<TraceResult | null>(null);
+  const [retracing, setRetracing] = useState(false);
+  const [traceSelected, setTraceSelected] = useState<Set<string>>(new Set());
+  const [showMap, setShowMap] = useState(false);
+  const [useAiNaming, setUseAiNaming] = useState(true);
+  const isSeedMode = scopeKind === "resource";
 
   // Saved discovery profiles for this connection.
   const profilesQ = useQuery({
@@ -270,6 +497,11 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
       setScopeOptions([]);
       return;
     }
+    // Seed mode has no tree to load — the scope IS a single resource id.
+    if (scopeKind === "resource") {
+      setScopeOptions([]);
+      return;
+    }
     let cancelled = false;
     setScopeLoading(true);
     setScopeId("");
@@ -289,6 +521,29 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
       cancelled = true;
     };
   }, [connectionId, scopeKind]);
+
+  // Seed picker typeahead (debounced) — an ARM-backed resource search.
+  useEffect(() => {
+    if (!isSeedMode || !connectionId) return;
+    const q = seedQuery.trim();
+    if (q.length < 3 || q.startsWith("/subscriptions/")) {
+      setSeedResults([]);
+      return;
+    }
+    let cancelled = false;
+    setSeedSearching(true);
+    const handle = setTimeout(() => {
+      api
+        .workloadSearch({ connection_id: connectionId, query: q, top: 25 })
+        .then((r) => !cancelled && setSeedResults(r.rows.filter((n) => n.kind === "resource")))
+        .catch(() => !cancelled && setSeedResults([]))
+        .finally(() => !cancelled && setSeedSearching(false));
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [seedQuery, connectionId, isSeedMode]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -416,8 +671,180 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
     );
   }
 
-  async function saveProfile() {
-    const name = window.prompt("Name this discovery profile:", scopeName ? `${scopeName} — ${preset}` : preset);
+  // ---- Seed mode ---------------------------------------------------------------------
+  // When the modal is opened FOR a resource (Inventory / Graph / alert), pre-pick the default
+  // connection so the user lands one click from a trace. If it's the wrong tenant the trace
+  // says so plainly and the picker is right there.
+  useEffect(() => {
+    if (!seedResourceId || connectionId || connections.length === 0) return;
+    setConnectionId(connections.find((c) => c.is_default)?.id ?? connections[0].id);
+  }, [seedResourceId, connectionId, connections]);
+
+  const enabledEdgeKinds = useMemo(
+    () => (trace?.edge_kinds ?? []).map((k) => k.kind).filter((k) => !disabledKinds.has(k)),
+    [trace, disabledKinds],
+  );
+
+  // Hop + link-strength sliders re-filter the ALREADY-scored graph client-side, so they're
+  // instant: the backend returned every node reachable within TRACE_MAX_HOPS.
+  const visibleTrace = useMemo(() => {
+    const members: TraceNode[] = [];
+    const borderline: TraceNode[] = [];
+    const shared: TraceNode[] = [];
+    for (const n of trace?.nodes ?? []) {
+      if (n.hop > hops && !n.is_seed) continue;
+      if (n.shared && !n.is_seed) {
+        if (n.score >= linkThreshold - BORDERLINE_BAND) shared.push(n);
+        continue;
+      }
+      if (n.is_seed || n.score >= linkThreshold) members.push(n);
+      else if (n.score >= linkThreshold - BORDERLINE_BAND) borderline.push(n);
+    }
+    return { members, borderline, shared };
+  }, [trace, hops, linkThreshold]);
+
+  // Re-derive the default selection whenever the sliders move (manual ticks are intentionally
+  // reset — the sliders ARE the bulk selection tool).
+  useEffect(() => {
+    if (!trace) return;
+    const next = new Set(visibleTrace.members.map((n) => n.id.toLowerCase()));
+    if (includeShared) visibleTrace.shared.forEach((n) => next.add(n.id.toLowerCase()));
+    setTraceSelected(next);
+  }, [trace, visibleTrace, includeShared]);
+
+  function applySeedPreset(p: SeedPresetId) {
+    setSeedPreset(p);
+    if (p === "custom") return;
+    const d = SEED_PRESET_DEFAULTS[p];
+    setHops(d.hops);
+    setLinkThreshold(d.threshold);
+    setIncludeShared(d.includeShared);
+  }
+
+  /** Trace outward from a seed resource. Collected at max breadth; the UI filters it down. */
+  function runTrace(opts?: { seed?: string; kinds?: string[] }) {
+    const target = (opts?.seed ?? scopeId).trim();
+    if (!connectionId || !target) {
+      setError("Pick a connection and a seed resource.");
+      return;
+    }
+    setError("");
+    setStage("trace");
+    if (opts?.seed && opts.seed.toLowerCase() !== scopeId.toLowerCase()) {
+      setScopeId(opts.seed);
+      setTrace(null); // a different seed — discard the old graph
+    }
+    setRetracing(true);
+    if (!trace) setLog([]);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    void streamTrace(
+      {
+        connection_id: connectionId,
+        seed_resource_id: target,
+        preset: "wide",
+        max_hops: TRACE_MAX_HOPS,
+        threshold: TRACE_MIN_THRESHOLD,
+        edge_kinds: opts?.kinds ?? enabledEdgeKinds,
+      },
+      {
+        onStatus: (d) => setLog((l) => [...l, { phase: d.phase, message: d.message }]),
+        onTrace: (d) => {
+          setTrace(d);
+          setScopeId(d.seed.id);
+          setScopeName(d.seed.name);
+          setRetracing(false);
+        },
+        onError: (m) => {
+          setError(m);
+          setRetracing(false);
+          if (!trace) setStage("setup");
+        },
+      },
+      controller.signal,
+    );
+  }
+
+  function toggleEdgeKind(kind: string) {
+    const next = new Set(disabledKinds);
+    if (next.has(kind)) next.delete(kind);
+    else next.add(kind);
+    setDisabledKinds(next);
+    setSeedPreset("custom");
+    // Edge-kind changes alter the graph itself, so they need a re-trace — the backend keeps
+    // the collected link tables cached, so this costs no extra Azure queries.
+    runTrace({ kinds: (trace?.edge_kinds ?? []).map((k) => k.kind).filter((k) => !next.has(k)) });
+  }
+
+  function toggleTraceNode(id: string) {
+    setTraceSelected((s) => {
+      const n = new Set(s);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  }
+
+  function toggleTraceAll(ids: string[], on: boolean) {
+    setTraceSelected((s) => {
+      const n = new Set(s);
+      ids.forEach((id) => (on ? n.add(id) : n.delete(id)));
+      return n;
+    });
+  }
+
+  /** Turn the traced selection into ONE workload candidate (AI naming optional). */
+  function startSeed(withAi: boolean) {
+    if (!connectionId || !scopeId) {
+      setError("Pick a connection and a seed resource.");
+      return;
+    }
+    setError("");
+    setStage("running");
+    setLog([]);
+    setCandidates([]);
+    setSelected(new Set());
+    setMeta(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    void streamAutopilot(
+      {
+        connection_id: connectionId,
+        scope_kind: "resource",
+        scope_id: scopeId,
+        scope_name: scopeName,
+        seed_resource_id: scopeId,
+        preset: seedPreset === "custom" ? "balanced" : seedPreset,
+        max_hops: hops,
+        threshold: linkThreshold,
+        edge_kinds: enabledEdgeKinds,
+        include_ids: [...traceSelected],
+        use_ai: withAi,
+      },
+      {
+        onStatus: (d) => setLog((l) => [...l, { phase: d.phase, message: d.message }]),
+        onCandidate: (d) => {
+          setLog((l) => [...l, { phase: "candidate", message: d.message }]);
+          setCandidates((c) => {
+            const next = [...c, d.candidate];
+            setSelected((s) => new Set(s).add(next.length - 1));
+            return next;
+          });
+        },
+        onDone: (d) => {
+          setMeta(d.meta);
+          setStage("review");
+        },
+        onError: (m) => {
+          setError(m);
+          setStage("review");
+        },
+      },
+      controller.signal,
+    );
+  }
+
+  async function saveProfile() {    const name = window.prompt("Name this discovery profile:", scopeName ? `${scopeName} — ${preset}` : preset);
     if (!name) return;
     try {
       await api.saveAutopilotProfile({
@@ -588,7 +1015,9 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
               ✨ Workload Autopilot
             </h2>
             <p className="text-xs text-gray-500">
-              Point it at a subscription or management group and it discovers the workloads inside.
+              {isSeedMode
+                ? "Point it at one resource and it reverse-engineers the workload around it."
+                : "Point it at a subscription or management group and it discovers the workloads inside."}
             </p>
           </div>
           <button onClick={cancel} className="rounded p-1.5 text-gray-400 hover:bg-gray-100">✕</button>
@@ -609,8 +1038,8 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
               </div>
               <div>
                 <label className={label}>Discover under</label>
-                <div className="flex gap-2">
-                  {(["subscription", "mg"] as const).map((k) => (
+                <div className="flex flex-wrap gap-2">
+                  {(["subscription", "mg", "resource"] as const).map((k) => (
                     <button
                       key={k}
                       onClick={() => setScopeKind(k)}
@@ -618,41 +1047,112 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
                         scopeKind === k ? "border-brand bg-brand/5 font-medium text-brand" : "border-gray-200 text-gray-600 hover:bg-gray-50"
                       }`}
                     >
-                      <AzureIcon kind={k === "mg" ? "mg" : "subscription"} className="h-4 w-4" />
-                      {k === "subscription" ? "Subscription" : "Management group"}
+                      <AzureIcon kind={k === "mg" ? "mg" : k === "resource" ? "resource" : "subscription"} className="h-4 w-4" />
+                      {k === "subscription" ? "Subscription" : k === "mg" ? "Management group" : "🎯 Resource"}
                     </button>
                   ))}
                 </div>
+                {isSeedMode && (
+                  <p className="mt-1 text-[11px] text-gray-400">
+                    Reverse-engineer <b>one</b> workload from a single resource — Autopilot follows its
+                    references, private endpoints, identity grants, tags and naming outward.
+                  </p>
+                )}
               </div>
-              <div>
-                <label className={label}>{scopeKind === "mg" ? "Management group" : "Subscription"}</label>
-                <div className="relative">
-                  <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2">
-                    <AzureIcon kind={scopeKind === "mg" ? "mg" : "subscription"} className="h-4 w-4" />
-                  </span>
-                  <select
-                    className={`${input} pl-8`}
-                    value={scopeId}
-                    disabled={!connectionId || scopeLoading}
-                    onChange={(e) => {
-                      setScopeId(e.target.value);
-                      setScopeName(scopeOptions.find((o) => o.id === e.target.value)?.name ?? "");
-                    }}
-                  >
-                    <option value="">
-                      {scopeLoading ? "Loading…" : !connectionId ? "Pick a connection first" : "Select…"}
-                    </option>
-                    {scopeOptions.map((o) => (
-                      <option key={o.id} value={o.id}>
-                        {o.depth ? `${"\u00A0\u00A0".repeat(o.depth)}↳ ${o.name}` : o.name}
-                      </option>
-                    ))}
-                  </select>
+              {isSeedMode ? (
+                <div>
+                  <label className={label}>Seed resource</label>
+                  {!scopeId && (
+                    <input
+                      value={seedQuery}
+                      disabled={!connectionId}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setSeedQuery(v);
+                        // Pasting a full ARM id selects it directly.
+                        if (v.trim().startsWith("/subscriptions/")) {
+                          setScopeId(v.trim());
+                          setScopeName(v.trim().split("/").pop() ?? "");
+                          setSeedQuery("");
+                        }
+                      }}
+                      placeholder={connectionId ? "Search by name, or paste a full /subscriptions/… resource id" : "Pick a connection first"}
+                      className={input}
+                    />
+                  )}
+                  {seedSearching && !scopeId && <p className="mt-1 text-[11px] text-gray-400">Searching…</p>}
+                  {seedResults.length > 0 && !scopeId && (
+                    <div className="mt-1 max-h-52 overflow-y-auto rounded-lg border">
+                      {seedResults.map((r) => (
+                        <button
+                          key={r.id}
+                          onClick={() => {
+                            setScopeId(r.id);
+                            setScopeName(r.name);
+                            setSeedQuery("");
+                            setSeedResults([]);
+                          }}
+                          className="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-gray-50"
+                        >
+                          <AzureIcon kind="resource" type={r.resource_type} className="h-4 w-4" />
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate text-xs font-medium text-gray-800">{r.name}</span>
+                            <span className="block truncate text-[10px] text-gray-400">
+                              {r.resource_type} · {r.resource_group}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {scopeId && (
+                    <div className="mt-1 flex items-start gap-2 rounded-lg border border-brand/30 bg-brand/5 px-2 py-1.5">
+                      <AzureIcon kind="resource" className="mt-0.5 h-4 w-4" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-xs font-medium text-gray-800">{scopeName || scopeId.split("/").pop()}</span>
+                        <span className="block truncate text-[10px] text-gray-400" title={scopeId}>{scopeId}</span>
+                      </span>
+                      <button
+                        onClick={() => { setScopeId(""); setScopeName(""); setSeedQuery(""); }}
+                        className="text-xs text-gray-400 hover:text-red-500"
+                        title="Clear the seed"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  )}
                 </div>
-              </div>
+              ) : (
+                <div>
+                  <label className={label}>{scopeKind === "mg" ? "Management group" : "Subscription"}</label>
+                  <div className="relative">
+                    <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2">
+                      <AzureIcon kind={scopeKind === "mg" ? "mg" : "subscription"} className="h-4 w-4" />
+                    </span>
+                    <select
+                      className={`${input} pl-8`}
+                      value={scopeId}
+                      disabled={!connectionId || scopeLoading}
+                      onChange={(e) => {
+                        setScopeId(e.target.value);
+                        setScopeName(scopeOptions.find((o) => o.id === e.target.value)?.name ?? "");
+                      }}
+                    >
+                      <option value="">
+                        {scopeLoading ? "Loading…" : !connectionId ? "Pick a connection first" : "Select…"}
+                      </option>
+                      {scopeOptions.map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {o.depth ? `${"\u00A0\u00A0".repeat(o.depth)}↳ ${o.name}` : o.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
 
               {/* Saved discovery profiles */}
-              {profiles.length > 0 && (
+              {profiles.length > 0 && !isSeedMode && (
                 <div>
                   <label className={label}>Saved profiles</label>
                   <div className="flex flex-wrap gap-1.5">
@@ -671,24 +1171,42 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
               {/* Speed preset */}
               <div>
                 <label className={label}>Preset</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {(["fast", "balanced", "thorough"] as const).map((p) => (
-                    <button
-                      key={p}
-                      onClick={() => applyPreset(p)}
-                      className={`rounded-lg border px-2 py-1.5 text-left text-xs transition ${preset === p ? "border-brand bg-brand/5" : "border-gray-200 hover:bg-gray-50"}`}
-                    >
-                      <div className={`font-semibold capitalize ${preset === p ? "text-brand" : "text-gray-700"}`}>
-                        {p === "fast" ? "⚡ Fast" : p === "balanced" ? "⚖️ Balanced" : "🔬 Thorough"}
-                      </div>
-                      <div className="mt-0.5 text-[10px] leading-tight text-gray-400">{PRESET_BLURB[p]}</div>
-                    </button>
-                  ))}
-                </div>
-                {preset === "custom" && <p className="mt-1 text-[11px] text-amber-600">Custom — you've overridden a preset's controls.</p>}
+                {isSeedMode ? (
+                  <div className="grid grid-cols-3 gap-2">
+                    {(["tight", "balanced", "wide"] as const).map((p) => (
+                      <button
+                        key={p}
+                        onClick={() => applySeedPreset(p)}
+                        className={`rounded-lg border px-2 py-1.5 text-left text-xs transition ${seedPreset === p ? "border-brand bg-brand/5" : "border-gray-200 hover:bg-gray-50"}`}
+                      >
+                        <div className={`font-semibold capitalize ${seedPreset === p ? "text-brand" : "text-gray-700"}`}>
+                          {p === "tight" ? "🎯 Tight" : p === "balanced" ? "⚖️ Balanced" : "🌐 Wide"}
+                        </div>
+                        <div className="mt-0.5 text-[10px] leading-tight text-gray-400">{SEED_PRESET_BLURB[p]}</div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-3 gap-2">
+                    {(["fast", "balanced", "thorough"] as const).map((p) => (
+                      <button
+                        key={p}
+                        onClick={() => applyPreset(p)}
+                        className={`rounded-lg border px-2 py-1.5 text-left text-xs transition ${preset === p ? "border-brand bg-brand/5" : "border-gray-200 hover:bg-gray-50"}`}
+                      >
+                        <div className={`font-semibold capitalize ${preset === p ? "text-brand" : "text-gray-700"}`}>
+                          {p === "fast" ? "⚡ Fast" : p === "balanced" ? "⚖️ Balanced" : "🔬 Thorough"}
+                        </div>
+                        <div className="mt-0.5 text-[10px] leading-tight text-gray-400">{PRESET_BLURB[p]}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {!isSeedMode && preset === "custom" && <p className="mt-1 text-[11px] text-amber-600">Custom — you've overridden a preset's controls.</p>}
               </div>
 
 
+              {!isSeedMode && (
               <div>
                 <label className={label}>Grouping strategy</label>
                 <div className="flex flex-wrap gap-2">
@@ -716,10 +1234,13 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
                   />
                 )}
               </div>
+              )}
+              {!isSeedMode && (
               <label className="flex items-start gap-2 text-sm text-gray-700">
                 <input type="checkbox" checked={mode === "delta"} onChange={(e) => setMode(e.target.checked ? "delta" : "full")} className="mt-0.5" />
                 <span>Delta mode — only propose resources <b>not already</b> in a saved workload (incremental reconciliation).</span>
               </label>
+              )}
               {error && <div className="text-xs text-red-600">{error}</div>}
             </div>
           )}
@@ -868,6 +1389,158 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
                       </div>
                     )}
                   </div>
+                  {error && <div className="text-xs text-red-600">{error}</div>}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Trace — SEED mode pre-flight: the scored dependency graph around one resource. */}
+          {stage === "trace" && (
+            <div className="space-y-4">
+              {!trace ? (
+                <div className="rounded-lg border bg-gray-50 p-4">
+                  <div className="mb-2 flex items-center gap-2 text-xs font-medium text-gray-600">
+                    <span className="h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                    Tracing dependencies (read-only, no AI)…
+                  </div>
+                  <div className="max-h-40 space-y-0.5 overflow-y-auto font-mono text-[11px] text-gray-500">
+                    {log.map((l, i) => (
+                      <div key={i}><span className="text-gray-400">›</span> {l.message}</div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {/* Seed banner */}
+                  <div className="rounded-xl border border-brand/30 bg-brand/5 p-3">
+                    <div className="flex items-start gap-2">
+                      <AzureIcon kind="resource" type={trace.seed.resource_type} className="mt-0.5 h-5 w-5" />
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-semibold text-gray-800">🎯 {trace.seed.name}</div>
+                        <div className="truncate text-[11px] text-gray-500">
+                          {trace.seed.resource_type} · {trace.seed.resource_group} · {trace.seed.location}
+                        </div>
+                      </div>
+                      {retracing && <span className="h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] text-gray-600">
+                      <span><b>{visibleTrace.members.length}</b> related resource(s)</span>
+                      <span>{visibleTrace.borderline.length} borderline</span>
+                      <span>{visibleTrace.shared.length} shared platform</span>
+                      <span>{trace.stats.universe} candidates examined</span>
+                      <span>{trace.stats.edges} relationships</span>
+                    </div>
+                  </div>
+
+                  {/* Already-organized notice */}
+                  {trace.existing_workload && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                      {trace.existing_workload.owns_seed ? "This resource already belongs to " : "These resources overlap the saved workload "}
+                      <b>{trace.existing_workload.name}</b> ({trace.existing_workload.overlap} shared)
+                      {trace.existing_workload.new_resources > 0
+                        ? ` — saving would reconcile ${trace.existing_workload.new_resources} newly linked resource(s).`
+                        : "."}
+                    </div>
+                  )}
+
+                  {/* Live sliders — these re-filter the already-scored graph instantly. */}
+                  <div className="grid grid-cols-2 gap-4 rounded-lg border bg-gray-50 p-3">
+                    <div>
+                      <label className={label}>Hops from the seed — {hops}</label>
+                      <input
+                        type="range" min={1} max={TRACE_MAX_HOPS} step={1} value={hops}
+                        onChange={(e) => { setHops(Number(e.target.value)); setSeedPreset("custom"); }}
+                        className="w-full"
+                      />
+                    </div>
+                    <div>
+                      <label className={label}>Link strength — {Math.round(linkThreshold * 100)}%</label>
+                      <input
+                        type="range" min={TRACE_MIN_THRESHOLD} max={0.9} step={0.05} value={linkThreshold}
+                        onChange={(e) => { setLinkThreshold(Number(e.target.value)); setSeedPreset("custom"); }}
+                        className="w-full"
+                      />
+                    </div>
+                    <label className="flex items-center gap-2 text-[11px] text-gray-700">
+                      <input type="checkbox" checked={includeShared} onChange={(e) => { setIncludeShared(e.target.checked); setSeedPreset("custom"); }} />
+                      Include shared platform resources as members
+                    </label>
+                    <div className="text-right">
+                      <button onClick={() => setShowMap((v) => !v)} className="text-[11px] font-medium text-brand hover:underline">
+                        {showMap ? "▾ Hide map" : "▸ Show dependency map"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {showMap && <TraceRings nodes={[...visibleTrace.members, ...visibleTrace.borderline, ...visibleTrace.shared]} maxHops={hops} />}
+
+                  {/* Relationship-kind filter */}
+                  <div>
+                    <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-gray-400">Relationship kinds</div>
+                    <div className="flex flex-wrap gap-1">
+                      {trace.edge_kinds.map((k) => {
+                        const on = !disabledKinds.has(k.kind);
+                        return (
+                          <button
+                            key={k.kind}
+                            onClick={() => toggleEdgeKind(k.kind)}
+                            title={`Link weight ${Math.round(k.weight * 100)}%`}
+                            className={`rounded-full border px-2 py-0.5 text-[11px] transition ${on ? "border-brand bg-brand/10 text-brand" : "border-gray-200 text-gray-400 hover:bg-gray-50"}`}
+                          >
+                            {on ? "✓ " : ""}{k.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-1 text-[10px] text-gray-400">Turn a signal off to rebuild the graph without it (no extra Azure queries — the trace is cached).</p>
+                  </div>
+
+                  {/* The traced resources */}
+                  <div className="space-y-3">
+                    <TraceSection
+                      title="Workload members"
+                      nodes={visibleTrace.members}
+                      selected={traceSelected}
+                      onToggle={toggleTraceNode}
+                      onToggleAll={toggleTraceAll}
+                      onExpand={(id) => runTrace({ seed: id })}
+                    />
+                    <TraceSection
+                      title="⚠️ Borderline"
+                      hint="weak links — decide, or let the AI rule on them"
+                      nodes={visibleTrace.borderline}
+                      selected={traceSelected}
+                      onToggle={toggleTraceNode}
+                      onToggleAll={toggleTraceAll}
+                      onExpand={(id) => runTrace({ seed: id })}
+                      defaultOpen={false}
+                      tone="text-amber-600"
+                    />
+                    <TraceSection
+                      title="🏛️ Shared platform"
+                      hint="dependencies only — never traversed through"
+                      nodes={visibleTrace.shared}
+                      selected={traceSelected}
+                      onToggle={toggleTraceNode}
+                      onToggleAll={toggleTraceAll}
+                      onExpand={(id) => runTrace({ seed: id })}
+                      defaultOpen={false}
+                    />
+                    {visibleTrace.members.length <= 1 && (
+                      <div className="rounded-lg border border-dashed p-4 text-center text-[11px] text-gray-500">
+                        Nothing else linked to this resource at these settings. Try more hops or a lower link strength.
+                      </div>
+                    )}
+                  </div>
+
+                  <label className="flex items-start gap-2 rounded-lg border bg-gray-50 px-3 py-2 text-xs text-gray-700">
+                    <input type="checkbox" checked={useAiNaming} onChange={(e) => setUseAiNaming(e.target.checked)} className="mt-0.5" />
+                    <span>
+                      Use <b>1 AI call</b> to name and classify the workload (and rule on the borderline resources).
+                      Off = a deterministic name from the seed.
+                    </span>
+                  </label>
                   {error && <div className="text-xs text-red-600">{error}</div>}
                 </>
               )}
@@ -1031,28 +1704,40 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
               )}
               {meta && (
                 <div className="space-y-1.5">
-                  {typeof meta.organized_pct === "number" && Number(meta.resource_count) > 0 && (
-                    <div>
-                      <div className="mb-0.5 flex items-center justify-between text-[11px] text-gray-500">
-                        <span>Estate organized into workloads</span>
-                        <span className="font-semibold text-gray-700">{String(meta.organized_pct)}%</span>
-                      </div>
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-100">
-                        <div className="h-full rounded-full bg-brand" style={{ width: `${Number(meta.organized_pct)}%` }} />
-                      </div>
-                    </div>
+                  {meta.seed ? (
+                    <p className="text-[11px] text-gray-400">
+                      Traced from “{String(meta.seed_name || meta.seed)}” within {String(meta.max_hops)} hop(s)
+                      {Number(meta.considered) > 0 ? ` across ${String(meta.considered)} reachable resource(s)` : ""}
+                      {Number(meta.resource_count) > 0 ? ` (${String(meta.resource_count)} candidates examined)` : ""}.
+                      {Number(meta.shared_excluded) > 0 ? ` ${String(meta.shared_excluded)} shared-platform resource(s) kept out of the workload.` : ""}
+                      {meta.used_ai ? " Named and classified by AI." : " Named deterministically (no AI)."}
+                    </p>
+                  ) : (
+                    <>
+                      {typeof meta.organized_pct === "number" && Number(meta.resource_count) > 0 && (
+                        <div>
+                          <div className="mb-0.5 flex items-center justify-between text-[11px] text-gray-500">
+                            <span>Estate organized into workloads</span>
+                            <span className="font-semibold text-gray-700">{String(meta.organized_pct)}%</span>
+                          </div>
+                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-100">
+                            <div className="h-full rounded-full bg-brand" style={{ width: `${Number(meta.organized_pct)}%` }} />
+                          </div>
+                        </div>
+                      )}
+                      <p className="text-[11px] text-gray-400">
+                        Scanned {String(meta.resource_count)} resources
+                        {meta.subscriptions ? ` across ${String(meta.subscriptions)} subscription(s)` : ""}.
+                        {Number(meta.filtered) > 0 ? ` ${String(meta.filtered)} filtered out before grouping;` : ""}
+                        {Number(meta.considered) > 0 ? ` ${String(meta.considered)} considered.` : ""}
+                        {Number(meta.tag_seeded_workloads) > 0 ? ` ${String(meta.tag_seeded_workloads)} tag-seeded.` : ""}
+                        {Number(meta.reattached) > 0 ? ` ${String(meta.reattached)} child resource(s) re-attached.` : ""}
+                        {Number(meta.below_floor) > 0 ? ` ${String(meta.below_floor)} hidden below the confidence floor.` : ""}
+                        {Number(meta.ungrouped) > 0 ? ` ${String(meta.ungrouped)} resource(s) didn't fit a workload.` : ""}
+                        {meta.truncated ? " (5,000-resource limit reached — results may be partial.)" : ""}
+                      </p>
+                    </>
                   )}
-                  <p className="text-[11px] text-gray-400">
-                    Scanned {String(meta.resource_count)} resources
-                    {meta.subscriptions ? ` across ${String(meta.subscriptions)} subscription(s)` : ""}.
-                    {Number(meta.filtered) > 0 ? ` ${String(meta.filtered)} filtered out before grouping;` : ""}
-                    {Number(meta.considered) > 0 ? ` ${String(meta.considered)} considered.` : ""}
-                    {Number(meta.tag_seeded_workloads) > 0 ? ` ${String(meta.tag_seeded_workloads)} tag-seeded.` : ""}
-                    {Number(meta.reattached) > 0 ? ` ${String(meta.reattached)} child resource(s) re-attached.` : ""}
-                    {Number(meta.below_floor) > 0 ? ` ${String(meta.below_floor)} hidden below the confidence floor.` : ""}
-                    {Number(meta.ungrouped) > 0 ? ` ${String(meta.ungrouped)} resource(s) didn't fit a workload.` : ""}
-                    {meta.truncated ? " (5,000-resource limit reached — results may be partial.)" : ""}
-                  </p>
                   {candidates.length > 0 && (
                     <div className="flex flex-wrap gap-3 rounded-lg border bg-gray-50 px-3 py-2 text-xs text-gray-600">
                       <span className="font-medium text-gray-700">On save:</span>
@@ -1078,8 +1763,26 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
           {stage === "setup" && (
             <>
               <button onClick={cancel} className="rounded-lg border px-3.5 py-1.5 text-sm text-gray-600 hover:bg-gray-50">Cancel</button>
-              <button onClick={runSurvey} disabled={!connectionId || !scopeId} className="rounded-lg bg-brand px-4 py-1.5 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50">
-                Survey estate →
+              {isSeedMode ? (
+                <button onClick={() => runTrace()} disabled={!connectionId || !scopeId} className="rounded-lg bg-brand px-4 py-1.5 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50">
+                  Trace dependencies →
+                </button>
+              ) : (
+                <button onClick={runSurvey} disabled={!connectionId || !scopeId} className="rounded-lg bg-brand px-4 py-1.5 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50">
+                  Survey estate →
+                </button>
+              )}
+            </>
+          )}
+          {stage === "trace" && (
+            <>
+              <button onClick={() => { abortRef.current?.abort(); setTrace(null); setStage("setup"); }} className="rounded-lg border px-3.5 py-1.5 text-sm text-gray-600 hover:bg-gray-50">← Back</button>
+              <button
+                onClick={() => startSeed(useAiNaming)}
+                disabled={!trace || traceSelected.size === 0}
+                className="rounded-lg bg-brand px-4 py-1.5 text-sm font-medium text-white hover:bg-brand/90 disabled:opacity-50"
+              >
+                {useAiNaming ? `✨ Name & classify ${traceSelected.size} resource(s) →` : `Create workload (${traceSelected.size}) →`}
               </button>
             </>
           )}
@@ -1108,7 +1811,7 @@ export function AutopilotModal({ onClose, onSaved }: { onClose: () => void; onSa
           )}
           {stage === "review" && (
             <>
-              <button onClick={() => { abortRef.current?.abort(); setStage("setup"); }} className="mr-auto rounded-lg border px-3.5 py-1.5 text-sm text-gray-600 hover:bg-gray-50" title="Go back to adjust scope and run discovery again">← Back</button>
+              <button onClick={() => { abortRef.current?.abort(); setStage(isSeedMode && trace ? "trace" : "setup"); }} className="mr-auto rounded-lg border px-3.5 py-1.5 text-sm text-gray-600 hover:bg-gray-50" title="Go back to adjust scope and run discovery again">← Back</button>
               <button onClick={cancel} className="rounded-lg border px-3.5 py-1.5 text-sm text-gray-600 hover:bg-gray-50">Close</button>
               {candidates.length === 0 ? (
                 <button onClick={() => setStage("setup")} className="rounded-lg border border-brand/40 px-3.5 py-1.5 text-sm text-brand hover:bg-brand/5">

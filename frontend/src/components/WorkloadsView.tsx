@@ -198,7 +198,7 @@ function WorkloadResourceTree({
 // Estate coverage: % of the Azure estate organized into workloads + orphaned-resource
 // triage. Loads on demand (the estate scan is heavy) per connection — expanding the card
 // only reveals a Scan button; the scan runs when the user explicitly presses it.
-function EstateCoveragePanel() {
+function EstateCoveragePanel({ onTrace }: { onTrace: (resourceId: string) => void }) {
   const [open, setOpen] = useState(false);
   const [connId, setConnId] = useState("");
   // Which connection the user has explicitly asked to scan. The scan never auto-runs on
@@ -308,6 +308,30 @@ function EstateCoveragePanel() {
                   <p className="mt-1.5 text-[11px] text-gray-400">
                     Run Autopilot again to fold these into workloads, or create one manually.
                   </p>
+                </div>
+              )}
+              {cov.orphans.length > 0 && (
+                <div>
+                  <div className="mb-1 text-xs font-medium text-gray-600">
+                    Triage an orphan — trace its workload from that one resource
+                  </div>
+                  <div className="max-h-52 space-y-1 overflow-auto">
+                    {cov.orphans.slice(0, 50).map((o) => (
+                      <div key={o.id} className="flex items-center gap-2 rounded bg-gray-50 px-2 py-1 text-xs">
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-gray-700">{o.name}</span>
+                          <span className="block truncate text-[10px] text-gray-400">{o.resource_type} · {o.resource_group}</span>
+                        </span>
+                        <button
+                          onClick={() => onTrace(o.id)}
+                          title="Reverse-engineer the workload around this resource"
+                          className="shrink-0 rounded border border-brand/40 px-2 py-0.5 text-[11px] font-medium text-brand transition hover:bg-brand/5"
+                        >
+                          Trace →
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
@@ -540,6 +564,8 @@ export function WorkloadsPanel() {
   // Preserve the page scroll position across navigation (e.g. open a workload then hit Back).
   const scrollRef = useRef<HTMLDivElement>(null);  const [editing, setEditing] = useState<Partial<Workload> | null>(null);
   const [autopilot, setAutopilot] = useState(false);
+  // Seed-mode Autopilot: open the modal pre-loaded with ONE resource id to trace outward.
+  const [seedTrace, setSeedTrace] = useState("");
   const [refreshing, setRefreshing] = useState<string>("");
   const [msg, setMsg] = useState("");
   const [notice, setNotice] = useState("");
@@ -1068,7 +1094,7 @@ export function WorkloadsPanel() {
         )}
 
         {/* Estate coverage: how much of the estate is organized into workloads + orphan triage. */}
-        {!wlQ.isLoading && workloads.length > 0 && !showTrash && <EstateCoveragePanel />}
+        {!wlQ.isLoading && workloads.length > 0 && !showTrash && <EstateCoveragePanel onTrace={setSeedTrace} />}
 
         {/* Fleet cockpit: aggregate health/composition/triage over the cache-only profiles. */}
         {!showTrash && workloads.length > 0 && (profilesQ.data?.profiles?.length ?? 0) > 0 && (
@@ -1370,11 +1396,13 @@ export function WorkloadsPanel() {
           }}
         />
       )}
-      {autopilot && (
+      {(autopilot || seedTrace) && (
         <AutopilotModal
-          onClose={() => setAutopilot(false)}
+          seedResourceId={seedTrace}
+          onClose={() => { setAutopilot(false); setSeedTrace(""); }}
           onSaved={() => {
             setAutopilot(false);
+            setSeedTrace("");
             qc.invalidateQueries({ queryKey: ["workloads"] });
             setNotice("Saved discovered workloads.");
           }}
