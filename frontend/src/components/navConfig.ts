@@ -123,6 +123,7 @@ export const PROACTIVE_NAV: ProactiveItem[] = [
   { id: "alerts-manager", to: "/alerts-manager", label: "Alerts Manager", icon: "🔔", desc: "Find overlapping alert rules, duplicate notification paths, action-group routing issues and AMBA baseline gaps." },
   { id: "telemetry", to: "/telemetry", label: "Telemetry Coverage", icon: "📊", desc: "Measure diagnostic-settings coverage per resource type against the recommended baseline." },
   { id: "backupdr", to: "/backupdr", label: "Backup & DR Coverage", icon: "🔁", desc: "Audit backup and disaster-recovery protection and generate remediation runbooks." },
+  { id: "backup-manager", to: "/backup-manager", label: "Backup Manager", icon: "💾", desc: "Protection inventory, backup job triage, policy and vault administration, DR drills and approval-gated backup changes." },
   { id: "capability", to: "/capability", label: "Connection Capability", icon: "🔌", desc: "What each Azure connection can and can't reach — ARM, Graph, Log Analytics, Key Vault and gated writes — surfacing the blind spots that make an answer half-blind." },
   // Estate intelligence — what's deployed, how it's tagged, what changed.
   { id: "inventory", to: "/inventory", label: "Inventory", icon: "📋", group: "Estate intelligence", desc: "A unified resource grid with overview, location, cost and optimization lenses." },

@@ -102,5 +102,6 @@ No dedicated export, history, scheduling, or integration controls are documented
 ## Related pages
 
 - [Inventory]({{ site.baseurl }}/user-guide/estate-intelligence/inventory/)
+- [Backup Manager]({{ site.baseurl }}/user-guide/coverage/backup-manager/)
 - [Azure Policy]({{ site.baseurl }}/user-guide/governance-identity/azure-policy/)
 - [Connection Capability]({{ site.baseurl }}/user-guide/coverage/connection-capability/)

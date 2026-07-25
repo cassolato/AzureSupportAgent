@@ -3180,8 +3180,854 @@ export interface CaseUpdateBody {
   verification_json?: Record<string, unknown> | null;
 }
 
+// ---------------------------------------------------------------- Backup Manager
+export type BackupManagerScope = {
+  connection_id?: string;
+  workload_id?: string;
+  subscription_id?: string;
+  management_group_id?: string;
+};
+
+export interface BackupManagerCapabilities {
+  connection_id: string;
+  connection_name: string;
+  auth_method: string;
+  read_only: boolean;
+  can_read: boolean;
+  can_protect: boolean;
+  can_manage_policies: boolean;
+  can_manage_vaults: boolean;
+  can_ondemand: boolean;
+  can_drill: boolean;
+  can_edit_reference: boolean;
+  can_approve: boolean;
+  /** Always false — Backup Manager never restores data (see portal_only_operations). */
+  can_restore: false;
+  /** Always false — destructive backup operations are portal-only. */
+  can_delete_backup_data: false;
+  portal_only_operations: { id: string; label: string; reason: string }[];
+  demo?: boolean;
+}
+
+export interface BackupManagerSummary {
+  generated_at: string;
+  demo: boolean;
+  scope: Record<string, unknown>;
+  errors: Record<string, string>;
+  protection: { vaults: number; protected_items: number; stopped: number; orphaned: number; policies: number };
+  jobs: { window_hours: number; total: number; succeeded: number; failed: number; running: number; unknown: number; success_rate_pct: number | null };
+  chronic_failures: number;
+  rpo: { attainment_pct: number; breached: number; at_risk: number; unknown: number };
+  posture: { average_score: number; band: string; red_vaults: number; actionable_count: number };
+  dr: {
+    replicated_items: number; healthy: number; degraded: number; unhealthy: number;
+    stale_drills: number; recovery_plans: number; recovery_plans_stale: number;
+    drill_stale_days: number; health_pct: number;
+  };
+  cost: { monthly_total: number; currency: string; confidence: string; recoverable_monthly: number };
+  actionable_changes: number;
+  job_window_days: number;
+}
+
+export interface BackupInstance {
+  id: string;
+  name: string;
+  vault_id: string;
+  vault_name: string;
+  vault_kind: "recovery_services" | "backup";
+  subscription_id: string;
+  resource_group: string;
+  location: string;
+  friendly_name: string;
+  datasource_id: string;
+  datasource_type: string;
+  backup_management_type: string;
+  protection_state: string;
+  protection_status: string;
+  health_status: string;
+  last_backup_status: string;
+  last_backup_time: string;
+  latest_recovery_point: string;
+  recovery_point_age_hours: number | null;
+  recovery_point_source?: string;
+  policy_id: string;
+  policy_name: string;
+  archive_enabled: boolean;
+  last_error_code: string;
+  last_error_message: string;
+  protection_stopped: boolean;
+  retain_data_only: boolean;
+  orphaned: boolean;
+  offsite?: boolean;
+  vault_redundancy?: string;
+}
+
+export interface BackupInventoryResp {
+  rows: BackupInstance[];
+  page: number;
+  page_size: number;
+  total_count: number;
+  has_more: boolean;
+  facets: {
+    datasource_types: string[];
+    states: string[];
+    vaults: { id: string; name: string; kind: string; count: number }[];
+  };
+  errors: Record<string, string>;
+  demo: boolean;
+  generated_at: string;
+}
+
+export interface BackupJob {
+  id: string;
+  name: string;
+  vault_id: string;
+  vault_name: string;
+  vault_kind: string;
+  subscription_id: string;
+  operation: string;
+  status: string;
+  status_bucket: "succeeded" | "failed" | "running" | "unknown";
+  start_time: string;
+  end_time: string;
+  duration_seconds: number | null;
+  entity_name: string;
+  datasource_id: string;
+  datasource_type: string;
+  error_code: string;
+  error_message: string;
+  age_hours: number | null;
+  known_failure: boolean;
+  failure_title: string;
+  failure_category: string;
+  failure_cause: string;
+  failure_remediation: string;
+  failure_severity: string;
+  retryable: boolean;
+  is_backup_operation: boolean;
+}
+
+export interface BackupJobsResp {
+  rows: BackupJob[];
+  page: number;
+  page_size: number;
+  total_count: number;
+  has_more: boolean;
+  summary: BackupManagerSummary["jobs"];
+  job_window_days: number;
+  errors: Record<string, string>;
+  demo: boolean;
+}
+
+export interface BackupFailureCluster {
+  error_code: string;
+  title: string;
+  category: string;
+  severity: string;
+  cause: string;
+  remediation: string;
+  known: boolean;
+  retryable: boolean;
+  job_count: number;
+  entity_count: number;
+  entities: string[];
+  subscription_count: number;
+  vault_count: number;
+  sample_message: string;
+  latest_at: string;
+}
+
+export interface BackupChronicFailure {
+  instance_id: string;
+  name: string;
+  datasource_id: string;
+  datasource_type: string;
+  vault_id: string;
+  vault_name: string;
+  vault_kind: string;
+  subscription_id: string;
+  policy_name: string;
+  age_hours: number | null;
+  age_days: number | null;
+  latest_recovery_point: string;
+  error_code: string;
+  error_message: string;
+  severity: string;
+}
+
+export interface BackupJobAnalysis {
+  clusters: BackupFailureCluster[];
+  chronic: BackupChronicFailure[];
+  congestion: { hour: number; total: number; failed: number; avg_duration_s: number }[];
+  summary: BackupManagerSummary["jobs"];
+  job_window_days: number;
+  demo: boolean;
+}
+
+export interface BackupVault {
+  id: string;
+  name: string;
+  kind: "recovery_services" | "backup";
+  location: string;
+  resource_group: string;
+  subscription_id: string;
+  sku: string;
+  provisioning_state: string;
+  public_network_access: string;
+  soft_delete_state: string;
+  soft_delete_retention_days: number | null;
+  immutability_state: string;
+  redundancy: string;
+  cross_region_restore: string;
+  cross_subscription_restore: string;
+  monitor_alerts: string;
+  cmk: boolean;
+  private_endpoints: number;
+  mua_enabled: boolean | null;
+  mua_resource_guard_id: string;
+  diagnostics_enabled: boolean | null;
+  diagnostics_workspaces: string[];
+  instance_count: number;
+  policy_count: number;
+  replicated_item_count: number;
+  empty: boolean;
+  enrichment_error: string;
+}
+
+export interface BackupPostureCheck {
+  id: string;
+  label: string;
+  severity: string;
+  why: string;
+  weight: number;
+  portal_only: boolean;
+  portal_reason: string;
+  status: "pass" | "warn" | "fail" | "na";
+  value: string;
+  detail: string;
+  action: string;
+}
+
+export interface BackupVaultScore {
+  vault_id: string;
+  vault_name: string;
+  vault_kind: string;
+  subscription_id: string;
+  resource_group: string;
+  location: string;
+  instance_count: number;
+  replicated_item_count: number;
+  score: number;
+  band: "green" | "amber" | "red";
+  status: string;
+  checks: BackupPostureCheck[];
+  failing: string[];
+  warning: string[];
+  actionable: string[];
+  portal_only_gaps: { id: string; label: string; reason: string; value: string }[];
+}
+
+export interface BackupCapacityRow {
+  vault_id: string;
+  vault_name: string;
+  vault_kind: string;
+  subscription_id: string;
+  instances: number;
+  instance_limit: number;
+  instance_pct: number;
+  policies: number;
+  policy_limit: number;
+  policy_pct: number;
+  at_risk: boolean;
+}
+
+export interface BackupPostureResp {
+  vault_count: number;
+  average_score: number;
+  band: string;
+  red_vaults: number;
+  amber_vaults: number;
+  green_vaults: number;
+  vaults: BackupVaultScore[];
+  by_check: { id: string; label: string; severity: string; portal_only: boolean; portal_reason: string; pass: number; warn: number; fail: number; na: number }[];
+  actionable_count: number;
+  capacity: BackupCapacityRow[];
+  generated_at: string | null;
+  demo: boolean;
+}
+
+export interface BackupPolicy {
+  id: string;
+  arm_id: string;
+  name: string;
+  vault_id: string;
+  vault_name: string;
+  vault_kind: string;
+  subscription_id: string;
+  backup_management_type: string;
+  policy_type: string;
+  workload_type: string;
+  protected_items_count: number;
+  time_zone: string;
+  instant_rp_days: number | null;
+  schedule_summary: string;
+  retention_days: number | null;
+  in_use_count: number;
+  fingerprint: string;
+  below_floor: boolean;
+  retention_floor_days: number;
+  unused: boolean;
+  duplicate_of: string[];
+}
+
+export interface BackupPoliciesResp {
+  policies: BackupPolicy[];
+  duplicate_groups: {
+    fingerprint: string; policy_count: number; vault_count: number; names: string[];
+    vaults: string[]; protected_items: number; retention_days: number | null;
+    schedule_summary: string; backup_management_type: string;
+  }[];
+  summary: {
+    total: number; unused: number; below_floor: number; duplicate_groups: number;
+    duplicate_policies: number; retention_floor_days: number;
+    tiers: { id: string; label: string; rpo_hours: number; retention_days: number; require_offsite: boolean; drill_days: number }[];
+  };
+  demo: boolean;
+}
+
+export interface BackupRetentionImpact {
+  policy_id: string;
+  policy_name: string;
+  vault_name: string;
+  direction: "increase" | "decrease" | "none";
+  current_retention_days: number;
+  proposed_retention_days: number;
+  protected_item_count: number;
+  points_per_day: number;
+  recovery_points_removed: number;
+  exact_items: number;
+  estimated_items: number;
+  fully_exact: boolean;
+  irreversible: boolean;
+  per_instance: { instance_id: string; name: string; datasource_type: string; vault_name: string; recovery_points_removed: number; estimated: boolean; oldest_retained: string }[];
+  note: string;
+}
+
+export interface BackupGap {
+  gap_id: string;
+  source: "live" | "coverage";
+  resource_id: string;
+  resource_name: string;
+  resource_type: string;
+  display_type: string;
+  resource_group: string;
+  subscription_id: string;
+  location: string;
+  mechanism: string;
+  target_vault_kind: string;
+  severity: string;
+  reason: string;
+  failed_checks?: string[];
+  actionable?: boolean;
+}
+
+export interface BackupGapsResp {
+  gaps: BackupGap[];
+  coverage_gaps: BackupGap[];
+  eligible_total: number;
+  protected_total: number;
+  coverage_pct: number;
+  error: string;
+  native_only: { type: string; note: string }[];
+  vaults?: { id: string; name: string; kind: string; location: string; subscription_id: string; redundancy: string }[];
+  policies?: { id: string; arm_id: string; name: string; vault_id: string; vault_kind: string; backup_management_type: string; retention_days: number | null }[];
+  demo?: boolean;
+}
+
+export interface BackupRemediationItem {
+  gap_id: string;
+  resource_id: string;
+  resource_name: string;
+  resource_type: string;
+  display_type: string;
+  vault_id: string;
+  vault_name: string;
+  vault_kind: string;
+  policy_id: string;
+  policy_name: string;
+  mechanism: string;
+  status: "ready" | "blocked";
+  reason?: string;
+  target_id?: string;
+  summary?: string;
+  validated?: boolean;
+  requires_validation?: boolean;
+}
+
+export interface BackupManagerChange {
+  id: string;
+  connection_id: string;
+  target_type: string;
+  target_label: string;
+  target_id: string;
+  target_name: string;
+  operation: string;
+  status: string;
+  risk: string;
+  summary: Record<string, unknown>;
+  requested_by: string;
+  requested_at: string;
+  decided_by: string;
+  decided_at: string;
+  decision_reason: string;
+  requires_dual_approval: boolean;
+  second_approver: string;
+  second_approved_at: string;
+  applied_by: string;
+  applied_at: string;
+  error_code: string;
+  error_message: string;
+  rollback_of: string;
+  evidence_id: string;
+  plan_id: string;
+  depends_on: string[];
+  azure_job_id: string;
+  poll_attempts: number;
+  is_async: boolean;
+  can_rollback: boolean;
+}
+
+export interface BackupChangesResp {
+  rows: BackupManagerChange[];
+  page: number;
+  page_size: number;
+  total_count: number;
+  has_more: boolean;
+  status_counts: Record<string, number>;
+  pending_count: number;
+  approved_count: number;
+  applying_count: number;
+  actionable_count: number;
+}
+
+export interface BackupReplicationItem {
+  id: string;
+  name: string;
+  vault_name: string;
+  friendly_name: string;
+  protected_item_type: string;
+  protection_state: string;
+  replication_health: string;
+  healthy: boolean;
+  test_failover_state: string;
+  last_test_failover: string;
+  last_test_failover_age_days: number | null;
+  primary_region: string;
+  recovery_region: string;
+  policy_name: string;
+  rpo_seconds: number | null;
+  health_error_count: number;
+  health_errors: { code: string; summary: string; level: string }[];
+  status: "green" | "amber" | "red";
+  stale_drill: boolean;
+  issues: string[];
+  test_failover_active: boolean;
+}
+
+export interface BackupDrResp {
+  items: BackupReplicationItem[];
+  recovery_plans: {
+    id: string; name: string; friendly_name: string; vault_name: string;
+    primary_region: string; recovery_region: string; last_test_failover: string;
+    last_test_failover_age_days: number | null; current_scenario: string;
+    current_scenario_status: string; protected_item_count: number; stale_drill: boolean;
+  }[];
+  summary: BackupManagerSummary["dr"];
+  rpo: {
+    rows: { instance_id: string; name: string; datasource_type: string; vault_name: string; tier: string; rpo_target_hours: number; recovery_point_age_hours: number | null; latest_recovery_point: string; status: string }[];
+    total: number; met: number; at_risk: number; breached: number; unknown: number; attainment_pct: number;
+  };
+  demo: boolean;
+}
+
+export interface BackupDrill {
+  id: string;
+  connection_id: string;
+  name: string;
+  kind: "restore" | "test_failover";
+  scope_kind: string;
+  scope_id: string;
+  target_id: string;
+  target_name: string;
+  status: string;
+  cadence_days: number;
+  due_at: string;
+  executed_at: string;
+  executed_by: string;
+  outcome_notes: string;
+  rto_minutes: number | null;
+  change_id: string;
+  evidence_id: string;
+  metadata: Record<string, unknown>;
+  created_by: string;
+  created_at: string;
+  overdue: boolean;
+  days_until_due: number | null;
+}
+
+export interface BackupDrillsResp {
+  drills: BackupDrill[];
+  summary: {
+    total: number; open: number; overdue: number; executed: number; passed: number; failed: number;
+    pass_rate_pct: number | null; avg_rto_minutes: number | null;
+    replicated_items_never_tested: number; recovery_plans_stale: number;
+  };
+}
+
+export interface BackupCostActuals {
+  available: boolean;
+  by_vault: Record<string, number>;
+  by_meter: Record<string, number>;
+  daily: { date: string; cost: number }[];
+  currency: string;
+  total: number;
+  period: { from: string; to: string; partial: string };
+  partial_period: boolean;
+  cost_type: string;
+  subscriptions: string[];
+  reason: string;
+  remedy: string;
+  cache_age_seconds?: number;
+  vaults?: { vault_id: string; vault_name: string; cost: number; in_scope: boolean }[];
+  demo?: boolean;
+}
+
+export interface BackupCostAllocation {
+  rows: {
+    instance_id: string; name: string; datasource_type: string; vault_id: string;
+    vault_name: string; allocated_cost: number; vault_total: number; weight: number;
+    weight_basis: "consumed_gb" | "estimated_cost" | "equal";
+  }[];
+  currency: string;
+  allocated_total: number;
+  unattributed_total: number;
+  vaults_allocated: number;
+  vaults_unattributed: number;
+  basis_counts: Record<string, number>;
+  note: string;
+}
+
+export interface BackupCostVariance {
+  comparable: boolean;
+  estimated: number;
+  actual: number;
+  delta: number;
+  delta_pct: number | null;
+  estimate_currency: string;
+  actual_currency: string;
+  period: { from?: string; to?: string; partial?: string };
+  by_meter: Record<string, number>;
+  reason: string;
+}
+
+export interface BackupRateCard {
+  source: "azure_retail_prices" | "reference" | "unavailable";
+  currency: string;
+  region: string;
+  as_of: string;
+  instance_meters: Record<string, number>;
+  storage_gb_month: Record<string, number>;
+  files_storage_gb_month: Record<string, number>;
+  site_recovery_instance_month: number | null;
+  meter_count: number;
+  error: string;
+  cache_age_seconds?: number;
+  stale?: boolean;
+}
+
+export interface BackupCostResp {
+  currency: string;
+  region: string;
+  as_of: string;
+  rate_source: "azure_retail_prices" | "reference" | "unavailable";
+  rate_error: string;
+  estimate_only: boolean;
+  source: string;
+  protected_instance_cost: number;
+  storage_cost: number;
+  site_recovery_cost: number;
+  monthly_total: number;
+  annual_total: number;
+  instance_count: number;
+  replicated_item_count: number;
+  measured_instances: number;
+  unpriced_instances: number;
+  assumed_instance_gb: number;
+  confidence: "measured" | "partial" | "assumed";
+  top_rows: {
+    instance_id: string; name: string; datasource_type: string; vault_id: string;
+    vault_name: string; redundancy: string; stored_gb: number; instance_cost: number;
+    storage_cost: number; monthly_cost: number; meter: string; measured: boolean;
+    priced: boolean; note: string;
+  }[];
+  actuals: BackupCostActuals;
+  allocation: BackupCostAllocation;
+  variance: BackupCostVariance;
+  report_note: string;
+  price_region: string;
+  waste: {
+    findings: { kind: string; severity: string; title: string; detail: string; instance_id: string; name: string; vault_name: string; monthly_cost: number; action: string }[];
+    recoverable_monthly: number;
+    counts: Record<string, number>;
+    currency: string;
+    basis: "actual" | "estimated";
+  };
+  demo: boolean;
+}
+
+export interface BackupReportResp {
+  available: boolean;
+  workspace?: string;
+  days?: number;
+  vaults_total: number;
+  vaults_with_diagnostics: number;
+  required_categories: string[];
+  job_trend: { date: string; total: number; failed: number; succeeded: number }[];
+  storage: { item: string; storage_type: string; consumed_gb: number }[];
+  failure_history: { error_code: string; failures: number; items: number; last_seen: string }[];
+  sla: { item: string; total: number; succeeded: number; success_rate: number }[];
+  total_consumed_gb?: number;
+  reason: string;
+  remedy: string;
+  demo?: boolean;
+}
+
+export interface BackupComplianceResp {
+  rows: { instance_id: string; name: string; datasource_type: string; vault_name: string; tier: string; tier_label: string; rpo_target_hours: number; recovery_point_age_hours: number | null; rpo_ok: boolean; retention_days: number | null; retention_target_days: number; retention_ok: boolean; offsite_required: boolean; offsite_ok: boolean; compliant: boolean }[];
+  total: number;
+  compliant: number;
+  breaches: number;
+  compliance_pct: number;
+  tiers: { id: string; label: string; rpo_hours: number; retention_days: number; require_offsite: boolean; drill_days: number }[];
+  demo: boolean;
+}
+
+/**
+ * One analysis, every tab.
+ *
+ * The module deliberately does not refetch on mount, on tab switch, or on scope change:
+ * a full backup sweep is expensive and moving numbers under an operator mid-decision is
+ * worse than slightly stale ones. `report_exists: false` means this scope has never been
+ * analyzed, which is the UI's cue to offer the Analyze button instead of data.
+ */
+export interface BackupSnapshot {
+  schema_version: number;
+  report_exists: boolean;
+  generated_at: string;
+  age_seconds?: number | null;
+  demo: boolean;
+  reason?: string;
+  scope: { scope_kind?: string; scope_id?: string; subscriptions: string[] } & Record<string, unknown>;
+  errors: Record<string, string>;
+  job_window_days: number;
+  counts: { vaults?: number; protected_items?: number; policies?: number; jobs?: number; gaps?: number; failed_jobs?: number };
+  summary: BackupManagerSummary;
+  inventory: {
+    rows: BackupInstance[];
+    facets: BackupInventoryResp["facets"];
+    total_count: number;
+    truncated: boolean;
+  };
+  jobs: { rows: BackupJob[]; summary: BackupManagerSummary["jobs"]; total_count: number; job_window_days: number; truncated: boolean };
+  job_analysis: BackupJobAnalysis;
+  policies: BackupPoliciesResp;
+  compliance: BackupComplianceResp;
+  posture: BackupPostureResp;
+  vaults: { vaults: BackupVault[]; capacity: BackupCapacityRow[] };
+  gaps: BackupGapsResp & { truncated?: boolean };
+  dr: BackupDrResp;
+  cost: BackupCostResp;
+}
+
+/** One line of a running analysis, replayable after a reconnect. */
+export interface BackupRefreshProgressLine {
+  seq: number;
+  ts: string;
+  level: string;
+  phase: string;
+  message: string;
+}
+
+export interface BackupRefreshJob {
+  id: string;
+  key: string;
+  status: "running" | "done" | "error";
+  started_at: string;
+  finished_at: string | null;
+  progress_count: number;
+  last_message: string;
+  error: string;
+}
+
+export interface BackupRefreshJobResponse {
+  job: BackupRefreshJob | null;
+  progress: BackupRefreshProgressLine[];
+  result: BackupSnapshot | null;
+}
+
+function backupScopeQuery(scope: BackupManagerScope, extra: Record<string, string | number | boolean> = {}): string {
+  const params = new URLSearchParams();
+  if (scope.connection_id) params.set("connection_id", scope.connection_id);
+  if (scope.workload_id) params.set("workload_id", scope.workload_id);
+  if (scope.subscription_id) params.set("subscription_id", scope.subscription_id);
+  if (scope.management_group_id) params.set("management_group_id", scope.management_group_id);
+  for (const [key, value] of Object.entries(extra)) {
+    if (value !== "" && value !== undefined && value !== null) params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
 export const api = {
   me: () => http<Me>("/me"),
+
+  // ---------------------------------------------------------------- Backup Manager
+  backupManagerCapabilities: (scope: BackupManagerScope) =>
+    http<BackupManagerCapabilities>(`/backup-manager/capabilities${backupScopeQuery(scope)}`),
+  backupManagerSummary: (scope: BackupManagerScope) =>
+    http<BackupManagerSummary>(`/backup-manager/summary${backupScopeQuery(scope)}`),
+  /** Every tab's data as of the last analysis. Never triggers Azure work. */
+  backupManagerSnapshot: (scope: BackupManagerScope) =>
+    http<BackupSnapshot>(`/backup-manager/snapshot${backupScopeQuery(scope)}`),
+  /** Start (or re-attach to) the detached analysis for this scope. */
+  backupManagerAnalyzeStart: (scope: BackupManagerScope) =>
+    http<BackupRefreshJobResponse>(`/backup-manager/refresh/start${backupScopeQuery(scope)}`, {
+      method: "POST", body: "{}",
+    }),
+  backupManagerAnalyzeJob: (scope: BackupManagerScope) =>
+    http<BackupRefreshJobResponse>(`/backup-manager/refresh/job${backupScopeQuery(scope)}`),
+  backupManagerRefresh: (scope: BackupManagerScope) =>
+    http<{ ok: boolean; generated_at: string; errors: Record<string, string> }>("/backup-manager/refresh", {
+      method: "POST",
+      body: JSON.stringify(scope),
+    }),
+  backupManagerInventory: (
+    scope: BackupManagerScope,
+    opts: { search?: string; vault_id?: string; state?: string; datasource_type?: string; only_issues?: boolean; page?: number; page_size?: number } = {},
+  ) => http<BackupInventoryResp>(`/backup-manager/inventory${backupScopeQuery(scope, opts as Record<string, string | number | boolean>)}`),
+  backupManagerVaults: (scope: BackupManagerScope) =>
+    http<{ vaults: BackupVault[]; capacity: BackupCapacityRow[]; errors: Record<string, string>; demo: boolean }>(
+      `/backup-manager/vaults${backupScopeQuery(scope)}`,
+    ),
+  backupManagerPosture: (scope: BackupManagerScope) =>
+    http<BackupPostureResp>(`/backup-manager/posture${backupScopeQuery(scope)}`),
+  backupManagerJobs: (scope: BackupManagerScope, opts: { status?: string; search?: string; page?: number; page_size?: number } = {}) =>
+    http<BackupJobsResp>(`/backup-manager/jobs${backupScopeQuery(scope, opts as Record<string, string | number>)}`),
+  backupManagerJobAnalysis: (scope: BackupManagerScope) =>
+    http<BackupJobAnalysis>(`/backup-manager/jobs/analysis${backupScopeQuery(scope)}`),
+  backupManagerPolicies: (scope: BackupManagerScope) =>
+    http<BackupPoliciesResp>(`/backup-manager/policies${backupScopeQuery(scope)}`),
+  backupManagerRetentionImpact: (body: BackupManagerScope & { policy_id: string; proposed_retention_days: number; exact?: boolean }) =>
+    http<BackupRetentionImpact>("/backup-manager/policies/retention-impact", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerGaps: (scope: BackupManagerScope, includeCoverage = true) =>
+    http<BackupGapsResp>(`/backup-manager/gaps${backupScopeQuery(scope, { include_coverage: includeCoverage })}`),
+  backupManagerRemediationPreview: (body: BackupManagerScope & { gap_ids: string[]; vault_id: string; policy_id: string; validate_datasources?: boolean }) =>
+    http<{ items: BackupRemediationItem[]; ready_count: number; blocked_count: number; blocked: BackupRemediationItem[] }>(
+      "/backup-manager/remediation/preview", { method: "POST", body: JSON.stringify(body) },
+    ),
+  backupManagerRemediationSubmit: (body: BackupManagerScope & { gap_ids: string[]; vault_id: string; policy_id: string; validate_datasources?: boolean; reason?: string }) =>
+    http<{ ok: boolean; plan_id: string; created: number; changes: BackupManagerChange[] }>(
+      "/backup-manager/remediation/submit", { method: "POST", body: JSON.stringify(body) },
+    ),
+  backupManagerProtectionChange: (body: BackupManagerScope & {
+    action: "enable" | "change_policy" | "stop_retain_data" | "resume";
+    target_id?: string; resource_id?: string; vault_id?: string; policy_id?: string; reason?: string;
+  }) => http<{ ok: boolean; change: BackupManagerChange }>("/backup-manager/protection/changes", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerBackupNow: (body: BackupManagerScope & { instance_id: string; retain_until_days?: number; reason?: string }) =>
+    http<{ ok: boolean; change: BackupManagerChange }>("/backup-manager/backup-now", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerCancelJob: (body: BackupManagerScope & { job_id: string; reason?: string }) =>
+    http<{ ok: boolean; change: BackupManagerChange }>("/backup-manager/jobs/cancel", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerHarden: (body: BackupManagerScope & {
+    vault_id: string; controls: string[]; soft_delete_retention_days?: number;
+    redundancy?: "GeoRedundant" | "ZoneRedundant"; workspace_id?: string; reason?: string;
+  }) => http<{ ok: boolean; created: number; skipped: { control: string; reason: string }[]; changes: BackupManagerChange[] }>(
+    "/backup-manager/vaults/harden", { method: "POST", body: JSON.stringify(body) },
+  ),
+  backupManagerDr: (scope: BackupManagerScope) => http<BackupDrResp>(`/backup-manager/dr${backupScopeQuery(scope)}`),
+  backupManagerCompliance: (scope: BackupManagerScope) =>
+    http<BackupComplianceResp>(`/backup-manager/compliance${backupScopeQuery(scope)}`),
+  backupManagerTestFailover: (body: BackupManagerScope & {
+    replicated_item_id?: string; recovery_plan_id?: string;
+    network_type?: "NoNetwork" | "ExistingNetwork"; network_id?: string;
+    recovery_point_id?: string; drill_id?: string; reason?: string;
+  }) => http<{ ok: boolean; change: BackupManagerChange }>("/backup-manager/dr/test-failover", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerTestFailoverCleanup: (body: BackupManagerScope & { replicated_item_id?: string; recovery_plan_id?: string; comments?: string }) =>
+    http<{ ok: boolean; change: BackupManagerChange }>("/backup-manager/dr/test-failover-cleanup", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerDrills: (scope: BackupManagerScope, status = "") =>
+    http<BackupDrillsResp>(`/backup-manager/drills${backupScopeQuery(scope, { status })}`),
+  backupManagerCreateDrill: (body: BackupManagerScope & {
+    name: string; kind: "restore" | "test_failover"; scope_kind?: string; scope_id?: string;
+    target_id?: string; target_name?: string; cadence_days?: number;
+  }) => http<{ ok: boolean; drill: BackupDrill }>("/backup-manager/drills", { method: "POST", body: JSON.stringify(body) }),
+  backupManagerDrillOutcome: (drillId: string, body: { status: "passed" | "failed" | "cancelled"; notes?: string; rto_minutes?: number | null; capture_evidence?: boolean }) =>
+    http<{ ok: boolean; drill: BackupDrill; next_drill: BackupDrill | null }>(
+      `/backup-manager/drills/${drillId}/outcome`, { method: "POST", body: JSON.stringify(body) },
+    ),
+  backupManagerCost: (
+    scope: BackupManagerScope,
+    opts: { useReports?: boolean; useActuals?: boolean; monthsBack?: number; costType?: "AmortizedCost" | "ActualCost"; force?: boolean } = {},
+  ) =>
+    http<BackupCostResp>(`/backup-manager/cost${backupScopeQuery(scope, {
+      use_reports: opts.useReports ?? true,
+      use_actuals: opts.useActuals ?? true,
+      months_back: opts.monthsBack ?? 1,
+      cost_type: opts.costType ?? "AmortizedCost",
+      force: opts.force ?? false,
+    })}`),
+  backupManagerCostActuals: (
+    scope: BackupManagerScope,
+    opts: { monthsBack?: number; costType?: "AmortizedCost" | "ActualCost"; force?: boolean } = {},
+  ) =>
+    http<BackupCostActuals>(`/backup-manager/cost/actuals${backupScopeQuery(scope, {
+      months_back: opts.monthsBack ?? 1,
+      cost_type: opts.costType ?? "AmortizedCost",
+      force: opts.force ?? false,
+    })}`),
+  backupManagerPrices: (scope: BackupManagerScope, opts: { currency?: string; region?: string; force?: boolean } = {}) =>
+    http<BackupRateCard>(`/backup-manager/prices${backupScopeQuery(scope, {
+      currency: opts.currency ?? "", region: opts.region ?? "", force: opts.force ?? false,
+    })}`),
+  backupManagerReports: (scope: BackupManagerScope, days = 30) =>
+    http<BackupReportResp>(`/backup-manager/reports${backupScopeQuery(scope, { days })}`),
+  backupManagerChanges: (connectionId: string, page = 1, pageSize = 100, view: "all" | "action_required" = "all", status = "") =>
+    http<BackupChangesResp>(`/backup-manager/changes${backupScopeQuery({ connection_id: connectionId }, { page, page_size: pageSize, view, status })}`),
+  backupManagerDecideChange: (changeId: string, decision: "approved" | "rejected", reason: string) =>
+    http<{ ok: boolean; change: BackupManagerChange; awaiting_second_approver?: boolean }>(
+      `/backup-manager/changes/${changeId}/decision`, { method: "POST", body: JSON.stringify({ decision, reason }) },
+    ),
+  backupManagerBulkDecide: (connectionId: string, changeIds: string[], decision: "approved" | "rejected", reason: string) =>
+    http<{ ok: boolean; updated: BackupManagerChange[]; skipped: { id: string; reason: string }[] }>(
+      "/backup-manager/changes/bulk-decision",
+      { method: "POST", body: JSON.stringify({ connection_id: connectionId, change_ids: changeIds, decision, reason }) },
+    ),
+  backupManagerBulkApply: (connectionId: string, changeIds: string[]) =>
+    http<{ ok: boolean; results: BackupManagerChange[]; skipped: { id: string; reason: string }[] }>(
+      "/backup-manager/changes/bulk-apply",
+      { method: "POST", body: JSON.stringify({ connection_id: connectionId, change_ids: changeIds }) },
+    ),
+  backupManagerRollback: (changeId: string) =>
+    http<{ ok: boolean; change: BackupManagerChange }>(`/backup-manager/changes/${changeId}/rollback`, { method: "POST", body: "{}" }),
+  backupManagerPollerStatus: () =>
+    http<{ running: boolean; ticks: number; last_error: string }>("/backup-manager/changes/poller"),
+  backupManagerReference: () => http<Record<string, unknown>>("/backup-manager/reference"),
+  backupManagerSaveReference: (doc: Record<string, unknown>) =>
+    http<Record<string, unknown>>("/backup-manager/reference", { method: "PUT", body: JSON.stringify(doc) }),
+  backupManagerRefusals: () => http<{ operations: { id: string; label: string; reason: string }[] }>("/backup-manager/refusals"),
+  backupManagerExport: (kind: string, scope: BackupManagerScope) =>
+    httpBlob(`/backup-manager/export${backupScopeQuery(scope, { kind })}`),
+  backupManagerEvidence: (body: BackupManagerScope & { name?: string }) =>
+    http<{ ok: boolean; snapshot: Record<string, unknown> }>("/backup-manager/evidence", { method: "POST", body: JSON.stringify(body) }),
+
   activeLlm: () => http<ActiveLlm>("/llm/active"),
   // Connection capability & blind-spot matrix. live=true verifies ARM/Graph tokens for real.
   capabilityMatrix: (live = false) =>

@@ -54,3 +54,20 @@ for (const key of VERY_LOW_CHURN_TEN_MIN) {
   queryClient.setQueryDefaults(key, { staleTime: TEN_MIN });
 }
 
+// Operator-controlled analyses. These are expensive server-side sweeps whose results must
+// only change when the operator explicitly asks — never on mount, focus, reconnect, or a
+// staleness timer. Setting this here rather than at the call sites means the guarantee cannot
+// be lost by a future component forgetting one of the options.
+const OPERATOR_REFRESHED: readonly (readonly unknown[])[] = [
+  queryKeys.backupManager.snapshotRoot,
+];
+for (const key of OPERATOR_REFRESHED) {
+  queryClient.setQueryDefaults(key, {
+    staleTime: Infinity,
+    gcTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+

@@ -168,6 +168,9 @@ const TelemetryCoveragePanel = lazy(() =>
 const BackupDrCoveragePanel = lazy(() =>
   import("./BackupDrCoverageView").then((m) => ({ default: m.BackupDrCoveragePanel })),
 );
+const BackupManagerPanel = lazy(() =>
+  import("./BackupManagerView").then((m) => ({ default: m.BackupManagerPanel })),
+);
 const EvidenceLockerPanel = lazy(() =>
   import("./EvidenceLockerView").then((m) => ({ default: m.EvidenceLockerPanel })),
 );
@@ -600,6 +603,8 @@ export default function ChatView() {
   const inTelemetry = location.pathname.startsWith("/telemetry") && !location.pathname.startsWith("/telemetry-intel");
   // Backup & DR Coverage dashboard (admin-only).
   const inBackupDr = location.pathname.startsWith("/backupdr");
+  // Backup Manager — the write/management plane for Azure Backup and Site Recovery.
+  const inBackupManager = location.pathname.startsWith("/backup-manager");
   // Evidence Locker (investigation snapshots).
   const inEvidence = location.pathname.startsWith("/evidence");
   // Durable Case Files (the persistent incident spine).
@@ -713,7 +718,7 @@ export default function ChatView() {
   // Ownership, Architectures and Estate Graph now live UNDER Proactive Support, so opening
   // any of them (or the /proactive landing) keeps the group expanded.
   const inAnyProactive = inInventory || inPolicy || inAssessments || inRbac || inIdentity
-    || inCoverage || inAlertsManager || inTelemetry || inBackupDr || inEvidence || inRadar || inReservations
+    || inCoverage || inAlertsManager || inTelemetry || inBackupDr || inBackupManager || inEvidence || inRadar || inReservations
     || inTeleIntel || inPerformance || inTagIntel || inChangeExplorer
     || inOwnership || inArchitectures || inKnowMe || inFmea || inGraph || inProactive || inQuota || inCapability || inCases || inInsights;
   useEffect(() => {
@@ -2598,6 +2603,7 @@ export default function ChatView() {
             architectures: ArchitectureIcon, knowme: KnowMeIcon, fmea: FmeaIcon, ownership: OwnershipIcon, graph: GraphIcon,
             assessments: AssessmentIcon, performance: PerformanceIcon,
             coverage: CoverageIcon, "alerts-manager": CoverageIcon, telemetry: TelemetryIcon, backupdr: BackupIcon,
+            "backup-manager": BackupIcon,
             capability: CoverageIcon,
             inventory: InventoryIcon, tagintel: TagIcon, "change-explorer": ChangeIcon,
             policy: PolicyIcon, identity: IdentityIcon, rbac: RbacIcon,
@@ -2611,6 +2617,7 @@ export default function ChatView() {
             architectures: inArchitectures, knowme: inKnowMe, fmea: inFmea, ownership: inOwnership, graph: inGraph,
             assessments: inAssessments, performance: inPerformance,
             coverage: inCoverage, "alerts-manager": inAlertsManager, telemetry: inTelemetry, backupdr: inBackupDr,
+            "backup-manager": inBackupManager,
             capability: inCapability,
             inventory: inInventory, tagintel: inTagIntel, "change-explorer": inChangeExplorer,
             policy: inPolicy, identity: inIdentity, rbac: inRbac,
@@ -3220,6 +3227,14 @@ export default function ChatView() {
           <PanelErrorBoundary name="Backup & DR Coverage">
             <Suspense fallback={<PanelLoading />}>
               <BackupDrCoveragePanel />
+            </Suspense>
+          </PanelErrorBoundary>
+        </main>
+      ) : inBackupManager ? (
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          <PanelErrorBoundary name="Backup Manager">
+            <Suspense fallback={<PanelLoading />}>
+              <BackupManagerPanel />
             </Suspense>
           </PanelErrorBoundary>
         </main>

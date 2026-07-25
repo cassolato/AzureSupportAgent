@@ -1,0 +1,2006 @@
+"""Backup Manager API — protection inventory, job inbox, policies, vault posture, DR readiness,
+cost, reporting, drills, and the approval-gated managed change ledger.
+
+Scope follows the Alerts Manager contract (connection + workload / subscription / management
+group).  Reads are cached and fail-soft; every write drafts a managed change and nothing
+reaches Azure until an approver applies it.
+
+Two whole classes of operation are absent by design and reported through ``/refusals`` so the
+gap is explicit: **restores** and **destructive backup operations**.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.backup_manager import (
+    analysis as analysis_ops,
+    changes as change_ops,
+    cost as cost_ops,
+    costmgmt,
+    demo as demo_data,
+    dr as dr_ops,
+    drills as drill_ops,
+    export as export_ops,
+    gaps as gap_ops,
+    inventory as inventory_ops,
+    jobs as job_ops,
+    policies as policy_ops,
+    posture as posture_ops,
+    pricing,
+    reference,
+    reports as report_ops,
+    service,
+    snapshot as snapshot_store,
+)
+from app.backup_manager.builtin_seed import PORTAL_ONLY_OPERATIONS
+from app.core.db import SessionLocal, get_db
+from app.core.genjob import JobRegistry, ProgressFn
+from app.core.security import Principal, require_permission
+from app.models import AuditLog, BackupDrill, BackupManagerChange
+
+router = APIRouter(prefix="/backup-manager", tags=["backup-manager"])
+
+#: Detached refresh jobs, one per (tenant, connection, scope). Starting a refresh for a scope
+#: that is already analyzing simply re-attaches to the running job, so a double click — or two
+#: operators on the same scope — cannot launch two sweeps.
+_refresh_jobs = JobRegistry("backup-manager-refresh")
+
+_read = require_permission("backup_manager.read")
+_protect_write = require_permission("backup_manager.protect_write")
+_policy_write = require_permission("backup_manager.policy_write")
+_vault_write = require_permission("backup_manager.vault_write")
+_ondemand = require_permission("backup_manager.ondemand")
+_drill_write = require_permission("backup_manager.drill_write")
+_reference_write = require_permission("backup_manager.reference_write")
+_approve = require_permission("backup_manager.approve")
+
+MAX_PAGE_SIZE = 200
+APPLY_CONCURRENCY = 6
+
+
+# --------------------------------------------------------------------------- request models
+class ScopeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_id: str = Field(default="", max_length=128)
+    workload_id: str = Field(default="", max_length=128)
+    subscription_id: str = Field(default="", max_length=64)
+    management_group_id: str = Field(default="", max_length=128)
+
+
+class ProtectionChangeRequest(ScopeBody):
+    action: Literal["enable", "change_policy", "stop_retain_data", "resume"]
+    target_id: str = Field(default="", max_length=1024)
+    resource_id: str = Field(default="", max_length=1024)
+    vault_id: str = Field(default="", max_length=1024)
+    policy_id: str = Field(default="", max_length=1024)
+    reason: str = Field(default="", max_length=1000)
+
+
+class RemediationPreviewRequest(ScopeBody):
+    gap_ids: list[str] = Field(default_factory=list, max_length=500)
+    vault_id: str = Field(default="", max_length=1024)
+    policy_id: str = Field(default="", max_length=1024)
+    validate_datasources: bool = True
+
+
+class RemediationSubmitRequest(RemediationPreviewRequest):
+    reason: str = Field(default="", max_length=1000)
+
+
+class AdhocBackupRequest(ScopeBody):
+    instance_id: str = Field(min_length=1, max_length=1024)
+    retain_until_days: int = Field(default=30, ge=1, le=99)
+    reason: str = Field(default="", max_length=1000)
+
+
+class JobCancelRequest(ScopeBody):
+    job_id: str = Field(min_length=1, max_length=1024)
+    reason: str = Field(default="", max_length=1000)
+
+
+class VaultHardenRequest(ScopeBody):
+    vault_id: str = Field(min_length=1, max_length=1024)
+    controls: list[Literal["enable_soft_delete", "extend_soft_delete_retention", "enable_crr",
+                           "set_redundancy", "enable_vault_alerts", "enable_diagnostics"]] = Field(min_length=1, max_length=10)
+    soft_delete_retention_days: int = Field(default=14, ge=14, le=180)
+    redundancy: Literal["GeoRedundant", "ZoneRedundant"] = "GeoRedundant"
+    workspace_id: str = Field(default="", max_length=1024)
+    reason: str = Field(default="", max_length=1000)
+
+
+class RetentionImpactRequest(ScopeBody):
+    policy_id: str = Field(min_length=1, max_length=1024)
+    proposed_retention_days: int = Field(ge=1, le=36500)
+    exact: bool = True
+
+
+class TestFailoverRequest(ScopeBody):
+    replicated_item_id: str = Field(default="", max_length=1024)
+    recovery_plan_id: str = Field(default="", max_length=1024)
+    network_type: Literal["NoNetwork", "ExistingNetwork"] = "NoNetwork"
+    network_id: str = Field(default="", max_length=1024)
+    recovery_point_id: str = Field(default="", max_length=1024)
+    drill_id: str = Field(default="", max_length=64)
+    reason: str = Field(default="", max_length=1000)
+
+
+class CleanupRequest(ScopeBody):
+    replicated_item_id: str = Field(default="", max_length=1024)
+    recovery_plan_id: str = Field(default="", max_length=1024)
+    comments: str = Field(default="", max_length=500)
+
+
+class DrillCreateRequest(ScopeBody):
+    name: str = Field(min_length=1, max_length=256)
+    kind: Literal["restore", "test_failover"] = "restore"
+    scope_kind: Literal["workload", "subscription", "resource"] = "workload"
+    scope_id: str = Field(default="", max_length=256)
+    target_id: str = Field(default="", max_length=1024)
+    target_name: str = Field(default="", max_length=256)
+    cadence_days: int = Field(default=180, ge=0, le=3650)
+
+
+class DrillOutcomeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["passed", "failed", "cancelled"]
+    notes: str = Field(default="", max_length=4000)
+    rto_minutes: int | None = Field(default=None, ge=0, le=100000)
+    capture_evidence: bool = False
+
+
+class ChangeDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["approved", "rejected"]
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ChangeSelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    connection_id: str = Field(default="", max_length=128)
+    change_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class BulkDecisionRequest(ChangeSelectionRequest):
+    decision: Literal["approved", "rejected"]
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReferenceSaveRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    reason: str = Field(default="", max_length=500)
+
+
+class EvidenceRequest(ScopeBody):
+    name: str = Field(default="", max_length=200)
+
+
+# --------------------------------------------------------------------------- helpers
+def _tenant(principal: Principal) -> str:
+    return principal.tenant_id or "default"
+
+
+def _connection(connection_id: str, workload_id: str | None = None) -> dict[str, Any]:
+    try:
+        return service.resolve_selected_connection(connection_id or None, workload_id or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _is_demo(workload_id: str | None) -> bool:
+    from app.demo_catalog import is_demo_workload
+
+    return bool(workload_id) and is_demo_workload(workload_id)
+
+
+async def _estate(
+    principal: Principal,
+    *,
+    connection_id: str,
+    workload_id: str,
+    subscription_id: str,
+    management_group_id: str,
+    force: bool = False,
+    enrich: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(estate, connection)`` for a scope, serving demo data where applicable."""
+    if _is_demo(workload_id):
+        return demo_data.build_demo_estate(workload_id), {"id": "demo", "read_only": True, "display_name": "Demo"}
+    connection = _connection(connection_id, workload_id)
+    try:
+        estate = await inventory_ops.collect_estate(
+            connection, tenant_id=_tenant(principal), workload_id=workload_id or None,
+            subscription_id=subscription_id or None, management_group_id=management_group_id or None,
+            force=force,
+        )
+    except (ValueError, PermissionError) as exc:
+        raise HTTPException(status_code=400, detail=service.safe_error(str(exc))) from exc
+    if enrich and estate.get("vaults"):
+        await inventory_ops.enrich_vaults(connection, estate["vaults"])
+    return estate, connection
+
+
+def _paged(rows: list[dict[str, Any]], page: int, page_size: int) -> dict[str, Any]:
+    size = max(1, min(int(page_size or 100), MAX_PAGE_SIZE))
+    index = max(1, int(page or 1))
+    start = (index - 1) * size
+    window = rows[start:start + size]
+    return {
+        "rows": window,
+        "page": index,
+        "page_size": size,
+        "total_count": len(rows),
+        "has_more": start + size < len(rows),
+    }
+
+
+def _audit(principal: Principal, action: str, target: str, metadata: dict[str, Any]) -> AuditLog:
+    return AuditLog(
+        tenant_id=principal.tenant_id, actor_id=principal.subject,
+        action=action, target=str(target or "")[:512], metadata_json=metadata,
+    )
+
+
+def _capabilities(connection: dict[str, Any], principal: Principal) -> dict[str, Any]:
+    has = lambda perm: principal.is_admin or principal.has(perm)  # noqa: E731 - local shorthand
+    return {
+        "connection_id": str(connection.get("id") or ""),
+        "connection_name": str(connection.get("display_name") or "Azure connection"),
+        "auth_method": str(connection.get("auth_method") or ""),
+        "read_only": bool(connection.get("read_only", True)),
+        "can_read": has("backup_manager.read"),
+        "can_protect": has("backup_manager.protect_write"),
+        "can_manage_policies": has("backup_manager.policy_write"),
+        "can_manage_vaults": has("backup_manager.vault_write"),
+        "can_ondemand": has("backup_manager.ondemand"),
+        "can_drill": has("backup_manager.drill_write"),
+        "can_edit_reference": has("backup_manager.reference_write"),
+        "can_approve": has("backup_manager.approve"),
+        # Structural refusals — surfaced so the UI explains the absence.
+        "can_restore": False,
+        "can_delete_backup_data": False,
+        "portal_only_operations": PORTAL_ONLY_OPERATIONS,
+    }
+
+
+def _find(rows: list[dict[str, Any]], key: str, value: str) -> dict[str, Any] | None:
+    target = service.canonical_id(value)
+    for row in rows:
+        if service.canonical_id(row.get(key, "")) == target:
+            return row
+    return None
+
+
+def _guard_write(connection: dict[str, Any]) -> None:
+    if str(connection.get("id") or "") == "demo":
+        raise HTTPException(status_code=400, detail="Demo mode is read-only; select a live Azure connection.")
+    try:
+        service.assert_writable(connection)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- system
+@router.get("/capabilities")
+async def capabilities(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    if _is_demo(workload_id):
+        return {**_capabilities({"id": "demo", "display_name": "Demo", "read_only": True}, principal), "demo": True}
+    return _capabilities(_connection(connection_id, workload_id), principal)
+
+
+@router.get("/refusals")
+async def refusals(_principal: Principal = Depends(_read)) -> dict[str, Any]:
+    """Operations Backup Manager deliberately does not implement, and why."""
+    return {"operations": PORTAL_ONLY_OPERATIONS}
+
+
+@router.get("/summary")
+async def summary(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The overview scorecard: protection, jobs, RPO, posture, cost, actionable changes."""
+    estate, connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id,
+    )
+    enriched_jobs = job_ops.enrich(estate.get("jobs", []))
+    posture = posture_ops.build_posture(estate.get("vaults", []))
+    rpo = dr_ops.rpo_attainment(estate.get("instances", []))
+    readiness = dr_ops.build_readiness(estate)
+    chronic = job_ops.chronic_failures(enriched_jobs, estate.get("instances", []))
+    # The overview quotes list prices only: actual spend needs a Cost Management round-trip
+    # that would make this endpoint slow, and the Cost tab shows it properly. The billing
+    # currency is reused from cache when known so the two views cannot disagree.
+    rate_card = cost_ops.reference_rate_card()
+    if not estate.get("demo"):
+        currency = (
+            costmgmt.known_currency(connection, tenant_id=_tenant(principal))
+            or str(reference.cost_rates().get("currency") or "USD")
+        )
+        try:
+            live_card = await pricing.get_rate_card(_price_region(estate, connection), currency)
+            if live_card.get("instance_meters"):
+                rate_card = live_card
+        except (ValueError, KeyError, TypeError):  # noqa: BLE001
+            rate_card = cost_ops.reference_rate_card()
+    cost = cost_ops.estimate(estate, rate_card=rate_card)
+    waste = cost_ops.waste(estate, rate_card=rate_card)
+
+    actionable = 0
+    if str(connection.get("id") or "") != "demo":
+        actionable = int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(BackupManagerChange)
+                    .where(
+                        BackupManagerChange.tenant_id == _tenant(principal),
+                        BackupManagerChange.connection_id == str(connection.get("id") or ""),
+                        BackupManagerChange.status.in_(tuple(change_ops.ACTIONABLE_STATUSES)),
+                    )
+                )
+            ).scalar_one()
+            or 0
+        )
+
+    return {
+        "generated_at": estate.get("generated_at"),
+        "demo": bool(estate.get("demo")),
+        "scope": estate.get("scope", {}),
+        "errors": estate.get("errors", {}),
+        "protection": {
+            "vaults": len(estate.get("vaults", [])),
+            "protected_items": len(estate.get("instances", [])),
+            "stopped": sum(1 for i in estate.get("instances", []) if i.get("protection_stopped")),
+            "orphaned": sum(1 for i in estate.get("instances", []) if i.get("orphaned")),
+            "policies": len(estate.get("policies", [])),
+        },
+        "jobs": job_ops.summarize(enriched_jobs),
+        "chronic_failures": len(chronic),
+        "rpo": {
+            "attainment_pct": rpo["attainment_pct"], "breached": rpo["breached"],
+            "at_risk": rpo["at_risk"], "unknown": rpo["unknown"],
+        },
+        "posture": {
+            "average_score": posture["average_score"], "band": posture["band"],
+            "red_vaults": posture["red_vaults"], "actionable_count": posture["actionable_count"],
+        },
+        "dr": readiness["summary"],
+        "cost": {
+            "monthly_total": cost["monthly_total"], "currency": cost["currency"],
+            "confidence": cost["confidence"], "recoverable_monthly": waste["recoverable_monthly"],
+        },
+        "actionable_changes": actionable,
+        "job_window_days": estate.get("job_window_days"),
+    }
+
+
+@router.post("/refresh")
+async def refresh(
+    body: ScopeBody,
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, force=True,
+    )
+    return {"ok": True, "generated_at": estate.get("generated_at"), "errors": estate.get("errors", {})}
+
+
+# --------------------------------------------------------------------------- snapshot
+def _scope_identity(
+    workload_id: str, subscription_id: str, management_group_id: str,
+) -> tuple[str, str]:
+    if workload_id:
+        return "workload", workload_id
+    if subscription_id:
+        return "subscription", subscription_id
+    if management_group_id:
+        return "management_group", management_group_id
+    return "none", ""
+
+
+def _job_key(tenant_id: str, connection_id: str, scope_kind: str, scope_id: str) -> str:
+    return "|".join((tenant_id or "default", connection_id or "default", scope_kind, scope_id))
+
+
+def _job_response(job: dict[str, Any] | None) -> dict[str, Any]:
+    public = _refresh_jobs.public_job(job)
+    if not job or not public:
+        return {"job": None, "progress": [], "result": None}
+    return {
+        "job": public,
+        "progress": list(job.get("progress") or []),
+        "result": job.get("result") if job.get("status") == "done" else None,
+    }
+
+
+async def _actionable_changes(db: AsyncSession, tenant_id: str, connection_id: str) -> int:
+    if not connection_id or connection_id == "demo":
+        return 0
+    return int((await db.execute(
+        select(func.count()).select_from(BackupManagerChange).where(
+            BackupManagerChange.tenant_id == tenant_id,
+            BackupManagerChange.connection_id == connection_id,
+            BackupManagerChange.status.in_(tuple(change_ops.ACTIONABLE_STATUSES)),
+        )
+    )).scalar_one() or 0)
+
+
+async def _demo_snapshot(workload_id: str) -> dict[str, Any]:
+    """Demo estates are synthetic and instant, so they are composed on read.
+
+    Making the operator click Analyze for data that costs nothing to produce would be
+    friction without a purpose."""
+    estate = demo_data.build_demo_estate(workload_id)
+    enriched_jobs = job_ops.enrich(estate.get("jobs", []))
+    gaps = demo_data.demo_gaps(workload_id)
+    gaps["coverage_gaps"] = []
+    gaps.setdefault("vaults", [])
+    gaps.setdefault("policies", [])
+    compliance = policy_ops.compliance(estate.get("instances", []), estate.get("policies", []))
+    compliance["tiers"] = reference.load_reference().get("tiers", [])
+    cost = await analysis_ops.build_cost(
+        {"id": "demo"}, estate, tenant_id="demo", is_demo=True, use_reports=False, use_actuals=False,
+    )
+    snapshot = analysis_ops.compose(
+        estate,
+        enriched_jobs=enriched_jobs,
+        posture=posture_ops.build_posture(estate.get("vaults", [])),
+        policies=policy_ops.analyze(estate.get("policies", []), estate.get("instances", [])),
+        compliance=compliance,
+        gaps=gaps,
+        readiness=dr_ops.build_readiness(estate),
+        rpo=dr_ops.rpo_attainment(estate.get("instances", [])),
+        cost=cost,
+    )
+    snapshot["schema_version"] = snapshot_store.SNAPSHOT_SCHEMA_VERSION
+    snapshot["demo"] = True
+    return snapshot
+
+
+@router.get("/snapshot")
+async def get_snapshot(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Every tab's data, exactly as the last analysis computed it.
+
+    This endpoint never talks to Azure. If the scope has not been analyzed it returns an empty
+    shell with ``report_exists: false``, which is what tells the UI to offer Analyze rather
+    than silently starting a multi-minute sweep on page load."""
+    scope_kind, scope_id = _scope_identity(workload_id, subscription_id, management_group_id)
+    if _is_demo(workload_id):
+        return await _demo_snapshot(workload_id)
+
+    connection = _connection(connection_id, workload_id)
+    tenant = _tenant(principal)
+    stored = snapshot_store.read_snapshot(
+        tenant, str(connection.get("id") or ""), scope_kind, scope_id,
+    )
+    if stored is None:
+        return snapshot_store.empty_snapshot(scope_kind, scope_id)
+    # The change ledger moves independently of an analysis, so it is layered on live rather
+    # than served at whatever value it had when the snapshot was taken.
+    summary = stored.get("summary")
+    if isinstance(summary, dict):
+        summary["actionable_changes"] = await _actionable_changes(
+            db, tenant, str(connection.get("id") or ""),
+        )
+    stored["age_seconds"] = snapshot_store.age_seconds(stored)
+    return stored
+
+
+@router.post("/refresh/start")
+async def refresh_start(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    """Start a detached analysis for this scope, idempotently.
+
+    The job outlives the request, so navigating away or closing the tab does not abandon a
+    sweep that has already spent minutes of Azure calls."""
+    scope_kind, scope_id = _scope_identity(workload_id, subscription_id, management_group_id)
+    if _is_demo(workload_id):
+        raise HTTPException(status_code=400, detail="Demo scopes are generated on read and need no analysis.")
+    if scope_kind == "none":
+        raise HTTPException(status_code=400, detail="Select a workload, subscription, or management group first.")
+
+    connection = _connection(connection_id, workload_id)
+    tenant = _tenant(principal)
+    effective_connection = str(connection.get("id") or "")
+    key = _job_key(tenant, effective_connection, scope_kind, scope_id)
+
+    async def runner(progress: ProgressFn) -> dict[str, Any]:
+        await progress("start", "Starting a server-side backup estate analysis. It continues if you navigate away.")
+        lock = snapshot_store.get_lock(tenant, effective_connection, scope_kind, scope_id)
+        async with lock:
+            snapshot = await analysis_ops.build_snapshot(
+                connection, tenant_id=tenant, scope_kind=scope_kind, scope_id=scope_id,
+                workload_id=workload_id, subscription_id=subscription_id,
+                management_group_id=management_group_id, progress=progress,
+            )
+            await progress("save", "Saving the analysis so every tab reads the same numbers…")
+            snapshot_store.write_snapshot(tenant, effective_connection, scope_kind, scope_id, snapshot)
+            async with SessionLocal() as db:
+                db.add(_audit(principal, "backup_manager.analyze", f"{scope_kind}:{scope_id}", {
+                    "counts": snapshot.get("counts", {}),
+                    "errors": sorted((snapshot.get("errors") or {}).keys()),
+                }))
+                await db.commit()
+                snapshot["summary"]["actionable_changes"] = await _actionable_changes(
+                    db, tenant, effective_connection,
+                )
+        counts = snapshot.get("counts", {})
+        await progress(
+            "done",
+            f"Analysis complete — {counts.get('protected_items', 0):,} protected item(s) in "
+            f"{counts.get('vaults', 0):,} vault(s), {counts.get('jobs', 0):,} job(s), "
+            f"{counts.get('gaps', 0):,} gap(s)."
+            + (f" Some sources failed: {', '.join(sorted((snapshot.get('errors') or {}).keys()))}."
+               if snapshot.get("errors") else ""),
+        )
+        return snapshot
+
+    return _job_response(_refresh_jobs.start(key, runner))
+
+
+@router.get("/refresh/job")
+async def refresh_job(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    """The current or most recent analysis for this scope, with its replayable progress log."""
+    scope_kind, scope_id = _scope_identity(workload_id, subscription_id, management_group_id)
+    if _is_demo(workload_id) or scope_kind == "none":
+        return {"job": None, "progress": [], "result": None}
+    connection = _connection(connection_id, workload_id)
+    key = _job_key(_tenant(principal), str(connection.get("id") or ""), scope_kind, scope_id)
+    return _job_response(_refresh_jobs.get_job(key))
+
+
+# --------------------------------------------------------------------------- inventory
+@router.get("/inventory")
+async def inventory(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    search: str = Query(default="", max_length=200),
+    vault_id: str = Query(default="", max_length=1024),
+    state: str = Query(default="", max_length=40),
+    datasource_type: str = Query(default="", max_length=120),
+    only_issues: bool = Query(default=False),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=MAX_PAGE_SIZE),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    rows = estate.get("instances", [])
+    needle = search.strip().lower()
+    if needle:
+        rows = [
+            r for r in rows
+            if needle in (r.get("friendly_name") or "").lower()
+            or needle in (r.get("datasource_id") or "")
+            or needle in (r.get("policy_name") or "").lower()
+        ]
+    if vault_id:
+        rows = [r for r in rows if service.canonical_id(r.get("vault_id", "")) == service.canonical_id(vault_id)]
+    if state:
+        rows = [r for r in rows if (r.get("protection_state") or "").lower() == state.lower()]
+    if datasource_type:
+        rows = [r for r in rows if (r.get("datasource_type") or "").lower() == datasource_type.lower()]
+    if only_issues:
+        rows = [
+            r for r in rows
+            if r.get("orphaned") or r.get("protection_stopped") or r.get("last_error_code")
+            or (r.get("last_backup_status") or "").lower() in ("failed", "unhealthy")
+        ]
+    facets = {
+        "datasource_types": sorted({r.get("datasource_type", "") for r in estate.get("instances", []) if r.get("datasource_type")}),
+        "states": sorted({r.get("protection_state", "") for r in estate.get("instances", []) if r.get("protection_state")}),
+        "vaults": [
+            {"id": v["id"], "name": v["name"], "kind": v["kind"], "count": v.get("instance_count", 0)}
+            for v in estate.get("vaults", [])
+        ],
+    }
+    return {**_paged(rows, page, page_size), "facets": facets, "errors": estate.get("errors", {}),
+            "demo": bool(estate.get("demo")), "generated_at": estate.get("generated_at")}
+
+
+@router.get("/vaults")
+async def vaults(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id,
+    )
+    return {
+        "vaults": estate.get("vaults", []),
+        "capacity": posture_ops.capacity(estate.get("vaults", [])),
+        "errors": estate.get("errors", {}),
+        "demo": bool(estate.get("demo")),
+    }
+
+
+@router.get("/posture")
+async def posture(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id,
+    )
+    result = posture_ops.build_posture(estate.get("vaults", []))
+    result["generated_at"] = estate.get("generated_at")
+    result["demo"] = bool(estate.get("demo"))
+    result["capacity"] = posture_ops.capacity(estate.get("vaults", []))
+    return result
+
+
+# --------------------------------------------------------------------------- jobs
+@router.get("/jobs")
+async def list_jobs(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    status: str = Query(default="", max_length=24),
+    search: str = Query(default="", max_length=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=MAX_PAGE_SIZE),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    rows = job_ops.enrich(estate.get("jobs", []))
+    if status:
+        rows = [r for r in rows if r.get("status_bucket") == status.lower()]
+    needle = search.strip().lower()
+    if needle:
+        rows = [
+            r for r in rows
+            if needle in (r.get("entity_name") or "").lower()
+            or needle in (r.get("error_code") or "").lower()
+            or needle in (r.get("operation") or "").lower()
+        ]
+    return {
+        **_paged(rows, page, page_size),
+        "summary": job_ops.summarize(job_ops.enrich(estate.get("jobs", []))),
+        "job_window_days": estate.get("job_window_days"),
+        "errors": estate.get("errors", {}),
+        "demo": bool(estate.get("demo")),
+    }
+
+
+@router.get("/jobs/analysis")
+async def job_analysis(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    """Failure clusters, chronic-failure list, and backup-window congestion in one call."""
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    enriched = job_ops.enrich(estate.get("jobs", []))
+    return {
+        "clusters": job_ops.cluster_failures(enriched),
+        "chronic": job_ops.chronic_failures(enriched, estate.get("instances", [])),
+        "congestion": job_ops.congestion(enriched),
+        "summary": job_ops.summarize(enriched),
+        "job_window_days": estate.get("job_window_days"),
+        "demo": bool(estate.get("demo")),
+    }
+
+
+# --------------------------------------------------------------------------- policies
+@router.get("/policies")
+async def list_policies(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    result = policy_ops.analyze(estate.get("policies", []), estate.get("instances", []))
+    result["demo"] = bool(estate.get("demo"))
+    return result
+
+
+@router.post("/policies/retention-impact")
+async def retention_impact(
+    body: RetentionImpactRequest,
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    policy = _find(estate.get("policies", []), "id", body.policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Policy not found in this scope.")
+    if str(connection.get("id") or "") == "demo":
+        return await policy_ops.retention_impact(
+            connection, policy, estate.get("instances", []),
+            proposed_retention_days=body.proposed_retention_days, exact=False,
+        )
+    return await policy_ops.retention_impact(
+        connection, policy, estate.get("instances", []),
+        proposed_retention_days=body.proposed_retention_days, exact=body.exact,
+    )
+
+
+# --------------------------------------------------------------------------- gaps
+@router.get("/gaps")
+async def list_gaps(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    include_coverage: bool = Query(default=True),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    if _is_demo(workload_id):
+        result = demo_data.demo_gaps(workload_id)
+        result["coverage_gaps"] = []
+        return result
+    estate, connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    subscriptions = set(estate.get("scope", {}).get("subscriptions") or [])
+    result = await gap_ops.detect(connection, estate, subscriptions=subscriptions)
+    coverage: list[dict[str, Any]] = []
+    if include_coverage:
+        scope_kind = "workload" if workload_id else "subscription"
+        scope_id = workload_id or subscription_id
+        if scope_id:
+            coverage = gap_ops.ingest_coverage_gaps(_tenant(principal), scope_kind, scope_id)
+    result["coverage_gaps"] = coverage
+    result["vaults"] = [
+        {"id": v["id"], "name": v["name"], "kind": v["kind"], "location": v["location"],
+         "subscription_id": v["subscription_id"], "redundancy": v.get("redundancy", "")}
+        for v in estate.get("vaults", [])
+    ]
+    result["policies"] = [
+        {"id": p["id"], "arm_id": p.get("arm_id", ""), "name": p["name"], "vault_id": p["vault_id"],
+         "vault_kind": p["vault_kind"], "backup_management_type": p.get("backup_management_type", ""),
+         "retention_days": p.get("retention_days")}
+        for p in estate.get("policies", [])
+    ]
+    return result
+
+
+async def _build_remediation(
+    principal: Principal, body: RemediationPreviewRequest,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    _guard_write(connection)
+    subscriptions = set(estate.get("scope", {}).get("subscriptions") or [])
+    detected = await gap_ops.detect(connection, estate, subscriptions=subscriptions)
+    wanted = set(body.gap_ids)
+    selected = [g for g in detected["gaps"] if g["gap_id"] in wanted] if wanted else []
+    if not selected:
+        raise HTTPException(status_code=400, detail="No matching open gaps were selected.")
+    vault = _find(estate.get("vaults", []), "id", body.vault_id)
+    if vault is None:
+        raise HTTPException(status_code=400, detail="Select a target vault visible in this scope.")
+    policy = _find(estate.get("policies", []), "id", body.policy_id) or _find(
+        estate.get("policies", []), "arm_id", body.policy_id
+    )
+    if policy is None:
+        raise HTTPException(status_code=400, detail="Select a backup policy that belongs to the target vault.")
+
+    items = [gap_ops.plan_item(gap, vault, policy) for gap in selected]
+    if body.validate_datasources:
+        needs_validation = [i for i in items if i.get("requires_validation") and i.get("status") == "ready"]
+        if needs_validation:
+            results = await service.bounded_gather(
+                [lambda i=i: gap_ops.validate_dataprotection_item(connection, i) for i in needs_validation], limit=4,
+            )
+            validated = {
+                id(original): result
+                for original, result in zip(needs_validation, service.unwrap(results))
+                if isinstance(result, dict)
+            }
+            items = [validated.get(id(i), i) for i in items]
+    return items, estate, connection
+
+
+@router.post("/remediation/preview")
+async def remediation_preview(
+    body: RemediationPreviewRequest,
+    principal: Principal = Depends(_protect_write),
+) -> dict[str, Any]:
+    items, _estate, _connection = await _build_remediation(principal, body)
+    ready = [i for i in items if i["status"] == "ready"]
+    blocked = [i for i in items if i["status"] != "ready"]
+    return {
+        "items": [{k: v for k, v in item.items() if k != "body"} for item in items],
+        "ready_count": len(ready),
+        "blocked_count": len(blocked),
+        "blocked": blocked,
+    }
+
+
+@router.post("/remediation/submit")
+async def remediation_submit(
+    body: RemediationSubmitRequest,
+    principal: Principal = Depends(_protect_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    items, _estate, connection = await _build_remediation(principal, body)
+    ready = [i for i in items if i["status"] == "ready"]
+    if not ready:
+        raise HTTPException(status_code=400, detail="No selected gap can be remediated; review the blockers first.")
+    plan_id = service.canonical_hash({"gaps": sorted(i["gap_id"] for i in ready), "at": service.now_iso()})[:32]
+    rows: list[BackupManagerChange] = []
+    for item in ready:
+        row = change_ops.build_change(
+            tenant_id=_tenant(principal),
+            connection_id=str(connection.get("id") or ""),
+            target_type="protection",
+            target_id=item["target_id"],
+            operation="create",
+            requested_by=principal.subject,
+            desired={"body": item["body"]},
+            summary={**change_ops.summary_for_protection(item), "reason": body.reason},
+            plan_id=plan_id,
+        )
+        rows.append(row)
+        db.add(row)
+    db.add(_audit(principal, "backup_manager.remediation.submit", plan_id, {
+        "count": len(rows), "vault_id": body.vault_id, "policy_id": body.policy_id,
+    }))
+    await db.commit()
+    return {
+        "ok": True, "plan_id": plan_id, "created": len(rows),
+        "changes": [change_ops.public_change(r) for r in rows],
+    }
+
+
+# --------------------------------------------------------------------------- protection actions
+@router.post("/protection/changes")
+async def protection_change(
+    body: ProtectionChangeRequest,
+    principal: Principal = Depends(_protect_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Draft an enable / change-policy / resume / stop-with-data-retained change.
+
+    Deleting backup data is not reachable: the request model has no such action and the apply
+    handler refuses any stop mode other than retain-data."""
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    _guard_write(connection)
+
+    if body.action == "enable":
+        gap = {
+            "gap_id": "", "resource_id": body.resource_id,
+            "resource_name": service.name_from_id(body.resource_id),
+            "resource_type": _type_from_id(body.resource_id),
+            "display_type": "", "location": "",
+            "subscription_id": service.subscription_from_id(body.resource_id),
+            "resource_group": service.resource_group_from_id(body.resource_id),
+        }
+        spec = gap_ops.ELIGIBLE_TYPES.get(gap["resource_type"])
+        if not spec:
+            raise HTTPException(status_code=400, detail="Backup Manager cannot enrol this resource type in a vault.")
+        gap["display_type"] = spec["display"]
+        vault = _find(estate.get("vaults", []), "id", body.vault_id)
+        policy = _find(estate.get("policies", []), "id", body.policy_id) or _find(
+            estate.get("policies", []), "arm_id", body.policy_id
+        )
+        if vault is None or policy is None:
+            raise HTTPException(status_code=400, detail="A visible target vault and policy are required.")
+        gap["location"] = vault.get("location", "")
+        item = gap_ops.plan_item(gap, vault, policy)
+        if item["status"] != "ready":
+            raise HTTPException(status_code=400, detail=item.get("reason") or "This protection request is not valid.")
+        row = change_ops.build_change(
+            tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+            target_type="protection", target_id=item["target_id"], operation="create",
+            requested_by=principal.subject, desired={"body": item["body"]},
+            summary={**change_ops.summary_for_protection(item), "reason": body.reason},
+        )
+    else:
+        instance = _find(estate.get("instances", []), "id", body.target_id)
+        if instance is None:
+            raise HTTPException(status_code=404, detail="Protected item not found in this scope.")
+        mechanism = "dataprotection" if instance["vault_kind"] == "backup" else "rsv_vm"
+        api_version = service.DP_API if mechanism == "dataprotection" else service.RSV_BACKUP_API
+        live, _status, _error = await service.arm_get(connection, instance["id"], api_version)
+        before = live or {}
+        common = {
+            "mechanism": mechanism, "api_version": api_version, "reason": body.reason,
+            "instance_name": instance.get("friendly_name", ""), "vault_name": instance.get("vault_name", ""),
+            "resource_id": instance.get("datasource_id", ""),
+        }
+        if body.action == "stop_retain_data":
+            desired_body = change_ops._stop_protection_body({"mechanism": mechanism}, before)
+            row = change_ops.build_change(
+                tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+                target_type="protection", target_id=instance["id"], operation="delete",
+                requested_by=principal.subject, desired={"body": desired_body}, before=before,
+                summary={**common, "kind": "stop_protection", "stop_mode": change_ops.STOP_PROTECTION_RETAIN,
+                         "description": f"Stop protection for {instance.get('friendly_name')} and retain existing recovery points"},
+                risk="medium",
+            )
+        else:
+            policy_id = body.policy_id or instance.get("policy_id", "")
+            policy = _find(estate.get("policies", []), "id", policy_id) or _find(
+                estate.get("policies", []), "arm_id", policy_id
+            )
+            if policy is None:
+                raise HTTPException(status_code=400, detail="Select a backup policy that belongs to this item's vault.")
+            policy_arm_id = str(policy.get("arm_id") or policy.get("id") or "")
+            if mechanism == "dataprotection":
+                desired_body = {"properties": {**service.as_dict(before.get("properties")),
+                                               "policyInfo": {"policyId": policy_arm_id}}}
+            else:
+                props = service.as_dict(before.get("properties"))
+                desired_body = {"properties": {
+                    "protectedItemType": str(props.get("protectedItemType") or "Microsoft.Compute/virtualMachines"),
+                    "sourceResourceId": str(props.get("sourceResourceId") or instance.get("datasource_id") or ""),
+                    "policyId": policy_arm_id,
+                }}
+            intent = "resume" if body.action == "resume" else "change_policy"
+            row = change_ops.build_change(
+                tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+                target_type="protection", target_id=instance["id"], operation="update",
+                requested_by=principal.subject, desired={"body": desired_body}, before=before,
+                summary={**common, "kind": intent, "intent": intent, "policy_id": policy_arm_id,
+                         "policy_name": policy.get("name", ""),
+                         "description": (
+                             f"Resume protection for {instance.get('friendly_name')}"
+                             if intent == "resume"
+                             else f"Move {instance.get('friendly_name')} to policy {policy.get('name')}"
+                         )},
+            )
+    db.add(row)
+    db.add(_audit(principal, f"backup_manager.protection.{body.action}", row.target_id, {"change_id": row.id}))
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(row)}
+
+
+def _type_from_id(resource_id: str) -> str:
+    parts = str(resource_id or "").strip("/").split("/")
+    lower = [p.lower() for p in parts]
+    try:
+        index = lower.index("providers")
+    except ValueError:
+        return ""
+    tail = parts[index + 1:]
+    if len(tail) < 2:
+        return ""
+    segments = [tail[0]] + [tail[i] for i in range(1, len(tail), 2)]
+    return "/".join(segments).lower()
+
+
+@router.post("/backup-now")
+async def backup_now(
+    body: AdhocBackupRequest,
+    principal: Principal = Depends(_ondemand),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    _guard_write(connection)
+    instance = _find(estate.get("instances", []), "id", body.instance_id)
+    if instance is None:
+        raise HTTPException(status_code=404, detail="Protected item not found in this scope.")
+    mechanism = "dataprotection" if instance["vault_kind"] == "backup" else "rsv_vm"
+    if mechanism == "dataprotection":
+        request_body: dict[str, Any] = {"backupRuleOptions": {"ruleName": "BackupDaily",
+                                                              "triggerOption": {"retentionTagOverride": "Default"}}}
+    else:
+        expiry = (service.now() + __import__("datetime").timedelta(days=body.retain_until_days)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        request_body = {"properties": {"objectType": "IaasVMBackupRequest", "recoveryPointExpiryTimeInUTC": expiry}}
+    row = change_ops.build_change(
+        tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+        target_type="adhoc_backup", target_id=instance["id"], operation="invoke",
+        requested_by=principal.subject, desired={"body": request_body},
+        summary={
+            "kind": "adhoc_backup", "mechanism": mechanism,
+            "instance_name": instance.get("friendly_name", ""), "vault_name": instance.get("vault_name", ""),
+            "retain_until_days": body.retain_until_days, "reason": body.reason,
+            "description": f"Run an on-demand backup of {instance.get('friendly_name')}",
+        },
+    )
+    db.add(row)
+    db.add(_audit(principal, "backup_manager.adhoc_backup", row.target_id, {"change_id": row.id}))
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(row)}
+
+
+@router.post("/jobs/cancel")
+async def cancel_job(
+    body: JobCancelRequest,
+    principal: Principal = Depends(_ondemand),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    _guard_write(connection)
+    job = _find(estate.get("jobs", []), "id", body.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found in this scope.")
+    if job.get("vault_kind") != "recovery_services":
+        raise HTTPException(status_code=400, detail="Only Recovery Services vault jobs can be cancelled here.")
+    if job.get("status_bucket") != "running":
+        raise HTTPException(status_code=400, detail="Only a running job can be cancelled.")
+    row = change_ops.build_change(
+        tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+        target_type="job_cancel", target_id=job["id"], operation="invoke",
+        requested_by=principal.subject, desired={"body": {}},
+        summary={"kind": "job_cancel", "entity_name": job.get("entity_name", ""),
+                 "operation_name": job.get("operation", ""), "reason": body.reason,
+                 "description": f"Cancel the running {job.get('operation')} job for {job.get('entity_name')}"},
+    )
+    db.add(row)
+    db.add(_audit(principal, "backup_manager.job_cancel", row.target_id, {"change_id": row.id}))
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(row)}
+
+
+# --------------------------------------------------------------------------- vault hardening
+@router.post("/vaults/harden")
+async def harden_vault(
+    body: VaultHardenRequest,
+    principal: Principal = Depends(_vault_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Draft one change per selected control. Irreversible controls are refused outright."""
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id,
+    )
+    _guard_write(connection)
+    vault = _find(estate.get("vaults", []), "id", body.vault_id)
+    if vault is None:
+        raise HTTPException(status_code=404, detail="Vault not found in this scope.")
+
+    rows: list[BackupManagerChange] = []
+    skipped: list[dict[str, str]] = []
+    # The Recovery Services vault PATCH rejects a partial monitoringSettings object, so the
+    # alerts change has to merge into the live settings rather than send just the one key.
+    live_props: dict[str, Any] = {}
+    live_body: dict[str, Any] = {}
+    alerts_read_error = ""
+    if "enable_vault_alerts" in body.controls:
+        api_version = service.RSV_API if vault["kind"] == "recovery_services" else service.DP_API
+        live, _status, alerts_read_error = await service.arm_get(connection, vault["id"], api_version)
+        if live:
+            live_body = change_ops.concurrency_body(live)
+            live_props = service.as_dict(live.get("properties"))
+        else:
+            alerts_read_error = alerts_read_error or "The vault's current settings could not be read."
+    for control in dict.fromkeys(body.controls):
+        if control == "enable_vault_alerts" and alerts_read_error:
+            # The vault PATCH validates monitoringSettings as a whole, so drafting without the
+            # live object would guarantee a failed apply. Fail here instead.
+            skipped.append({"control": control, "reason": alerts_read_error})
+            continue
+        try:
+            row = _build_harden_change(principal, connection, vault, control, body, live_props, live_body)
+        except ValueError as exc:
+            skipped.append({"control": control, "reason": str(exc)})
+            continue
+        if row is None:
+            skipped.append({"control": control, "reason": "Already satisfied on this vault."})
+            continue
+        rows.append(row)
+        db.add(row)
+    if not rows:
+        raise HTTPException(status_code=400, detail=skipped[0]["reason"] if skipped else "Nothing to change.")
+    db.add(_audit(principal, "backup_manager.vault.harden", vault["id"], {
+        "controls": list(body.controls), "created": len(rows),
+    }))
+    await db.commit()
+    return {
+        "ok": True, "created": len(rows), "skipped": skipped,
+        "changes": [change_ops.public_change(r) for r in rows],
+    }
+
+
+def _build_harden_change(
+    principal: Principal, connection: dict[str, Any], vault: dict[str, Any], control: str,
+    body: VaultHardenRequest, live_props: dict[str, Any] | None = None,
+    live_body: dict[str, Any] | None = None,
+) -> BackupManagerChange | None:
+    tenant, connection_id = _tenant(principal), str(connection.get("id") or "")
+    kind = vault["kind"]
+    vault_id = vault["id"]
+    common = {"vault_id": vault_id, "vault_name": vault["name"], "vault_kind": kind,
+              "control": control, "reason": body.reason}
+
+    if control in ("enable_soft_delete", "extend_soft_delete_retention"):
+        state = str(vault.get("soft_delete_state") or "").lower()
+        if control == "enable_soft_delete" and state in ("enabled", "on", "alwayson"):
+            return None
+        retention = max(14, min(int(body.soft_delete_retention_days), 180))
+        if kind == "recovery_services":
+            payload = {"properties": {"softDeleteFeatureState": "Enabled", "enhancedSecurityState": "Enabled",
+                                      "softDeleteRetentionPeriodInDays": retention}}
+            summary = {**common, "arm_path": f"{vault_id}/backupconfig/vaultconfig", "arm_method": "PUT",
+                       "api_version": service.RSV_VAULT_CONFIG_API, "setting": "softDeleteFeatureState",
+                       "description": f"Enable soft delete on {vault['name']} with {retention}-day retention"}
+        else:
+            payload = {"properties": {"securitySettings": {"softDeleteSettings": {
+                "state": "On", "retentionDurationInDays": retention}}}}
+            summary = {**common, "arm_path": vault_id, "arm_method": "PATCH", "api_version": service.DP_API,
+                       "setting": "securitySettings",
+                       "description": f"Enable soft delete on {vault['name']} with {retention}-day retention"}
+        return change_ops.build_change(
+            tenant_id=tenant, connection_id=connection_id, target_type="vault_security",
+            target_id=vault_id, operation="update", requested_by=principal.subject,
+            desired={"body": payload}, summary={**summary, "api_version": summary["api_version"]},
+        )
+
+    if control == "enable_crr":
+        if kind != "recovery_services":
+            raise ValueError("Cross Region Restore is configured on Recovery Services vaults.")
+        if str(vault.get("redundancy") or "").lower().replace("-", "") != "georedundant":
+            raise ValueError("Cross Region Restore requires geo-redundant backup storage; change redundancy first.")
+        payload = {"properties": {"crossRegionRestoreFlag": True}}
+        return change_ops.build_change(
+            tenant_id=tenant, connection_id=connection_id, target_type="vault_security",
+            target_id=vault_id, operation="update", requested_by=principal.subject,
+            desired={"body": payload},
+            summary={**common, "arm_path": f"{vault_id}/backupstorageconfig/vaultstorageconfig",
+                     "arm_method": "PATCH", "api_version": service.RSV_STORAGE_CONFIG_API,
+                     "setting": "crossRegionRestoreFlag",
+                     "description": f"Enable Cross Region Restore on {vault['name']}"},
+        )
+
+    if control == "set_redundancy":
+        if int(vault.get("instance_count") or 0) > 0:
+            raise ValueError(
+                "Backup storage redundancy can only be changed before the first item is protected; "
+                f"{vault['name']} already protects {vault.get('instance_count')} item(s)."
+            )
+        if kind != "recovery_services":
+            raise ValueError("Backup vault redundancy is fixed at creation time.")
+        payload = {"properties": {"storageModelType": body.redundancy}}
+        return change_ops.build_change(
+            tenant_id=tenant, connection_id=connection_id, target_type="vault_security",
+            target_id=vault_id, operation="update", requested_by=principal.subject,
+            desired={"body": payload},
+            summary={**common, "arm_path": f"{vault_id}/backupstorageconfig/vaultstorageconfig",
+                     "arm_method": "PATCH", "api_version": service.RSV_STORAGE_CONFIG_API,
+                     "setting": "storageModelType",
+                     "description": f"Set {vault['name']} backup storage redundancy to {body.redundancy}"},
+        )
+
+    if control == "enable_vault_alerts":
+        if str(vault.get("monitor_alerts") or "").lower() == "enabled":
+            return None
+        # Both vault kinds accept the setting on the vault resource. The Recovery Services
+        # alertsConfiguration sub-resource is not reliably writable across API versions, and
+        # the vault PATCH validates monitoringSettings as a whole, so the live object is
+        # merged rather than partially overwritten.
+        monitoring = dict(service.as_dict(service.as_dict(live_props).get("monitoringSettings")))
+        azure_monitor = dict(service.as_dict(monitoring.get("azureMonitorAlertSettings")))
+        azure_monitor["alertsForAllJobFailures"] = "Enabled"
+        monitoring["azureMonitorAlertSettings"] = azure_monitor
+        payload = {"properties": {"monitoringSettings": monitoring}}
+        api_version = service.RSV_API if kind == "recovery_services" else service.DP_API
+        summary = {**common, "arm_path": vault_id, "arm_method": "PATCH", "api_version": api_version}
+        return change_ops.build_change(
+            tenant_id=tenant, connection_id=connection_id, target_type="vault_alerts",
+            target_id=vault_id, operation="update", requested_by=principal.subject,
+            desired={"body": payload}, before=dict(live_body or {}),
+            summary={**summary, "setting": "monitoringSettings",
+                     "description": f"Enable built-in backup failure alerts on {vault['name']}"},
+        )
+
+    if control == "enable_diagnostics":
+        workspace = body.workspace_id or str(connection.get("log_analytics_workspace_id") or "")
+        if not workspace:
+            raise ValueError("A Log Analytics workspace is required to enable backup reporting.")
+        if not workspace.lower().startswith("/subscriptions/"):
+            raise ValueError("Provide the full ARM id of the Log Analytics workspace.")
+        target = f"{vault_id}/providers/microsoft.insights/diagnosticSettings/backup-manager-reports"
+        return change_ops.build_change(
+            tenant_id=tenant, connection_id=connection_id, target_type="vault_diagnostics",
+            target_id=target, operation="create", requested_by=principal.subject,
+            desired={"body": report_ops.diagnostic_setting_body(workspace)},
+            summary={**common, "workspace_id": workspace, "api_version": service.DIAG_API,
+                     "categories": list(report_ops.REQUIRED_CATEGORIES),
+                     "description": f"Send Backup Reports from {vault['name']} to Log Analytics"},
+        )
+    raise ValueError(f"Unsupported control '{control}'.")
+
+
+# --------------------------------------------------------------------------- DR + drills
+@router.get("/dr")
+async def dr_readiness(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    readiness = dr_ops.build_readiness(estate)
+    readiness["rpo"] = dr_ops.rpo_attainment(estate.get("instances", []))
+    readiness["demo"] = bool(estate.get("demo"))
+    return readiness
+
+
+@router.get("/compliance")
+async def compliance(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, _connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    result = policy_ops.compliance(estate.get("instances", []), estate.get("policies", []))
+    result["tiers"] = reference.load_reference().get("tiers", [])
+    result["demo"] = bool(estate.get("demo"))
+    return result
+
+
+@router.post("/dr/test-failover")
+async def request_test_failover(
+    body: TestFailoverRequest,
+    principal: Principal = Depends(_drill_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Draft an approval-gated Site Recovery test failover. Never a real failover."""
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    _guard_write(connection)
+    if bool(body.replicated_item_id) == bool(body.recovery_plan_id):
+        raise HTTPException(status_code=400, detail="Provide exactly one of a replicated item or a recovery plan.")
+
+    if body.replicated_item_id:
+        item = _find(estate.get("replication", []), "id", body.replicated_item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Replicated item not found in this scope.")
+        blocker = dr_ops.validate_drill_target(item)
+        if blocker:
+            raise HTTPException(status_code=400, detail=blocker)
+        target_id, drill_target, target_name = item["id"], "item", item.get("friendly_name", "")
+    else:
+        plan = _find(estate.get("recovery_plans", []), "id", body.recovery_plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Recovery plan not found in this scope.")
+        if str(plan.get("current_scenario_status") or "").lower() in ("inprogress", "running"):
+            raise HTTPException(status_code=400, detail="This recovery plan already has a scenario in progress.")
+        target_id, drill_target, target_name = plan["id"], "recovery_plan", plan.get("friendly_name", "")
+
+    try:
+        payload = dr_ops.build_test_failover_body(
+            network_type=body.network_type, network_id=body.network_id,
+            recovery_point_id=body.recovery_point_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    row = change_ops.build_change(
+        tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+        target_type="asr_test_failover", target_id=target_id, operation="invoke",
+        requested_by=principal.subject, desired={"body": payload},
+        summary={
+            "kind": "test_failover", "drill_target": drill_target, "target_name": target_name,
+            "network_type": body.network_type, "network_id": body.network_id,
+            "drill_id": body.drill_id, "reason": body.reason,
+            "description": f"Run an isolated test failover for {target_name}",
+            "cleanup_reminder": "Run test-failover cleanup afterwards or the drill resources keep billing.",
+        },
+        risk="high",
+    )
+    db.add(row)
+    db.add(_audit(principal, "backup_manager.dr.test_failover", target_id, {"change_id": row.id}))
+    if body.drill_id:
+        drill = await db.get(BackupDrill, body.drill_id)
+        if drill is not None and drill.tenant_id == _tenant(principal):
+            drill.change_id = row.id
+            drill.status = "in_progress"
+            drill.updated_at = service.now()
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(row)}
+
+
+@router.post("/dr/test-failover-cleanup")
+async def request_cleanup(
+    body: CleanupRequest,
+    principal: Principal = Depends(_drill_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    estate, connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id, enrich=False,
+    )
+    _guard_write(connection)
+    if bool(body.replicated_item_id) == bool(body.recovery_plan_id):
+        raise HTTPException(status_code=400, detail="Provide exactly one of a replicated item or a recovery plan.")
+    if body.replicated_item_id:
+        item = _find(estate.get("replication", []), "id", body.replicated_item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Replicated item not found in this scope.")
+        target_id, drill_target, target_name = item["id"], "item", item.get("friendly_name", "")
+    else:
+        plan = _find(estate.get("recovery_plans", []), "id", body.recovery_plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Recovery plan not found in this scope.")
+        target_id, drill_target, target_name = plan["id"], "recovery_plan", plan.get("friendly_name", "")
+    row = change_ops.build_change(
+        tenant_id=_tenant(principal), connection_id=str(connection.get("id") or ""),
+        target_type="asr_cleanup", target_id=target_id, operation="invoke",
+        requested_by=principal.subject,
+        desired={"body": dr_ops.build_cleanup_body(body.comments or "Drill complete.")},
+        summary={"kind": "test_failover_cleanup", "drill_target": drill_target, "target_name": target_name,
+                 "description": f"Clean up the test failover for {target_name}"},
+    )
+    db.add(row)
+    db.add(_audit(principal, "backup_manager.dr.cleanup", target_id, {"change_id": row.id}))
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(row)}
+
+
+@router.get("/drills")
+async def list_drills(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    status: str = Query(default="", max_length=24),
+    principal: Principal = Depends(_read),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    rows = await drill_ops.list_drills(
+        db, tenant_id=_tenant(principal), connection_id=connection_id, status=status,
+    )
+    public = [drill_ops.public_drill(r) for r in rows]
+    readiness: dict[str, Any] = {}
+    try:
+        estate, _connection = await _estate(
+            principal, connection_id=connection_id, workload_id=workload_id,
+            subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+        )
+        readiness = dr_ops.build_readiness(estate)
+    except HTTPException:
+        readiness = {}
+    return {"drills": public, "summary": drill_ops.summarize(public, readiness)}
+
+
+@router.post("/drills")
+async def create_drill(
+    body: DrillCreateRequest,
+    principal: Principal = Depends(_drill_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        drill = drill_ops.build_drill(
+            tenant_id=_tenant(principal), connection_id=body.connection_id or "default",
+            name=body.name, kind=body.kind, scope_kind=body.scope_kind,
+            scope_id=body.scope_id or body.workload_id, target_id=body.target_id,
+            target_name=body.target_name, cadence_days=body.cadence_days, created_by=principal.subject,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.add(drill)
+    await db.flush()  # materialise the generated id before it is referenced by the audit row
+    db.add(_audit(principal, "backup_manager.drill.create", drill.id, {"kind": drill.kind, "name": drill.name}))
+    await db.commit()
+    return {"ok": True, "drill": drill_ops.public_drill(drill)}
+
+
+@router.post("/drills/{drill_id}/outcome")
+async def record_drill_outcome(
+    drill_id: str,
+    body: DrillOutcomeRequest,
+    principal: Principal = Depends(_drill_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    drill = await db.get(BackupDrill, drill_id)
+    if drill is None or drill.tenant_id != _tenant(principal):
+        raise HTTPException(status_code=404, detail="Drill not found.")
+    evidence_id = ""
+    if body.capture_evidence:
+        from app.evidence import registry as evidence_registry
+
+        meta = evidence_registry.create_snapshot(
+            tenant_id=_tenant(principal),
+            name=f"Recovery drill — {drill.name}",
+            scope=drill.scope_id or drill.target_name or "backup-manager",
+            included=["drill"],
+            retention_class="standard",
+            tags=["backup-manager", "drill", drill.kind],
+            content={
+                "kind": "backup_manager.drill",
+                "drill": drill_ops.public_drill(drill),
+                "outcome": {"status": body.status, "notes": body.notes, "rto_minutes": body.rto_minutes},
+                "recorded_by": principal.subject,
+                "recorded_at": service.now_iso(),
+            },
+            created_by=principal.subject,
+            demo=False,
+        )
+        evidence_id = str(meta.get("id") or "")
+    try:
+        drill_ops.record_outcome(
+            drill, status=body.status, executed_by=principal.subject, notes=body.notes,
+            rto_minutes=body.rto_minutes, evidence_id=evidence_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    follow_up = drill_ops.next_occurrence(drill, created_by=principal.subject) if body.status != "cancelled" else None
+    if follow_up is not None:
+        db.add(follow_up)
+    db.add(_audit(principal, "backup_manager.drill.outcome", drill.id, {
+        "status": body.status, "evidence_id": evidence_id,
+    }))
+    await db.commit()
+    return {
+        "ok": True, "drill": drill_ops.public_drill(drill),
+        "next_drill": drill_ops.public_drill(follow_up) if follow_up is not None else None,
+    }
+
+
+# --------------------------------------------------------------------------- cost + reports
+@router.get("/cost")
+async def cost(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    use_reports: bool = Query(default=True),
+    use_actuals: bool = Query(default=True),
+    months_back: int = Query(default=1, ge=0, le=12),
+    cost_type: Literal["AmortizedCost", "ActualCost"] = Query(default="AmortizedCost"),
+    force: bool = Query(default=False),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    """Backup cost from the best available source.
+
+    Layers three inputs, each labelled so the caller knows what it is looking at: live retail
+    list prices (forward-looking), Log Analytics consumption (per-item truth), and Cost
+    Management actuals (authoritative, but only ever attributed to the vault).
+
+    Shares its implementation with the snapshot builder, so the Cost tab cannot disagree with
+    the overview when the operator picks a different period."""
+    estate, connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id,
+    )
+    return await analysis_ops.build_cost(
+        connection, estate,
+        tenant_id=_tenant(principal),
+        is_demo=str(connection.get("id") or "") == "demo",
+        use_reports=use_reports, use_actuals=use_actuals,
+        months_back=months_back, cost_type=cost_type, force=force,
+    )
+
+
+# Both helpers now live with the analysis pipeline that owns them; these names are kept so the
+# API module and its tests have one obvious place to reach them.
+_price_region = analysis_ops.price_region
+_match_report_storage = analysis_ops.match_report_storage
+
+
+@router.get("/cost/actuals")
+async def cost_actuals(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    months_back: int = Query(default=1, ge=0, le=12),
+    cost_type: Literal["AmortizedCost", "ActualCost"] = Query(default="AmortizedCost"),
+    force: bool = Query(default=False),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    """Raw Cost Management actuals for backup and Site Recovery, by vault and meter.
+
+    Doubles as the capability probe for cost reporting: ``available`` plus ``reason``/``remedy``
+    tell the UI exactly why actuals are missing when they are."""
+    estate, connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    if str(connection.get("id") or "") == "demo":
+        return {
+            "available": False, "demo": True, "by_vault": {}, "by_meter": {}, "daily": [],
+            "currency": "", "total": 0.0,
+            "reason": "Demo mode does not query Azure Cost Management.",
+            "remedy": "Select a live Azure connection.",
+        }
+    subscriptions = [s for s in (estate.get("scope", {}).get("subscriptions") or []) if s]
+    result = await costmgmt.cached_actuals(
+        connection, subscriptions, tenant_id=_tenant(principal),
+        months_back=months_back, cost_type=cost_type, daily=True, force=force,
+    )
+    vault_names = {service.canonical_id(v["id"]): v.get("name", "") for v in estate.get("vaults", [])}
+    result["vaults"] = sorted(
+        (
+            {"vault_id": vault_id, "vault_name": vault_names.get(vault_id, service.name_from_id(vault_id)),
+             "cost": round(amount, 2), "in_scope": vault_id in vault_names}
+            for vault_id, amount in (result.get("by_vault") or {}).items()
+        ),
+        key=lambda row: -row["cost"],
+    )
+    result.pop("rows", None)
+    return result
+
+
+@router.get("/prices")
+async def prices(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    currency: str = Query(default="", max_length=8),
+    region: str = Query(default="", max_length=64),
+    force: bool = Query(default=False),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    """The live Azure Retail Prices rate card the estimate is built from."""
+    estate, connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id, enrich=False,
+    )
+    resolved_region = region or _price_region(estate, connection)
+    # Default to the billing currency when it is already known, so this really is the card
+    # the estimate was built from rather than one denominated differently.
+    resolved_currency = (
+        currency
+        or costmgmt.known_currency(connection, tenant_id=_tenant(principal))
+        or str(reference.cost_rates().get("currency") or "USD")
+    )
+    return await pricing.get_rate_card(resolved_region, resolved_currency, force=force)
+
+
+@router.get("/reports")
+async def backup_reports(
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    days: int = Query(default=30, ge=1, le=180),
+    principal: Principal = Depends(_read),
+) -> dict[str, Any]:
+    estate, connection = await _estate(
+        principal, connection_id=connection_id, workload_id=workload_id,
+        subscription_id=subscription_id, management_group_id=management_group_id,
+    )
+    if str(connection.get("id") or "") == "demo":
+        return {
+            "available": False, "demo": True,
+            "reason": "Backup reporting queries Log Analytics, which demo mode does not simulate.",
+            "remedy": "Select a live Azure connection with vault diagnostics enabled.",
+            "vaults_total": len(estate.get("vaults", [])),
+            "vaults_with_diagnostics": sum(1 for v in estate.get("vaults", []) if v.get("diagnostics_enabled")),
+            "required_categories": list(report_ops.REQUIRED_CATEGORIES),
+            "job_trend": [], "storage": [], "failure_history": [], "sla": [],
+        }
+    return await report_ops.build_report(connection, estate, days=days)
+
+
+# --------------------------------------------------------------------------- managed changes
+@router.get("/changes")
+async def list_changes(
+    connection_id: str = Query(default=""),
+    status: str = Query(default="", max_length=24),
+    view: Literal["all", "action_required"] = Query(default="all"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=100, ge=1, le=MAX_PAGE_SIZE),
+    principal: Principal = Depends(_read),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    tenant = _tenant(principal)
+    filters = [BackupManagerChange.tenant_id == tenant]
+    if connection_id:
+        filters.append(BackupManagerChange.connection_id == connection_id)
+    if status:
+        filters.append(BackupManagerChange.status == status)
+    elif view == "action_required":
+        filters.append(BackupManagerChange.status.in_(tuple(change_ops.ACTIONABLE_STATUSES)))
+
+    total = int((await db.execute(
+        select(func.count()).select_from(BackupManagerChange).where(*filters)
+    )).scalar_one() or 0)
+    rows = list((await db.execute(
+        select(BackupManagerChange)
+        .where(*filters)
+        .order_by(BackupManagerChange.requested_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )).scalars())
+
+    counts_filters = [BackupManagerChange.tenant_id == tenant]
+    if connection_id:
+        counts_filters.append(BackupManagerChange.connection_id == connection_id)
+    counts = dict(
+        (await db.execute(
+            select(BackupManagerChange.status, func.count())
+            .where(*counts_filters)
+            .group_by(BackupManagerChange.status)
+        )).all()
+    )
+    return {
+        "rows": [change_ops.public_change(r) for r in rows],
+        "page": page,
+        "page_size": page_size,
+        "total_count": total,
+        "has_more": (page - 1) * page_size + len(rows) < total,
+        "status_counts": {str(k): int(v) for k, v in counts.items()},
+        "pending_count": int(counts.get("pending", 0)),
+        "approved_count": int(counts.get("approved", 0)),
+        "applying_count": int(counts.get("applying", 0)),
+        "actionable_count": int(counts.get("pending", 0)) + int(counts.get("approved", 0)),
+    }
+
+
+@router.post("/changes/{change_id}/decision")
+async def decide_change(
+    change_id: str,
+    body: ChangeDecisionRequest,
+    principal: Principal = Depends(_approve),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    change = await change_ops.load_change(db, change_id, tenant_id=_tenant(principal))
+    if change is None:
+        raise HTTPException(status_code=404, detail="Managed change not found.")
+    if change.status not in ("pending", "approved"):
+        raise HTTPException(status_code=409, detail=f"A {change.status} change cannot be decided.")
+    if body.decision == "rejected":
+        change.status = "rejected"
+    else:
+        if change.requires_dual_approval:
+            if not change.decided_by:
+                change.decided_by = principal.subject
+                change.decided_at = service.now()
+                change.decision_reason = body.reason
+                db.add(_audit(principal, "backup_manager.change.first_approval", change.target_id, {"change_id": change.id}))
+                await db.commit()
+                return {"ok": True, "change": change_ops.public_change(change),
+                        "awaiting_second_approver": True}
+            if change.decided_by == principal.subject:
+                raise HTTPException(
+                    status_code=403,
+                    detail="This change requires a second, different approver before it can be applied.",
+                )
+            change.second_approver = principal.subject
+            change.second_approved_at = service.now()
+        change.status = "approved"
+    change.decided_by = change.decided_by or principal.subject
+    change.decided_at = change.decided_at or service.now()
+    change.decision_reason = body.reason
+    db.add(_audit(principal, f"backup_manager.change.{body.decision}", change.target_id, {"change_id": change.id}))
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(change)}
+
+
+@router.post("/changes/bulk-decision")
+async def bulk_decision(
+    body: BulkDecisionRequest,
+    principal: Principal = Depends(_approve),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    tenant = _tenant(principal)
+    rows = list((await db.execute(
+        select(BackupManagerChange).where(
+            BackupManagerChange.tenant_id == tenant,
+            BackupManagerChange.id.in_(body.change_ids),
+        )
+    )).scalars())
+    updated, skipped = [], []
+    for change in rows:
+        if change.status != "pending":
+            skipped.append({"id": change.id, "reason": f"Status is {change.status}."})
+            continue
+        if body.decision == "approved" and change.requires_dual_approval:
+            skipped.append({"id": change.id, "reason": "Requires two distinct approvers; approve it individually."})
+            continue
+        change.status = body.decision
+        change.decided_by = principal.subject
+        change.decided_at = service.now()
+        change.decision_reason = body.reason
+        updated.append(change)
+    db.add(_audit(principal, f"backup_manager.changes.bulk_{body.decision}", "bulk", {
+        "updated": len(updated), "skipped": len(skipped),
+    }))
+    await db.commit()
+    return {
+        "ok": True, "updated": [change_ops.public_change(c) for c in updated], "skipped": skipped,
+    }
+
+
+@router.post("/changes/bulk-apply")
+async def bulk_apply(
+    body: ChangeSelectionRequest,
+    principal: Principal = Depends(_approve),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Apply approved changes in dependency order with bounded concurrency."""
+    tenant = _tenant(principal)
+    rows = list((await db.execute(
+        select(BackupManagerChange).where(
+            BackupManagerChange.tenant_id == tenant,
+            BackupManagerChange.id.in_(body.change_ids),
+        )
+    )).scalars())
+    approved = [r for r in rows if r.status == "approved"]
+    skipped = [{"id": r.id, "reason": f"Status is {r.status}."} for r in rows if r.status != "approved"]
+    if not approved:
+        raise HTTPException(status_code=400, detail="No approved changes were selected.")
+
+    ordered = change_ops.order_changes(approved)
+    connections: dict[str, dict[str, Any]] = {}
+    from app.core.azure_connections import resolve_connection
+
+    semaphore = asyncio.Semaphore(APPLY_CONCURRENCY)
+
+    async def run(change: BackupManagerChange) -> None:
+        async with semaphore:
+            connection = connections.get(change.connection_id)
+            if connection is None:
+                connection = resolve_connection(change.connection_id) or {}
+                connections[change.connection_id] = connection
+            if not connection:
+                change.status = "failed"
+                change.error_code = "ConnectionMissing"
+                change.error_message = "The Azure connection for this change no longer exists."
+                return
+            try:
+                submission, context = await change_ops.apply_change(connection, change)
+            except (ValueError, PermissionError) as exc:
+                change.status = "failed"
+                change.error_code = "PreflightFailed"
+                change.error_message = service.safe_error(str(exc))
+                return
+            if context.get("before"):
+                change.before_encrypted = service.encrypted_json(context["before"])
+            change_ops.mark_submitted(change, submission, principal.subject)
+
+    # Prerequisite-bearing changes run first as a serialised prefix; the remainder fan out.
+    serial = [c for c in ordered if c.depends_on]
+    parallel = [c for c in ordered if not c.depends_on]
+    for change in serial:
+        await run(change)
+    if parallel:
+        await asyncio.gather(*(run(c) for c in parallel))
+
+    db.add(_audit(principal, "backup_manager.changes.bulk_apply", "bulk", {
+        "requested": len(rows), "applied": sum(1 for c in approved if c.status == "applied"),
+        "applying": sum(1 for c in approved if c.status == "applying"),
+        "failed": sum(1 for c in approved if c.status == "failed"),
+    }))
+    await db.commit()
+    from app.backup_manager import cache as inventory_cache
+
+    await inventory_cache.invalidate(tenant_id=tenant)
+    return {
+        "ok": True,
+        "results": [change_ops.public_change(c) for c in approved],
+        "skipped": skipped,
+    }
+
+
+@router.post("/changes/{change_id}/rollback")
+async def rollback_change(
+    change_id: str,
+    principal: Principal = Depends(_approve),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    change = await change_ops.load_change(db, change_id, tenant_id=_tenant(principal))
+    if change is None:
+        raise HTTPException(status_code=404, detail="Managed change not found.")
+    if change.status != "applied":
+        raise HTTPException(status_code=409, detail="Only an applied change can be rolled back.")
+    try:
+        row = change_ops.build_rollback(change, requested_by=principal.subject)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.add(row)
+    db.add(_audit(principal, "backup_manager.change.rollback_requested", change.target_id, {
+        "change_id": change.id, "rollback_change_id": row.id,
+    }))
+    await db.commit()
+    return {"ok": True, "change": change_ops.public_change(row)}
+
+
+@router.get("/changes/poller")
+async def poller_status(_principal: Principal = Depends(_read)) -> dict[str, Any]:
+    from app.backup_manager.lro import poller
+
+    return {"running": poller.running, "ticks": poller.ticks, "last_error": poller.last_error}
+
+
+# --------------------------------------------------------------------------- reference
+@router.get("/reference")
+async def get_reference(_principal: Principal = Depends(_read)) -> dict[str, Any]:
+    return reference.load_reference()
+
+
+@router.put("/reference")
+async def put_reference(
+    body: ReferenceSaveRequest,
+    principal: Principal = Depends(_reference_write),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    payload = body.model_dump()
+    reason = str(payload.pop("reason", "") or "")
+    doc = reference.save_reference(payload, actor=principal.subject, reason=reason)
+    db.add(_audit(principal, "backup_manager.reference.save", "reference", {"version": doc.get("version")}))
+    await db.commit()
+    return doc
+
+
+@router.get("/reference/revisions")
+async def reference_revisions(_principal: Principal = Depends(_read)) -> dict[str, Any]:
+    return {"revisions": reference.list_revisions()}
+
+
+@router.post("/reference/restore")
+async def reference_restore(
+    revision_id: str = Query(min_length=1, max_length=64),
+    principal: Principal = Depends(_reference_write),
+) -> dict[str, Any]:
+    try:
+        return reference.restore_revision(revision_id, actor=principal.subject)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/reference/reset")
+async def reference_reset(principal: Principal = Depends(_reference_write)) -> dict[str, Any]:
+    return reference.reset_reference(actor=principal.subject)
+
+
+# --------------------------------------------------------------------------- export + evidence
+@router.get("/export")
+async def export_csv(
+    kind: Literal["instances", "jobs", "policies", "gaps", "posture", "drills"] = Query(...),
+    connection_id: str = Query(default=""),
+    workload_id: str = Query(default=""),
+    subscription_id: str = Query(default=""),
+    management_group_id: str = Query(default=""),
+    principal: Principal = Depends(_read),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    if kind == "drills":
+        rows = [drill_ops.public_drill(r) for r in await drill_ops.list_drills(
+            db, tenant_id=_tenant(principal), connection_id=connection_id,
+        )]
+    else:
+        estate, connection = await _estate(
+            principal, connection_id=connection_id, workload_id=workload_id,
+            subscription_id=subscription_id, management_group_id=management_group_id,
+            enrich=(kind == "posture"),
+        )
+        if kind == "instances":
+            rows = estate.get("instances", [])
+        elif kind == "jobs":
+            rows = job_ops.enrich(estate.get("jobs", []))
+        elif kind == "policies":
+            rows = policy_ops.analyze(estate.get("policies", []), estate.get("instances", []))["policies"]
+        elif kind == "posture":
+            rows = posture_ops.build_posture(estate.get("vaults", []))["vaults"]
+        else:
+            if _is_demo(workload_id):
+                rows = demo_data.demo_gaps(workload_id)["gaps"]
+            else:
+                subscriptions = set(estate.get("scope", {}).get("subscriptions") or [])
+                rows = (await gap_ops.detect(connection, estate, subscriptions=subscriptions))["gaps"]
+    content = export_ops.export(kind, rows)
+    return Response(
+        content=content, media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="backup-manager-{kind}.csv"'},
+    )
+
+
+@router.post("/evidence")
+async def capture_evidence(
+    body: EvidenceRequest,
+    principal: Principal = Depends(_read),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Hash-stamp the current recoverability position into the Evidence Locker."""
+    from app.evidence import registry as evidence_registry
+
+    estate, _connection = await _estate(
+        principal, connection_id=body.connection_id, workload_id=body.workload_id,
+        subscription_id=body.subscription_id, management_group_id=body.management_group_id,
+    )
+    drills = [drill_ops.public_drill(r) for r in await drill_ops.list_drills(
+        db, tenant_id=_tenant(principal), connection_id=body.connection_id,
+    )]
+    payload = export_ops.evidence_payload(
+        estate=estate,
+        posture=posture_ops.build_posture(estate.get("vaults", [])),
+        compliance=policy_ops.compliance(estate.get("instances", []), estate.get("policies", [])),
+        rpo=dr_ops.rpo_attainment(estate.get("instances", [])),
+        drills=drills,
+        scope=estate.get("scope", {}),
+    )
+    scope_label = body.workload_id or body.subscription_id or "tenant"
+    meta = evidence_registry.create_snapshot(
+        tenant_id=_tenant(principal),
+        name=body.name or f"Backup recoverability — {scope_label}",
+        scope=scope_label,
+        included=["backup_manager"],
+        retention_class="standard",
+        tags=["backup-manager", "recoverability"],
+        content=payload,
+        created_by=principal.subject,
+        demo=bool(estate.get("demo")),
+    )
+    db.add(_audit(principal, "backup_manager.evidence", str(meta.get("id") or ""), {
+        "sha256": meta.get("sha256"), "scope": scope_label,
+    }))
+    await db.commit()
+    return {"ok": True, "snapshot": meta}

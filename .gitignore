@@ -112,6 +112,7 @@ test-results/
 
 # --- Editors / OS ------------------------------------------------------------
 .vscode/
+.vs/
 .idea/
 .DS_Store
 Thumbs.db
@@ -140,11 +141,17 @@ docs/_journey_render/
 # --- Per-section performance/UX improvement plans (review scratch, not shipped) ---
 docs/improvement-plans/
 
-# --- Documentation regeneration agent scratch/build output ------------------
-# Public documentation remains tracked; workspace agent customization stays local.
+# --- Workspace agent customization (local-only, not shipped) -----------------
+# The whole .github folder stays local: it holds the workspace custom agents
+# (.github/agents/documentation-regenerator.agent.md, .github/agents/ui-test-pilot.agent.md)
+# and their design notes (.github/UITestAgent.md) — internal tooling, not product code.
+# Public documentation under docs/ remains tracked.
 .github/
 .docs-work/
 docs/.jekyll-cache/
 docs/.sass-cache/
 docs/_site/
 docs/.bundle/
+
+# --- UI Test Pilot run artifacts (screenshots + run reports) -----------------
+.uxshots/ui-test/

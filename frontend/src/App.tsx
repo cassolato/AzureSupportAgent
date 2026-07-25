@@ -186,6 +186,8 @@ export default function App() {
           <Route path="/alert-analysis" element={<Navigate to="/alerts-manager" replace />} />
           <Route path="/telemetry" element={<ChatView />} />
           <Route path="/backupdr" element={<ChatView />} />
+          <Route path="/backup-manager" element={<ChatView />} />
+          <Route path="/backup-manager/:tab" element={<ChatView />} />
           <Route path="/capability" element={<ChatView />} />
           <Route path="/evidence" element={<ChatView />} />
           <Route path="/cases" element={<ChatView />} />

@@ -24,6 +24,8 @@ _ARM_SCOPE = "https://management.azure.com/.default"
 _ARM_RESOURCE = "https://management.azure.com"
 _GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 _GRAPH_RESOURCE = "https://graph.microsoft.com"
+_LA_SCOPE = "https://api.loganalytics.io/.default"
+_LA_RESOURCE = "https://api.loganalytics.io"
 _LOGIN = "https://login.microsoftonline.com"
 
 
@@ -340,4 +342,31 @@ async def get_graph_token(conn: dict[str, Any]) -> tuple[str | None, str | None]
     if _has_managed_identity():
         return await _managed_identity_token(_managed_identity_client_id(conn), _GRAPH_RESOURCE)
     return await _cli_token(tenant, _GRAPH_RESOURCE)
+
+
+async def get_log_analytics_token(conn: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Acquire a Log Analytics (api.loganalytics.io) access token for this connection.
+
+    Returns (token, error). Log Analytics is a separate token audience from ARM, so a pasted
+    ARM token cannot serve it — those connections fail closed with an explicit message rather
+    than returning an empty result set that would look like "no data".
+    """
+    method = conn.get("auth_method", "")
+    tenant = conn.get("tenant_id", "")
+    if method == "service_principal":
+        if not (tenant and conn.get("client_id") and conn.get("client_secret")):
+            return None, "Missing tenant id, client id or client secret."
+        return await _sp_secret_token(tenant, conn["client_id"], conn["client_secret"], _LA_SCOPE)
+    if method == "service_principal_cert":
+        if not (tenant and conn.get("client_id") and conn.get("certificate_pem")):
+            return None, "Missing tenant id, client id or certificate."
+        return await _sp_cert_token(tenant, conn["client_id"], conn["certificate_pem"], _LA_SCOPE)
+    if method == "az_cli_token":
+        return None, (
+            "Pasted-token connections cannot query Log Analytics (different token audience). "
+            "Use a service-principal or managed-identity connection for backup reporting."
+        )
+    if _has_managed_identity():
+        return await _managed_identity_token(_managed_identity_client_id(conn), _LA_RESOURCE)
+    return await _cli_token(tenant, _LA_RESOURCE)
 

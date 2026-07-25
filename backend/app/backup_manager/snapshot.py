@@ -1,0 +1,183 @@
+"""Durable, per-scope Backup Manager snapshots — the module's user-controlled cache.
+
+Backup Manager reads an entire estate: nine Resource Graph queries, one ARM config read per
+vault, a Cost Management round-trip and a Log Analytics query. That is far too slow to repeat
+on every tab switch, and repeating it on a timer would make the numbers move under the
+operator while they are working a decision.
+
+So the module follows the Alerts Manager contract: one snapshot is computed per
+``(tenant, connection, scope)`` when the operator explicitly asks for it, persisted here, and
+served unchanged to every tab until they ask again. :func:`read_snapshot` never computes — if
+nothing has been analyzed yet it returns an empty shell whose ``report_exists`` is ``False``,
+which is the UI's cue to show "Analyze backups" instead of silently firing off a sweep.
+
+Snapshots are bounded on both axes: row lists are capped when written (a large tenant's
+seven-day job history would otherwise dominate the file) and the least recently generated
+scopes are pruned, so this file cannot grow without limit the way an unbounded analysis cache
+can.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from app.backup_manager import service
+
+log = logging.getLogger("app.backup_manager.snapshot")
+
+# Bump when the snapshot shape changes so stale-shaped snapshots are treated as absent
+# instead of being fed to a UI that expects different keys.
+SNAPSHOT_SCHEMA_VERSION = 1
+
+_PATH = Path(__file__).resolve().parents[2] / ".data" / "backup_manager_snapshot.json"
+
+#: How many analyzed scopes to keep. Beyond this the oldest are dropped.
+MAX_SCOPES = 24
+#: Per-section row caps. Backup job history is the only list that grows unboundedly with
+#: estate size; the others are naturally small but are capped for symmetry.
+MAX_ROWS = {"instances": 5000, "jobs": 2000, "gaps": 2000}
+
+_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_lock(tenant_id: str, connection_id: str, scope_kind: str, scope_id: str) -> asyncio.Lock:
+    """One lock per scope so two concurrent analyses cannot interleave their writes."""
+    key = _key(tenant_id, connection_id, scope_kind, scope_id)
+    lock = _locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[key] = lock
+    return lock
+
+
+def _key(tenant_id: str, connection_id: str, scope_kind: str, scope_id: str) -> str:
+    return "|".join((
+        str(tenant_id or "default"), str(connection_id or "default"),
+        str(scope_kind or ""), str(scope_id or "").lower(),
+    ))
+
+
+def _read() -> dict[str, Any]:
+    if not _PATH.exists():
+        return {}
+    try:
+        value = json.loads(_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("backup_manager: unreadable snapshot store, starting empty: %s", exc)
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write(value: dict[str, Any]) -> None:
+    try:
+        _PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(value), encoding="utf-8")
+        tmp.replace(_PATH)
+    except OSError as exc:  # a snapshot we cannot persist is still usable in this request
+        log.warning("backup_manager: could not persist snapshot: %s", exc)
+
+
+def empty_snapshot(scope_kind: str, scope_id: str, reason: str = "") -> dict[str, Any]:
+    """The shell served when a scope has never been analyzed.
+
+    Every section is present and empty so the UI can render its tabs without null guards;
+    ``report_exists`` is what tells it to offer the Analyze button instead of the data."""
+    return {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "report_exists": False,
+        "generated_at": "",
+        "demo": False,
+        "reason": reason,
+        "scope": {"scope_kind": scope_kind, "scope_id": scope_id, "subscriptions": []},
+        "errors": {},
+        "job_window_days": 0,
+        "counts": {},
+        "summary": {},
+        "inventory": {"rows": [], "facets": {"datasource_types": [], "states": [], "vaults": []},
+                      "total_count": 0, "truncated": False},
+        "jobs": {"rows": [], "summary": {}, "total_count": 0, "truncated": False},
+        "job_analysis": {"clusters": [], "chronic": [], "congestion": {}},
+        "policies": {"policies": [], "duplicate_groups": [], "summary": {}},
+        "compliance": {"rows": [], "tiers": []},
+        "posture": {"vaults": [], "average_score": 0, "band": "green", "red_vaults": 0,
+                    "actionable_count": 0, "capacity": {}},
+        "vaults": {"vaults": [], "capacity": {}},
+        "gaps": {"gaps": [], "coverage_gaps": [], "vaults": [], "policies": [], "summary": {},
+                 "truncated": False},
+        "dr": {"summary": {}, "rpo": {}, "items": [], "recovery_plans": []},
+        "cost": {},
+    }
+
+
+def bound(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Cap the row lists that scale with estate size, flagging any truncation."""
+    inventory = snapshot.get("inventory")
+    if isinstance(inventory, dict):
+        rows = inventory.get("rows") or []
+        if len(rows) > MAX_ROWS["instances"]:
+            inventory["rows"] = rows[: MAX_ROWS["instances"]]
+            inventory["truncated"] = True
+    jobs = snapshot.get("jobs")
+    if isinstance(jobs, dict):
+        rows = jobs.get("rows") or []
+        if len(rows) > MAX_ROWS["jobs"]:
+            # Newest first is already the collector's order, so the tail is the oldest history.
+            jobs["rows"] = rows[: MAX_ROWS["jobs"]]
+            jobs["truncated"] = True
+    gaps = snapshot.get("gaps")
+    if isinstance(gaps, dict):
+        rows = gaps.get("gaps") or []
+        if len(rows) > MAX_ROWS["gaps"]:
+            gaps["gaps"] = rows[: MAX_ROWS["gaps"]]
+            gaps["truncated"] = True
+    return snapshot
+
+
+def read_snapshot(
+    tenant_id: str, connection_id: str, scope_kind: str, scope_id: str,
+) -> dict[str, Any] | None:
+    """The stored snapshot for a scope, or ``None``. Never computes."""
+    value = _read().get(_key(tenant_id, connection_id, scope_kind, scope_id))
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        return None
+    return value
+
+
+def write_snapshot(
+    tenant_id: str, connection_id: str, scope_kind: str, scope_id: str, snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot["schema_version"] = SNAPSHOT_SCHEMA_VERSION
+    snapshot["report_exists"] = True
+    bound(snapshot)
+    data = _read()
+    data[_key(tenant_id, connection_id, scope_kind, scope_id)] = snapshot
+    if len(data) > MAX_SCOPES:
+        for stale in sorted(data, key=lambda k: str(data[k].get("generated_at") or ""))[:-MAX_SCOPES]:
+            data.pop(stale, None)
+    _write(data)
+    return snapshot
+
+
+def delete_snapshot(tenant_id: str, connection_id: str, scope_kind: str, scope_id: str) -> bool:
+    data = _read()
+    if _key(tenant_id, connection_id, scope_kind, scope_id) not in data:
+        return False
+    del data[_key(tenant_id, connection_id, scope_kind, scope_id)]
+    _write(data)
+    return True
+
+
+def age_seconds(snapshot: dict[str, Any]) -> float | None:
+    generated = str(snapshot.get("generated_at") or "")
+    if not generated:
+        return None
+    parsed = service.parse_iso(generated)
+    if parsed is None:
+        return None
+    return max(0.0, (service.now() - parsed).total_seconds())

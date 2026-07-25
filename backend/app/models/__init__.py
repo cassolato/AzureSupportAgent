@@ -178,6 +178,107 @@ class AlertManagerChange(Base):
     )
 
 
+class BackupManagerChange(Base):
+    """Approval-gated Azure Backup / Site Recovery mutation with encrypted before/desired state.
+
+    Structurally the Alerts Manager ledger plus the fields a *long-running* Azure operation
+    needs.  Backup control-plane writes answer 202 and complete minutes later, so an applied
+    row passes through ``applying`` while :mod:`app.backup_manager.lro` polls
+    ``operation_url``; ``poll_attempts`` and ``poll_deadline`` bound that wait so a change can
+    never sit in ``applying`` forever.
+
+    ``requires_dual_approval`` marks changes a single identity must not push through alone.
+    Destructive operations (delete backup data, immutability lock, restore) have no ``target_type``
+    at all — they are refused before a row is ever created.
+    """
+
+    __tablename__ = "backup_manager_changes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    connection_id: Mapped[str] = mapped_column(String(36), index=True)
+    # vault | backup_policy | protection | vault_security | vault_alerts | vault_diagnostics
+    # | adhoc_backup | job_cancel | policy_assignment | asr_test_failover | asr_cleanup
+    target_type: Mapped[str] = mapped_column(String(40), default="protection")
+    target_id: Mapped[str] = mapped_column(String(1024), index=True)
+    operation: Mapped[str] = mapped_column(String(24))  # create|update|delete|invoke
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    risk: Mapped[str] = mapped_column(String(16), default="medium")
+    summary_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    desired_encrypted: Mapped[str] = mapped_column(Text, default="")
+    before_encrypted: Mapped[str] = mapped_column(Text, default="")
+    after_encrypted: Mapped[str] = mapped_column(Text, default="")
+    expected_state_hash: Mapped[str] = mapped_column(String(64), default="")
+    requested_by: Mapped[str] = mapped_column(String(128))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    decided_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Second approver for irreversible-adjacent work (drills, retention decreases).
+    requires_dual_approval: Mapped[bool] = mapped_column(Boolean, default=False)
+    second_approver: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    second_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rollback_of: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    evidence_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    plan_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    depends_on: Mapped[list] = mapped_column(JSON, default=list)
+    # --- long-running operation tracking ---
+    operation_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    azure_job_id: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    poll_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    poll_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    poll_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_backup_changes_tenant_requested", "tenant_id", "requested_at"),
+        Index("ix_backup_changes_tenant_status", "tenant_id", "status"),
+        Index("ix_backup_changes_status_poll", "status", "poll_after"),
+    )
+
+
+class BackupDrill(Base):
+    """A recorded restore / failover readiness drill.
+
+    The audit artefact an auditor actually asks for: who proved recovery works, for which
+    workload, when, and what evidence was captured. Kept as a first-class row (not a JSON
+    registry) because it is referenced by evidence snapshots and compliance exports."""
+
+    __tablename__ = "backup_drills"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    connection_id: Mapped[str] = mapped_column(String(36), index=True)
+    name: Mapped[str] = mapped_column(String(256))
+    kind: Mapped[str] = mapped_column(String(32), default="restore")  # restore|test_failover
+    scope_kind: Mapped[str] = mapped_column(String(24), default="workload")
+    scope_id: Mapped[str] = mapped_column(String(256), default="")
+    target_id: Mapped[str] = mapped_column(String(1024), default="")
+    target_name: Mapped[str] = mapped_column(String(256), default="")
+    # scheduled | in_progress | passed | failed | cancelled
+    status: Mapped[str] = mapped_column(String(24), default="scheduled", index=True)
+    cadence_days: Mapped[int] = mapped_column(Integer, default=180)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    executed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    outcome_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rto_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    change_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    evidence_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    __table_args__ = (
+        Index("ix_backup_drills_tenant_status", "tenant_id", "status"),
+        Index("ix_backup_drills_tenant_due", "tenant_id", "due_at"),
+    )
+
+
 class Usage(Base):
     __tablename__ = "usage"
 
