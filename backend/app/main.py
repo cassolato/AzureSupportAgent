@@ -126,6 +126,11 @@ async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSON
     )
 
 
+# Handle for the background MCP tool-catalog warmup started at startup, so shutdown can
+# cancel it instead of waiting for it (see _startup / _shutdown).
+_warm_task = None
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Keep the local SQLite schema in sync (creates tables + late-added columns).
@@ -242,11 +247,28 @@ async def _startup() -> None:
 
     from app.mcp.client import warm_tool_catalog
 
-    asyncio.create_task(warm_tool_catalog())
+    # Keep the handle so shutdown can CANCEL it. Left untracked, this fire-and-forget task
+    # keeps the event loop alive until the warmup finishes (node spawn + tool listing per
+    # tenant, ~8s), which delays every container shutdown/rollout and made a TestClient
+    # context-manager exit take 8s in the test suite.
+    global _warm_task
+    _warm_task = asyncio.create_task(warm_tool_catalog())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    import asyncio
+    import contextlib
+
+    # Cancel the background MCP warmup first — it's a pure optimization for the first chat
+    # message and must never hold up shutdown.
+    global _warm_task
+    if _warm_task is not None and not _warm_task.done():
+        _warm_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _warm_task
+    _warm_task = None
+
     from app.automations.scheduler import scheduler
 
     await scheduler.stop()

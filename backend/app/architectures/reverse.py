@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from app.exec.command_runner import (
+    KQL_RESOURCE_CAPTURE_BYTES,
     close_sp_session,
     open_sp_session,
     run_kql_capture,
@@ -132,7 +133,12 @@ def _parse_rows(stdout: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(stdout or "[]")
     except (json.JSONDecodeError, TypeError):
-        return []
+        # A payload cut at the capture cap is invalid JSON. Returning [] here would report
+        # "no resources" for a workload that has plenty (the recurring silent-zero bug), so
+        # salvage every complete object before the cut instead.
+        from app.exec.command_runner import parse_kql_rows
+
+        return parse_kql_rows(stdout)
     if isinstance(data, dict) and "data" in data:
         data = data["data"]
     return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
@@ -321,7 +327,14 @@ async def dump_resources(
                 break
             joined = ", ".join(f"'{_esc(i)}'" for i in chunk)
             prop_kql = f"Resources | where id in~ ({joined}) | project id, properties"
-            pcap = await run_kql_capture(prop_kql, connection, output="json", session_config_dir=config_dir)
+            # 30 resources' FULL `properties` blobs per chunk — by far the heaviest projection
+            # in the codebase (a single AKS/APIM/Front Door resource can be hundreds of KB).
+            # The default 256 KB capture cap would truncate the chunk and cost us the
+            # relationship data this whole reverse-engineering pass exists to collect.
+            pcap = await run_kql_capture(
+                prop_kql, connection, output="json", session_config_dir=config_dir,
+                max_bytes=KQL_RESOURCE_CAPTURE_BYTES,
+            )
             if not pcap.ok:
                 continue
             for pr in _parse_rows(pcap.stdout):

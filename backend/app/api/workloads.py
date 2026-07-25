@@ -1267,6 +1267,19 @@ async def refresh_workload_endpoint(
 
     if rg_pairs:
         current = await discovery.resources_in_resource_groups(conn, list(rg_pairs))
+        # None = the query could not be evaluated (auth/throttle/truncation). Treating that
+        # as "the resource groups are empty" would mark EVERY member as removed and persist
+        # the wipe, with no version history to recover from. Abort instead — a refresh that
+        # can't see Azure must leave the workload exactly as it was.
+        if current is None:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Couldn't read the workload's resource groups from Azure, so the refresh "
+                    "was cancelled and its resources were left unchanged. Check the Azure "
+                    "connection and try again."
+                ),
+            )
         current_by_id = {r["id"].lower(): r for r in current if r.get("id")}
         existing_ids = {n.get("id", "").lower() for n in resource_nodes}
 

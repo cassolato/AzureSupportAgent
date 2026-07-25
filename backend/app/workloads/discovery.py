@@ -26,11 +26,14 @@ _PAGE = 200
 
 
 def _parse_rows(stdout: str) -> list[dict[str, Any]]:
-    try:
-        data = json.loads(stdout or "[]")
-        return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
-        return []
+    """Parse a captured Resource Graph payload, SALVAGING a truncated array.
+
+    A plain ``json.loads`` returns ``[]`` for a response cut mid-array, which is the silent
+    "0 resources" bug this codebase has hit repeatedly on the REST path (az_cli_token /
+    managed identity). ``parse_kql_rows`` recovers every complete object before the cut."""
+    from app.exec.command_runner import parse_kql_rows
+
+    return parse_kql_rows(stdout)
 
 
 def _esc(val: str) -> str:
@@ -293,13 +296,21 @@ async def all_resources(
     connection: dict | None, *, cap: int = 1000, session_config_dir: str | None = None
 ) -> list[dict[str, Any]]:
     """Every resource across the whole tenant (with tags), in ONE query, capped."""
+    from app.exec.command_runner import KQL_RESOURCE_CAPTURE_BYTES
+
     kql = (
         "Resources "
         "| project name, type, location, id, resourceGroup, subscriptionId, tags "
         "| order by subscriptionId asc, resourceGroup asc, name asc "
         f"| take {min(max(cap, 1), 1000)}"
     )
-    capres = await run_kql_capture(kql, connection, output="json", session_config_dir=session_config_dir)
+    # 1000 rows WITH tags measures ~400 bytes/row, so the default 256 KB capture cap is hit
+    # around 600 resources - well inside this query's own 1000-row ceiling. Without the large
+    # cap the payload truncates and the whole picker cache warms to nothing.
+    capres = await run_kql_capture(
+        kql, connection, output="json", session_config_dir=session_config_dir,
+        max_bytes=KQL_RESOURCE_CAPTURE_BYTES,
+    )
     if not capres.ok:
         return []
     return [_norm_resource(r) for r in _parse_rows(capres.stdout)]
@@ -339,6 +350,8 @@ async def resources_in_subscriptions(
     ``session_config_dir`` reuses a pre-authenticated SP login (cache prefetch)."""
     if not subscription_ids:
         return []
+    from app.exec.command_runner import KQL_RESOURCE_CAPTURE_BYTES
+
     joined = ", ".join(f"'{_esc(s)}'" for s in subscription_ids)
     kql = (
         "Resources "
@@ -347,7 +360,11 @@ async def resources_in_subscriptions(
         "| order by resourceGroup asc, name asc "
         f"| take {min(max(cap, 1), 1000)}"
     )
-    capres = await run_kql_capture(kql, connection, output="json", session_config_dir=session_config_dir)
+    # See all_resources(): tags push this past the default 256 KB cap around 600 rows.
+    capres = await run_kql_capture(
+        kql, connection, output="json", session_config_dir=session_config_dir,
+        max_bytes=KQL_RESOURCE_CAPTURE_BYTES,
+    )
     if not capres.ok:
         logger.warning(
             "Resource Graph query failed (exit=%s) for subs %s: error=%r stderr=%r",
@@ -457,8 +474,16 @@ async def gather_signals(
 
 async def resources_in_resource_groups(
     connection: dict | None, pairs: list[tuple[str, str]], *, cap: int = 1000
-) -> list[dict[str, Any]]:
-    """Resources within the given (subscription_id, resource_group) pairs."""
+) -> list[dict[str, Any]] | None:
+    """Resources within the given (subscription_id, resource_group) pairs.
+
+    Returns ``None`` when the query COULD NOT BE EVALUATED (auth failure, throttling,
+    truncated/garbled response) — deliberately distinct from ``[]``, which means "the scope
+    really is empty". Callers MUST NOT treat the two the same: this result drives workload
+    membership reconciliation, and a failed read that looks like an empty scope would mark
+    every existing member as deleted and persist that. Paged + fail-closed via
+    ``run_kql_collect`` rather than a single 256 KB capture, so a large resource group can't
+    silently truncate into a false empty either."""
     if not pairs:
         return []
     clauses = [
@@ -468,33 +493,20 @@ async def resources_in_resource_groups(
     ]
     if not clauses:
         return []
+    from app.exec.command_runner import run_kql_collect
+
     kql = (
         "Resources "
         f"| where {' or '.join(clauses)} "
         "| project name, type, location, id, resourceGroup, subscriptionId, tags "
-        "| order by name asc "
-        f"| take {min(max(cap, 1), 1000)}"
+        "| order by name asc"
     )
-    capres = await run_kql_capture(kql, connection, output="json")
-    if not capres.ok:
-        return []
-    return [_norm_resource(r) for r in _parse_rows(capres.stdout)]
-
-
-async def resources_exist(connection: dict | None, ids: list[str]) -> set[str]:
-    """Return the subset of resource ids that still exist in Azure."""
-    if not ids:
-        return set()
-    found: set[str] = set()
-    # Chunk to keep each KQL bounded.
-    for i in range(0, len(ids), 200):
-        chunk = ids[i : i + 200]
-        joined = ", ".join(f"'{_esc(x)}'" for x in chunk)
-        kql = f"Resources | where id in~ ({joined}) | project id"
-        capres = await run_kql_capture(kql, connection, output="json")
-        if capres.ok:
-            for r in _parse_rows(capres.stdout):
-                if r.get("id"):
-                    found.add(r["id"].lower())
-    return found
+    res = await run_kql_collect(kql, connection, max_rows=max(cap, 1), page_size=1000)
+    if not res.ok:
+        logger.warning(
+            "Resource-group membership query FAILED (%d pair(s)): %r",
+            len(clauses), (res.error or "")[:300],
+        )
+        return None
+    return [_norm_resource(r) for r in res.rows]
 

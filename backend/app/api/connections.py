@@ -196,7 +196,11 @@ async def test_connection_endpoint(
 async def discover_endpoint(
     connection_id: str, _: Principal = Depends(require_admin)
 ):
-    conn = resolve_connection(connection_id)
+    # EXACT lookup (like /test and /validate-entra above). resolve_connection() falls back to
+    # the DEFAULT connection for a missing or disabled id, which would report the default
+    # tenant's subscriptions and management groups as if they belonged to the connection the
+    # admin actually clicked.
+    conn = get_connection(connection_id)
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found.")
     token, err = await get_arm_token(conn)
