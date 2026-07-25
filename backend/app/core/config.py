@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # spoofing in audit logs and brute-force counters. Leave empty (default) to
     # trust no proxy header at all — the safest default for direct/local deployments.
     trusted_proxies: str = ""
+    # Azure Container Apps and similar managed ingress products replace X-Forwarded-For
+    # before forwarding to the container. Enable this only when the application cannot be
+    # reached except through that trusted ingress; it prevents every caller collapsing onto
+    # the proxy's IP in brute-force counters and audit records.
+    trust_forwarded_headers: bool = False
 
     # LLM
     # Empty by default so a fresh install enables NO provider — every provider stays

@@ -1673,6 +1673,21 @@ async def _start_message_turn(
                                 step["summary"] = ev.data.get("summary")
                                 step["duration"] = ev.data.get("duration_ms")
                                 break
+                        task_db.add(
+                            AuditLog(
+                                tenant_id=tenant_id,
+                                actor_id=actor_id,
+                                action="tool.result",
+                                target=str(ev.data.get("tool_name") or "unknown")[:512],
+                                provider=turn_provider,
+                                model=turn_model,
+                                metadata_json={
+                                    "chat_id": chat_id,
+                                    "error": is_tool_error,
+                                    "duration_ms": ev.data.get("duration_ms"),
+                                },
+                            )
+                        )
                         reasoning_buf = ""
                         await checkpoint()
 

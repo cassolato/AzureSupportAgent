@@ -450,6 +450,11 @@ class _CsrfGuard:
             blocked = not self._origin_ok(origin, host)
         elif sec_fetch_site == "cross-site":
             blocked = True
+        elif headers.get("cookie") and sec_fetch_site != "same-origin":
+            # Browser cookie auth is ambient. A state-changing cookie-bearing request
+            # without Origin is rejected unless Fetch Metadata proves same-origin. API
+            # clients without ambient cookies remain supported.
+            blocked = True
         if blocked:
             resp = JSONResponse(
                 status_code=403, content={"detail": "Cross-origin request blocked."}
@@ -591,6 +596,14 @@ app.include_router(api)
 # refresh) works. When the bundle is absent (pure local dev with Vite on :5173), these
 # routes are simply not registered.
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _is_api_fallback_path(path: str) -> bool:
+    """True when an unmatched SPA-fallback path belongs to the API namespace."""
+    normalized = path.lstrip("/")
+    return normalized == "api" or normalized.startswith("api/")
+
+
 if _STATIC_DIR.is_dir():
     # Hashed build assets (JS/CSS) + any files under /assets. Vite emits content-hashed
     # filenames (index-<hash>.js), so these are safe to cache for a year as immutable —
@@ -619,9 +632,11 @@ if _STATIC_DIR.is_dir():
         return FileResponse(str(_index_file), headers={"Cache-Control": "no-cache"})
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    async def _spa_fallback(full_path: str) -> FileResponse:
+    async def _spa_fallback(full_path: str):
         # Serve a real static file when one exists (favicon, agent-icons, etc.);
         # otherwise hand back index.html so the SPA router renders the route.
+        if _is_api_fallback_path(full_path):
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
         candidate = (_STATIC_DIR / full_path).resolve()
         if candidate.is_file() and str(candidate).startswith(str(_STATIC_DIR)):
             return FileResponse(str(candidate))

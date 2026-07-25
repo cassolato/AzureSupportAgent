@@ -934,9 +934,9 @@ async def import_owners_preview(
     ask the user which sheet to analyze first."""
     from app.ownership import importer, sheet
 
-    raw = await file.read()
-    if len(raw) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File too large (max 8 MB).")
+    from app.core.uploads import read_upload_limited
+
+    raw = await read_upload_limited(file, 8 * 1024 * 1024)
 
     # If a multi-sheet workbook arrives without a chosen sheet, ask the user to pick first
     # (avoids running the AI mapping on the wrong/arbitrary sheet).
