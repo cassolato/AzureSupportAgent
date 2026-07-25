@@ -21,18 +21,18 @@ if _BACKEND_DIR not in sys.path:
 # case fast — no tests were deleted.
 _SLOW_TEST_FILES: set[str] = {
     # Slow renderers (each PDF render is ~0.5–2.5s).
-    "test_coverage_pdf.py", "test_performance_pdf.py", "test_assessment_pdf.py",
+    "test_assessment_pdf.py",
     "test_coverage_suite.py", "test_coverage_runs.py", "test_coverage_trends.py",
     "test_coverage_cached_only.py",
     # Large estate-intelligence / governance matrices (broad, overlapping coverage).
-    "test_tagintel.py", "test_tagintel_generate.py", "test_changeexplorer.py",
+    "test_tagintel.py", "test_tagintel_generate.py",
     "test_changeexplorer_nlquery.py", "test_cis_v5.py", "test_metric_chart.py",
     "test_inventory_scope.py", "test_assessment_hardening.py", "test_assessment_catalog.py",
     "test_graph_analytics.py", "test_graph_scope.py", "test_scope_batching.py",
     # Integration bridges + heavier tool/provider suites.
     "test_arm_rest_bridge.py", "test_arm_mg_hierarchy.py", "test_tool_protocol.py",
     "test_builtin_tools.py", "test_builtin_agents.py", "test_autopilot.py",
-    "test_backup_restore.py", "test_security_e2e.py", "test_admin_demo.py",
+    "test_backup_restore.py", "test_security_e2e.py",
     "test_workload_profile.py", "test_perfprofile.py", "test_perfprofile_runs.py",
     "test_perfprofile_tool.py", "test_missions.py", "test_teleintel.py",
     "test_reservations.py", "test_radar.py", "test_pricing.py",

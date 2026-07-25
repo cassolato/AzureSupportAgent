@@ -16,8 +16,10 @@ import logging
 from typing import Any
 
 from app.exec.command_runner import (
+    KQL_RESOURCE_CAPTURE_BYTES,
     close_sp_session,
     open_sp_session,
+    parse_kql_rows,
     run_kql_capture,
     run_kql_collect,
 )
@@ -92,10 +94,17 @@ async def resolve_seed(
     if "/providers/" not in rid.lower():
         return None, "That id points at a subscription or resource group — pick an individual resource."
     kql = f"Resources | where id =~ '{_esc(rid)}' | project {_PROJECT}"
-    cap = await run_kql_capture(kql, connection, output="json", session_config_dir=session)
+    # KQL_RESOURCE_CAPTURE_BYTES + parse_kql_rows: _PROJECT includes `properties`, and a single
+    # big resource (AKS, APIM, Front Door, a large Logic App definition) can exceed the default
+    # 256 KB capture cap. On the REST path that truncation yields invalid JSON, and a plain
+    # json.loads would return [] - reporting a resource that plainly exists as "not found".
+    cap = await run_kql_capture(
+        kql, connection, output="json", session_config_dir=session,
+        max_bytes=KQL_RESOURCE_CAPTURE_BYTES,
+    )
     if not cap.ok:
         return None, f"Couldn't query Azure Resource Graph: {(cap.error or 'unknown error')[:200]}"
-    rows = _parse_rows(cap.stdout)
+    rows = parse_kql_rows(cap.stdout)
     if not rows:
         return None, "That resource wasn't found in this connection's tenant (or you don't have read access to it)."
     return _norm(rows[0]), ""

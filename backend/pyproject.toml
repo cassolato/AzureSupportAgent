@@ -34,6 +34,7 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.8",
     "ruff>=0.7",
 ]
 
@@ -50,9 +51,26 @@ target-version = "py312"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# ALWAYS run pytest with cwd = backend/. Run it from the repo root and pytest picks a
+# different rootdir, silently DROPS the addopts below, and executes the heavy/live suites -
+# ~58 spurious failures in files unrelated to your change. Green looks like
+# "N passed, 604 deselected"; "0 deselected" means you're in the wrong directory.
+#
 # Fast default run: the heavier / lower-frequency suites are auto-tagged ``slow`` in
 # tests/conftest.py and excluded by default so `pytest` builds & runs fast. Run the full
 # suite with `pytest -m ""` (or just the heavy ones with `pytest -m slow`).
+#
+# PARALLEL (pytest-xdist) - measured on a 24-core box, 2026-07-24:
+#     pytest -n 8 --dist loadfile            fast suite   41.7s -> 17.5s  (2.4x)
+#     pytest -m "" -n 12 --dist loadfile     full suite  130.9s -> 33.3s  (3.9x)
+# `--dist loadfile` keeps every test in a file on ONE worker, so module-level state and
+# intra-file ordering behave exactly as they do serially (verified: 3 consecutive clean
+# runs). `--dist load` splits per test and measured SLOWER (27.7s) - don't use it.
+# Past -n 12 it gets slower again: each worker re-imports the app (~3.5s), and the longest
+# single file is the floor no matter how many workers you add.
+#
+# `-n` is deliberately NOT in addopts: spawning 8 workers costs more than it saves when you
+# run one file or one test in the inner loop, and it breaks breakpoints/pdb.
 addopts = "-m 'not slow'"
 markers = [
     "slow: heavier or lower-frequency suite, excluded from the fast default run",

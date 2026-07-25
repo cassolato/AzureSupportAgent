@@ -22,7 +22,11 @@ def _parse_rows(stdout: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(stdout or "[]")
     except (json.JSONDecodeError, TypeError):
-        return []
+        # Truncated at the capture cap -> invalid JSON. Salvage the complete objects rather
+        # than silently producing empty evidence.
+        from app.exec.command_runner import parse_kql_rows
+
+        return parse_kql_rows(stdout)
     if isinstance(data, dict):
         data = data.get("data") or data.get("value") or []
     return data if isinstance(data, list) else []
