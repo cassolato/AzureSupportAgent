@@ -99,6 +99,10 @@ class AppSettingsUpdate(BaseModel):
     tool_result_limit: int | None = None
     tool_discovery_limit: int | None = None
     request_timeout_seconds: int | None = None
+    expensive_requests_per_user_hour: int | None = Field(default=None, ge=0, le=100000)
+    expensive_requests_per_tenant_hour: int | None = Field(default=None, ge=0, le=1000000)
+    monthly_tokens_per_user: int | None = Field(default=None, ge=0)
+    monthly_tokens_per_tenant: int | None = Field(default=None, ge=0)
     command_execution_enabled: bool | None = None
     command_allowlist: list[str] | None = None
     command_timeout_seconds: int | None = None

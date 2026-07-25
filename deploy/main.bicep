@@ -453,6 +453,12 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: 'true'
             }
             {
+              // ACA ingress owns and rewrites X-Forwarded-For; trusting it restores the
+              // real client IP for global login throttling and security audit records.
+              name: 'TRUST_FORWARDED_HEADERS'
+              value: 'true'
+            }
+            {
               name: 'DOTNET_SYSTEM_GLOBALIZATION_INVARIANT'
               value: '1'
             }

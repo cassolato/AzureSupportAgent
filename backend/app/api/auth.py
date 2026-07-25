@@ -79,14 +79,19 @@ def _client_ip(request: Request) -> str | None:
     """
     direct = request.client.host if request.client else None
     trusted = {ip.strip() for ip in (settings.trusted_proxies or "").split(",") if ip.strip()}
-    if direct and direct in trusted:
+    if settings.trust_forwarded_headers or (direct and direct in trusted):
         xff = request.headers.get("x-forwarded-for")
         if xff:
             # Standard format is `client, proxy1, proxy2, ...` — the first entry is
             # the original client (the proxy chain prepends as it forwards).
             first = xff.split(",")[0].strip()
             if first:
-                return first
+                import ipaddress
+
+                try:
+                    return str(ipaddress.ip_address(first))
+                except ValueError:
+                    pass
     return direct
 
 

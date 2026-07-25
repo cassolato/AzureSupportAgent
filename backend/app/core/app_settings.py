@@ -150,6 +150,11 @@ DEFAULTS: dict[str, Any] = {
     "tool_discovery_limit": 60000,
     # Seconds to wait for a single LLM streaming request before timing out.
     "request_timeout_seconds": 180,
+    # Shared DB-backed abuse/cost controls. Zero disables an individual limit.
+    "expensive_requests_per_user_hour": 60,
+    "expensive_requests_per_tenant_hour": 600,
+    "monthly_tokens_per_user": 5000000,
+    "monthly_tokens_per_tenant": 50000000,
     # --- Host command execution (Run button on az-cli code blocks) ----------------
     # Master switch. When False, the Run button is hidden and the exec endpoint 403s.
     # ON by default — an admin can opt out to hide the Run button entirely.
@@ -366,6 +371,14 @@ def save_settings(updates: dict[str, Any]) -> dict[str, Any]:
     current["tool_result_limit"] = max(2000, min(200000, int(current["tool_result_limit"])))
     current["tool_discovery_limit"] = max(2000, min(400000, int(current["tool_discovery_limit"])))
     current["request_timeout_seconds"] = max(30, min(600, int(current["request_timeout_seconds"])))
+    current["expensive_requests_per_user_hour"] = max(
+        0, min(100000, int(current["expensive_requests_per_user_hour"]))
+    )
+    current["expensive_requests_per_tenant_hour"] = max(
+        0, min(1000000, int(current["expensive_requests_per_tenant_hour"]))
+    )
+    current["monthly_tokens_per_user"] = max(0, int(current["monthly_tokens_per_user"]))
+    current["monthly_tokens_per_tenant"] = max(0, int(current["monthly_tokens_per_tenant"]))
     current["command_timeout_seconds"] = max(5, min(900, int(current["command_timeout_seconds"])))
     current["deep_parallel_count"] = max(1, min(12, int(current.get("deep_parallel_count", 12))))
     current["deep_parallel_enabled"] = bool(current.get("deep_parallel_enabled", True))

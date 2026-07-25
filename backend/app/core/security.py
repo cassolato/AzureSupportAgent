@@ -131,6 +131,14 @@ async def get_principal(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your account has no access. Contact an administrator to be granted a role.",
         )
+    from app.core.cost_controls import enforce_cost_controls
+
+    await enforce_cost_controls(
+        request,
+        db,
+        tenant_id=principal.tenant_id,
+        user_id=principal.subject,
+    )
     return principal
 
 

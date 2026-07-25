@@ -52,6 +52,8 @@ RUN apt-get update \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
+    && /opt/az/bin/python3 -m pip install --no-cache-dir "cryptography>=48.0.1" \
+    && npm install -g npm@latest \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -84,7 +86,7 @@ COPY third_party/ /app/third_party/
 RUN python -m venv /opt/eidmcp \
     && /opt/eidmcp/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/eidmcp/bin/pip install --no-cache-dir \
-        azure-core azure-identity "mcp[cli]>=1.28.1,<2" msgraph-core msgraph-sdk fastmcp python-dotenv
+        "cryptography>=48.0.1" azure-core azure-identity "mcp[cli]>=1.28.1,<2" msgraph-core msgraph-sdk fastmcp python-dotenv
 
 EXPOSE 8000
 

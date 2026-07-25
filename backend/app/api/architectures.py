@@ -1228,7 +1228,9 @@ async def upload_know_me_asset_endpoint(
     from app.knowme import registry as kreg
 
     _km_or_404(km_id, principal)
-    data = await file.read()
+    from app.core.uploads import read_upload_limited
+
+    data = await read_upload_limited(file, 8 * 1024 * 1024)
     try:
         asset = kassets.save_asset(km_id, data=data, content_type=file.content_type or "", filename=file.filename or "")
     except ValueError as exc:
