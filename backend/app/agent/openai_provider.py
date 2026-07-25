@@ -100,13 +100,19 @@ class OpenAIProvider(LLMProvider):
 
         params = generation_params()
         cap = int(max_tokens) if max_tokens else params["max_tokens"]
+        openai_tools = self._to_openai_tools(tools)
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "tools": self._to_openai_tools(tools),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        # Omit `tools` entirely when there are none. Sending an explicit null is
+        # rejected with a 400 by stricter OpenAI-compatible endpoints (e.g. newer
+        # Azure AI Foundry models), and toolless calls are common here — chat title
+        # generation and the provider connection probe both pass tools=None.
+        if openai_tools:
+            kwargs["tools"] = openai_tools
         # gpt-5 / o-series Azure models use `max_completion_tokens`; everything else uses
         # `max_tokens`. Pick up front for known models so we don't fail-then-retry.
         cap_param = (

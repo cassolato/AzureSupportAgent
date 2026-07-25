@@ -16,8 +16,65 @@ function alertsManagerScope(params: AlertsManagerScopeParams) {
   } as const;
 }
 
+export type BackupManagerScopeParams = {
+  connection_id?: string;
+  workload_id?: string;
+  subscription_id?: string;
+  management_group_id?: string;
+};
+
+function backupManagerScope(params: BackupManagerScopeParams) {
+  return {
+    connection_id: params.connection_id ?? "",
+    workload_id: params.workload_id ?? "",
+    subscription_id: params.subscription_id ?? "",
+    management_group_id: params.management_group_id ?? "",
+  } as const;
+}
+
 export const queryKeys = {
   azureConnections: ["azureConnections"] as const,
+  backupManager: {
+    root: ["backup-manager"] as const,
+    capabilities: (p: BackupManagerScopeParams) => ["backup-manager-capabilities", backupManagerScope(p)] as const,
+    /** The one analysis every tab reads. Held indefinitely; only an explicit Analyze replaces it. */
+    snapshotRoot: ["backup-manager-snapshot"] as const,
+    snapshot: (p: BackupManagerScopeParams) => ["backup-manager-snapshot", backupManagerScope(p)] as const,
+    analyzeJobRoot: ["backup-manager-analyze-job"] as const,
+    analyzeJob: (p: BackupManagerScopeParams) => ["backup-manager-analyze-job", backupManagerScope(p)] as const,
+    summaryRoot: ["backup-manager-summary"] as const,
+    summary: (p: BackupManagerScopeParams) => ["backup-manager-summary", backupManagerScope(p)] as const,
+    inventoryRoot: ["backup-manager-inventory"] as const,
+    inventory: (p: BackupManagerScopeParams, filters: Record<string, unknown>) =>
+      ["backup-manager-inventory", backupManagerScope(p), filters] as const,
+    vaultsRoot: ["backup-manager-vaults"] as const,
+    vaults: (p: BackupManagerScopeParams) => ["backup-manager-vaults", backupManagerScope(p)] as const,
+    postureRoot: ["backup-manager-posture"] as const,
+    posture: (p: BackupManagerScopeParams) => ["backup-manager-posture", backupManagerScope(p)] as const,
+    jobsRoot: ["backup-manager-jobs"] as const,
+    jobs: (p: BackupManagerScopeParams, filters: Record<string, unknown>) =>
+      ["backup-manager-jobs", backupManagerScope(p), filters] as const,
+    jobAnalysis: (p: BackupManagerScopeParams) => ["backup-manager-job-analysis", backupManagerScope(p)] as const,
+    policiesRoot: ["backup-manager-policies"] as const,
+    policies: (p: BackupManagerScopeParams) => ["backup-manager-policies", backupManagerScope(p)] as const,
+    gapsRoot: ["backup-manager-gaps"] as const,
+    gaps: (p: BackupManagerScopeParams) => ["backup-manager-gaps", backupManagerScope(p)] as const,
+    drRoot: ["backup-manager-dr"] as const,
+    dr: (p: BackupManagerScopeParams) => ["backup-manager-dr", backupManagerScope(p)] as const,
+    drillsRoot: ["backup-manager-drills"] as const,
+    drills: (p: BackupManagerScopeParams) => ["backup-manager-drills", backupManagerScope(p)] as const,
+    costRoot: ["backup-manager-cost"] as const,
+    cost: (p: BackupManagerScopeParams, opts: Record<string, unknown> = {}) =>
+      ["backup-manager-cost", backupManagerScope(p), opts] as const,
+    costActuals: (p: BackupManagerScopeParams, opts: Record<string, unknown> = {}) =>
+      ["backup-manager-cost-actuals", backupManagerScope(p), opts] as const,
+    prices: (p: BackupManagerScopeParams) => ["backup-manager-prices", backupManagerScope(p)] as const,
+    reportsRoot: ["backup-manager-reports"] as const,
+    reports: (p: BackupManagerScopeParams, days: number) => ["backup-manager-reports", backupManagerScope(p), days] as const,
+    changesRoot: ["backup-manager-changes"] as const,
+    changes: (connectionId: string, page: number, pageSize: number, view = "all", status = "") =>
+      ["backup-manager-changes", connectionId, page, pageSize, view, status] as const,
+  },
   alertsManager: {
     rulesRoot: ["alerts-manager-rules"] as const,
     rules: (params: AlertsManagerScopeParams) => ["alerts-manager-rules", alertsManagerScope(params)] as const,

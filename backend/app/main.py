@@ -21,6 +21,7 @@ from app.api import (
     auth,
     automations,
     backup,
+    backup_manager,
     backupdr,
     capability,
     cases,
@@ -240,6 +241,14 @@ async def _startup() -> None:
 
     monitor_sampler.start()
 
+    # Start the Backup Manager long-running-operation poller. Azure Backup control-plane
+    # writes are asynchronous (202 + tracking URL), so an applied managed change only reaches
+    # a terminal state once this worker polls it. Deliberately independent of the automations
+    # scheduler so the ledger converges even when scheduling is paused.
+    from app.backup_manager.lro import poller as backup_lro_poller
+
+    backup_lro_poller.start()
+
     # Warm the Azure MCP tool catalog in the background so the FIRST chat message
     # doesn't pay the `npx @azure/mcp` cold-start (node spawn + package resolve),
     # which the orchestrator awaits before streaming any token. Non-blocking.
@@ -275,6 +284,9 @@ async def _shutdown() -> None:
     from app.monitor.sampler import sampler as monitor_sampler
 
     await monitor_sampler.stop()
+    from app.backup_manager.lro import poller as backup_lro_poller
+
+    await backup_lro_poller.stop()
 
 app.add_middleware(
     CORSMiddleware,
@@ -497,6 +509,7 @@ api.include_router(identity.router)
 api.include_router(alert_analysis.router)
 api.include_router(alerts_manager.router)
 api.include_router(amba.router)
+api.include_router(backup_manager.router)
 api.include_router(telemetry.router)
 api.include_router(backupdr.router)
 api.include_router(coverage_reports.router)

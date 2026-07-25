@@ -405,7 +405,7 @@ async def query_resource_graph_paged(
                 complete = not bool(skip_token)
         return rows, None, complete, total
     except httpx.HTTPError as e:  # noqa: BLE001
-        return rows, f"Resource Graph request error: {e}", False, total, False
+        return rows, f"Resource Graph request error: {e}", False, total
 
 
 def _retry_after_seconds(resp: "httpx.Response") -> float | None:

@@ -48,6 +48,7 @@ export const DOCUMENTATION_TARGETS: Readonly<Record<string, DocumentationTarget>
   "/coverage": target("Monitoring Coverage", "/user-guide/coverage/monitoring-coverage", "/how-to/coverage/monitoring-coverage"),
   "/telemetry": target("Telemetry Coverage", "/user-guide/coverage/telemetry-coverage", "/how-to/coverage/telemetry-coverage"),
   "/backupdr": target("Backup & DR Coverage", "/user-guide/coverage/backup-dr-coverage", "/how-to/coverage/backup-dr-coverage"),
+  "/backup-manager": target("Backup Manager", "/user-guide/coverage/backup-manager"),
   "/capability": target("Connection Capability", "/user-guide/coverage/connection-capability", "/how-to/coverage/connection-capability"),
 
   "/inventory": target("Inventory", "/user-guide/estate-intelligence/inventory", "/how-to/estate-intelligence/inventory"),
