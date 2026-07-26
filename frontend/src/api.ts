@@ -3875,6 +3875,89 @@ export interface BackupRefreshJobResponse {
   result: BackupSnapshot | null;
 }
 
+/** One workload's headline from its last Backup Manager analysis (never triggers Azure). */
+export interface BackupManagerFleetRow {
+  workload_id: string;
+  name: string;
+  connection_id: string;
+  criticality: string;
+  environment: string;
+  demo: boolean;
+  has_analysis: boolean;
+  run_at: string;
+  age_seconds: number | null;
+  partial: boolean;
+  errors: string[];
+  vaults: number;
+  protected_items: number;
+  stopped: number;
+  orphaned: number;
+  policies: number;
+  gaps: number;
+  pct_protected: number | null;
+  failed_jobs: number;
+  chronic_failures: number;
+  rpo_attainment_pct: number | null;
+  rpo_breached: number;
+  posture_score: number;
+  posture_band: string;
+  red_vaults: number;
+  vault_actions: number;
+  dr_replicated: number;
+  dr_unhealthy: number;
+  monthly_cost: number;
+  recoverable_monthly: number;
+  currency: string;
+  cost_confidence: string;
+}
+export interface BackupManagerFleet {
+  workloads: BackupManagerFleetRow[];
+  total: number;
+  analyzed: number;
+  concurrency: number;
+}
+export interface BackupManagerJobState {
+  id: string;
+  status: "running" | "done" | "error";
+  started_at: string;
+  finished_at: string | null;
+  progress_count: number;
+  last_message: string;
+  error: string;
+}
+export interface BackupManagerJobs {
+  /** Keyed `connection|scope_kind|scope_id`. */
+  jobs: Record<string, BackupManagerJobState>;
+  concurrency: number;
+}
+export interface BackupManagerStoredSnapshot {
+  key: string;
+  connection_id: string;
+  scope_kind: string;
+  scope_id: string;
+  scope_name: string;
+  generated_at: string;
+  age_seconds: number | null;
+  size_bytes: number;
+  schema_stale: boolean;
+  partial: boolean;
+  demo: boolean;
+  protected_items: number;
+  gaps: number;
+  orphan: boolean;
+  orphan_reasons: string[];
+}
+export interface BackupManagerSnapshotStore {
+  snapshots: BackupManagerStoredSnapshot[];
+  stats: {
+    count: number;
+    total_bytes: number;
+    orphans: number;
+    orphan_bytes: number;
+    max_scopes: number;
+  };
+}
+
 function backupScopeQuery(scope: BackupManagerScope, extra: Record<string, string | number | boolean> = {}): string {
   const params = new URLSearchParams();
   if (scope.connection_id) params.set("connection_id", scope.connection_id);
@@ -3906,6 +3989,17 @@ export const api = {
     }),
   backupManagerAnalyzeJob: (scope: BackupManagerScope) =>
     http<BackupRefreshJobResponse>(`/backup-manager/refresh/job${backupScopeQuery(scope)}`),
+  /** Status of every in-flight/recent analysis for the tenant — one call drives the Fleet grid. */
+  backupManagerAnalyzeJobs: () => http<BackupManagerJobs>("/backup-manager/refresh/jobs"),
+  /** Last analysis headline per workload; cached-only, never scans Azure. */
+  backupManagerFleet: () => http<BackupManagerFleet>("/backup-manager/fleet"),
+  backupManagerSnapshotStore: () =>
+    http<BackupManagerSnapshotStore>("/backup-manager/cleanup/snapshots"),
+  backupManagerPurgeSnapshots: (keys: string[]) =>
+    http<{ count: number; freed_bytes: number; fleet_rows: number }>(
+      "/backup-manager/cleanup/snapshots/purge",
+      { method: "POST", body: JSON.stringify({ keys }) },
+    ),
   backupManagerRefresh: (scope: BackupManagerScope) =>
     http<{ ok: boolean; generated_at: string; errors: Record<string, string> }>("/backup-manager/refresh", {
       method: "POST",

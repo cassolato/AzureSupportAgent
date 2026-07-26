@@ -32,6 +32,8 @@ import {
 import { queryKeys } from "../queryKeys";
 import { usePersistedState, useWorkloadDeepLink } from "../utils/persistedState";
 import { BackupFlowTab } from "./backup/BackupFlowTab";
+import { BackupManagerCleanup } from "./backup/BackupManagerCleanup";
+import { BackupManagerFleet } from "./backup/BackupManagerFleet";
 import { ScopePicker } from "./ScopePicker";
 import { ConnectionScopePicker } from "./ConnectionScopePicker";
 
@@ -52,6 +54,37 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "changes", label: "Managed changes", icon: "📋" },
 ];
 const VALID_TABS = new Set<string>(TABS.map((t) => t.id));
+
+/**
+ * Estate-wide views that sit ABOVE the per-scope module, mirroring Backup & DR Coverage and
+ * Change Explorer. One scope's tabs and the whole fleet are different altitudes, so they are
+ * not peers in the same tab row.
+ */
+type MainView = "manager" | "fleet" | "cleanup";
+const MAIN_VIEWS: { id: MainView; label: string }[] = [
+  { id: "manager", label: "💾 Manager" },
+  { id: "fleet", label: "🚀 Fleet" },
+  { id: "cleanup", label: "🧹 Cleanup" },
+];
+
+function MainViewTabs({ value, onChange }: { value: MainView; onChange: (value: MainView) => void }) {
+  return (
+    <div className="flex items-center gap-1 border-b bg-white px-5 pt-2">
+      {MAIN_VIEWS.map((view) => (
+        <button
+          key={view.id}
+          onClick={() => onChange(view.id)}
+          aria-current={value === view.id ? "page" : undefined}
+          className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${value === view.id
+            ? "border-brand font-medium text-brand"
+            : "border-transparent text-gray-500 hover:text-gray-700"}`}
+        >
+          {view.label}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 const BAND_STYLE: Record<string, string> = {
   green: "bg-emerald-50 text-emerald-700 ring-emerald-200",
@@ -272,6 +305,9 @@ export function BackupManagerPanel() {
   const navigate = useNavigate();
   const { tab: routeTab } = useParams<{ tab?: string }>();
   const [routeSearch] = useSearchParams();
+  // The estate-wide views share the module's `:tab` segment so every view is linkable and
+  // survives a reload, but they are a different altitude from the per-scope tabs below.
+  const mainView: MainView = routeTab === "fleet" ? "fleet" : routeTab === "cleanup" ? "cleanup" : "manager";
   const tab: Tab = routeTab && VALID_TABS.has(routeTab) ? (routeTab as Tab) : "overview";
 
   const [scopeKind, setScopeKind] = usePersistedState<"workload" | "subscription">("azsup.backupManager.scopeKind", "workload");
@@ -316,6 +352,22 @@ export function BackupManagerPanel() {
   const snapshot = snapshotQ.data;
   const analyzed = !!snapshot?.report_exists;
 
+  // A job THIS browser started, remembered locally until the server confirms it finished.
+  //
+  // Without it, "is an analysis running?" hangs entirely on the newest poll response, so a
+  // single reply that doesn't report the job — a poll that raced the start, a backend whose
+  // in-memory registry was restarted, another replica behind the ingress — flips the button
+  // back to "Analyze backups" AND stops the polling that would have recovered it. The sweep
+  // keeps running server-side and still writes its snapshot, so the operator sees a moment of
+  // "Analyzing…", then an idle screen, while the work is very much in flight.
+  const [pendingJob, setPendingJob] = useState<{ scope: string; id: string; startedAt: string } | null>(null);
+  const scopeSig = JSON.stringify(queryKeys.backupManager.analyzeJob(scope));
+  const pending = pendingJob && pendingJob.scope === scopeSig ? pendingJob : null;
+  // refetchInterval is evaluated by the query cache outside the render closure, so the flag it
+  // reads has to live in a ref.
+  const pendingRef = useRef(false);
+  useEffect(() => { pendingRef.current = !!pending; }, [pending]);
+
   // The job query is the opposite: always current, and polls only while work is in flight.
   // Mounting it on every tab is what lets an operator start an analysis, navigate away, and
   // come back to a live progress log instead of an apparently idle screen.
@@ -325,10 +377,11 @@ export function BackupManagerPanel() {
     enabled: scopeReady && !caps?.demo,
     staleTime: 0,
     refetchOnMount: "always",
-    refetchInterval: (query) => (query.state.data?.job?.status === "running" ? 1000 : false),
+    refetchInterval: (query) =>
+      query.state.data?.job?.status === "running" || pendingRef.current ? 1000 : false,
   });
   const job = jobQ.data?.job;
-  const analyzing = job?.status === "running";
+  const serverRunning = job?.status === "running";
 
   const changesQ = useQuery({
     queryKey: queryKeys.backupManager.changes(connId, 1, 100, "all", ""),
@@ -368,11 +421,58 @@ export function BackupManagerPanel() {
     mutationFn: () => api.backupManagerAnalyzeStart(scope),
     onSuccess: (state) => {
       qc.setQueryData(queryKeys.backupManager.analyzeJob(scope), state);
+      if (state.job) {
+        setPendingJob({
+          scope: scopeSig,
+          id: state.job.id,
+          startedAt: state.job.started_at || new Date().toISOString(),
+        });
+      }
       void jobQ.refetch();
     },
     onError: (e: Error) => setBanner(e.message),
   });
   const startAnalysis = () => analyzeM.mutate();
+
+  // Stop tracking a locally-started job once the server has actually reported it (or a newer
+  // run) as finished. A poll that returns an OLDER finished job — the previous analysis for
+  // this scope — must not clear it, or we are back to the bug this marker exists to prevent.
+  useEffect(() => {
+    if (!pending) return;
+    const settled =
+      job &&
+      job.status !== "running" &&
+      (job.id === pending.id || Date.parse(job.started_at || "") >= Date.parse(pending.startedAt));
+    if (settled) {
+      setPendingJob(null);
+      return;
+    }
+    // The registry no longer knows about it at all. Give the start a grace window (a poll can
+    // legitimately race it), then stop claiming an analysis is in flight rather than spinning
+    // forever on a job nobody can see.
+    if (!job && Date.now() - Date.parse(pending.startedAt) > 30_000) {
+      setPendingJob(null);
+      setBanner("Lost contact with the analysis job — it may still be finishing on the server. Reopen Backup Manager to reconnect.");
+    }
+  }, [job, pending, jobQ.dataUpdatedAt]);
+
+  // What the operator is told. The local marker covers the window where the server has not
+  // (yet) reported the job, and isPending covers the click-to-response gap.
+  const analyzing = analyzeM.isPending || serverRunning || !!pending;
+  const analyzingSince = job?.started_at ?? pending?.startedAt;
+  // Show live progress from the moment work starts, even before the first poll lands.
+  const progressState: BackupRefreshJobResponse | undefined = jobQ.data?.job
+    ? jobQ.data
+    : pending
+      ? {
+          job: {
+            id: pending.id, key: "", status: "running", started_at: pending.startedAt,
+            finished_at: null, progress_count: 0, last_message: "", error: "",
+          },
+          progress: [],
+          result: null,
+        }
+      : undefined;
 
   useEffect(() => {
     if (!banner) return;
@@ -382,6 +482,18 @@ export function BackupManagerPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      <MainViewTabs value={mainView} onChange={(next) => navigate(`/backup-manager/${next === "manager" ? "overview" : next}`)} />
+      {mainView === "fleet" ? (
+        <BackupManagerFleet onOpenWorkload={(id, connectionId) => {
+          setScopeKind("workload");
+          setWorkloadId(id);
+          if (connectionId) setConnId(connectionId);
+          goTab("overview");
+        }} />
+      ) : mainView === "cleanup" ? (
+        <BackupManagerCleanup canPurge={!!caps?.can_approve} />
+      ) : (
+      <>
       <header className="border-b bg-white px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -420,7 +532,7 @@ export function BackupManagerPanel() {
                 className="rounded-lg bg-gray-900 px-3 py-1.5 text-sm font-medium tabular-nums text-white hover:bg-gray-700 disabled:opacity-50"
               >
                 {analyzing
-                  ? `Analyzing… ${elapsedText(job?.started_at)}`
+                  ? `Analyzing… ${elapsedText(analyzingSince)}`
                   : analyzed ? "↻ Analyze again" : "Analyze backups"}
               </button>
             )}
@@ -474,8 +586,8 @@ export function BackupManagerPanel() {
                 Demo workload — synthetic backup estate. Every write action is disabled.
               </div>
             )}
-            {jobQ.data?.job && (
-              <div className="mb-3"><AnalysisProgress state={jobQ.data} /></div>
+            {progressState && (
+              <div className="mb-3"><AnalysisProgress state={progressState} /></div>
             )}
             {snapshotQ.isLoading ? (
               <Empty>Loading the last backup analysis…</Empty>
@@ -483,8 +595,8 @@ export function BackupManagerPanel() {
               <Empty>{(snapshotQ.error as Error).message}</Empty>
             ) : !analyzed ? (
               // Every tab shows the same prompt: nothing is fetched until it is asked for.
-              <NeedsAnalysis onAnalyze={startAnalysis} analyzing={analyzing || analyzeM.isPending}
-                startedAt={job?.started_at} />
+              <NeedsAnalysis onAnalyze={startAnalysis} analyzing={analyzing}
+                startedAt={analyzingSince} />
             ) : !snapshot ? null : (
               <>
                 {tab === "overview" && <OverviewTab snapshot={snapshot} actionable={actionable} onGoTab={goTab} />}
@@ -505,6 +617,8 @@ export function BackupManagerPanel() {
           </>
         )}
       </main>
+      </>
+      )}
     </div>
   );
 }

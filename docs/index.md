@@ -50,7 +50,7 @@ AI-driven Azure operations, investigation, governance, and proactive support—d
 - Find alert gaps with [Monitoring Coverage]({{ site.baseurl }}/user-guide/coverage/monitoring-coverage/).
 - Review alert noise and routing in [Alerts Manager]({{ site.baseurl }}/user-guide/coverage/alerts-manager/).
 - Audit diagnostic settings and recoverability with [Telemetry Coverage]({{ site.baseurl }}/user-guide/coverage/telemetry-coverage/) and [Backup & DR Coverage]({{ site.baseurl }}/user-guide/coverage/backup-dr-coverage/).
-- Triage backup jobs and manage vaults, policies, DR drills, and backup cost in [Backup Manager]({{ site.baseurl }}/user-guide/coverage/backup-manager/).
+- Triage backup jobs and manage vaults, policies, DR drills, and backup cost in [Backup Manager]({{ site.baseurl }}/user-guide/coverage/backup-manager/), one workload at a time or across the whole fleet.
 
 ### Govern and automate
 

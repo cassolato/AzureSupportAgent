@@ -28,7 +28,8 @@ Open the feature route listed in the selected guide.
 2. Use [Alerts Manager]({{ site.baseurl }}/how-to/coverage/alerts-manager/) for fired-alert triage, overlaps, rule and Action Group authoring, deployment plans, and approval-gated Azure changes.
 3. Use [Telemetry Coverage]({{ site.baseurl }}/how-to/coverage/telemetry-coverage/) for diagnostic-setting categories and destinations.
 4. Use [Backup & DR Coverage]({{ site.baseurl }}/how-to/coverage/backup-dr-coverage/) for backup, restore-test, replication, and resilience evidence.
-5. Use [Connection Capability]({{ site.baseurl }}/how-to/coverage/connection-capability/) to explain collection blind spots or disabled writes.
+5. Use [Backup Manager]({{ site.baseurl }}/how-to/coverage/backup-manager/) to analyze a backup estate, sweep every workload, triage failed jobs, close gaps through approved changes, and reclaim stored analyses.
+6. Use [Connection Capability]({{ site.baseurl }}/how-to/coverage/connection-capability/) to explain collection blind spots or disabled writes.
 
 **Expected result:** You start from the feature whose collector and reference match the control being investigated.
 
@@ -36,7 +37,7 @@ Open the feature route listed in the selected guide.
 
 ## Safety and rollback
 
-Coverage scans are read-only, but Alerts Manager can apply approved Azure changes. Generated IaC and runbooks are artifacts, not deployments. Preserve evidence before purging runs, and use each feature's verification procedure after an external or managed change.
+Coverage scans are read-only, but Alerts Manager and Backup Manager can apply approved Azure changes. Generated IaC and runbooks are artifacts, not deployments. Preserve evidence before purging runs, and use each feature's verification procedure after an external or managed change.
 
 ## Troubleshooting
 

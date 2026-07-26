@@ -3,7 +3,7 @@ layout: default
 title: Diagnose Connection Capability
 parent: Coverage operations
 grand_parent: How-to guides
-nav_order: 5
+nav_order: 6
 description: Explain collection blind spots, verify ARM and Graph reachability, and preserve least privilege.
 permalink: /how-to/coverage/connection-capability/
 ---
