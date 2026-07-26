@@ -6,12 +6,12 @@ grand_parent: User guide
 nav_order: 5
 description: Manage Azure Backup and Site Recovery — protection inventory, job triage, policies, vault posture, DR drills, real cost, and approval-gated changes.
 permalink: /user-guide/coverage/backup-manager/
-feature_ids: [PROACTIVE_NAV:backup-manager, BACKUP_MANAGER_NAV:overview, BACKUP_MANAGER_NAV:flow, BACKUP_MANAGER_NAV:inventory, BACKUP_MANAGER_NAV:jobs, BACKUP_MANAGER_NAV:policies, BACKUP_MANAGER_NAV:vaults, BACKUP_MANAGER_NAV:gaps, BACKUP_MANAGER_NAV:dr, BACKUP_MANAGER_NAV:cost, BACKUP_MANAGER_NAV:changes]
+feature_ids: [PROACTIVE_NAV:backup-manager, BACKUP_MANAGER_NAV:overview, BACKUP_MANAGER_NAV:flow, BACKUP_MANAGER_NAV:inventory, BACKUP_MANAGER_NAV:jobs, BACKUP_MANAGER_NAV:policies, BACKUP_MANAGER_NAV:vaults, BACKUP_MANAGER_NAV:gaps, BACKUP_MANAGER_NAV:dr, BACKUP_MANAGER_NAV:cost, BACKUP_MANAGER_NAV:changes, BACKUP_MANAGER_NAV:fleet, BACKUP_MANAGER_NAV:cleanup]
 ---
 
 # Backup Manager
 
-**Product permissions:** `backup_manager.read`; write actions use `backup_manager.protect_write`, `backup_manager.policy_write`, `backup_manager.vault_write`, `backup_manager.ondemand`, `backup_manager.drill_write`, and `backup_manager.reference_write` according to the action. `backup_manager.approve` decides and applies managed changes.
+**Product permissions:** `backup_manager.read`; write actions use `backup_manager.protect_write`, `backup_manager.policy_write`, `backup_manager.vault_write`, `backup_manager.ondemand`, `backup_manager.drill_write`, and `backup_manager.reference_write` according to the action. `backup_manager.approve` decides and applies managed changes, and is also required to permanently purge stored analyses or analysis history from the Cleanup tab.
 
 ## Purpose
 
@@ -64,6 +64,65 @@ Every source is fail-soft. A permission gap or unsupported table degrades that o
 
 Tab controls are permission- and capability-dependent. A read-only connection disables every write control even when the signed-in user holds the permission.
 
+Above those tabs sits a view strip — **Manager · Fleet · Cleanup** — matching Backup & DR Coverage and Change Explorer. The tabs above answer questions about the selected scope; **Fleet** and **Cleanup** are estate-wide and are therefore a level up rather than peers in the same row.
+
+## Fleet
+
+**App route:** `/backup-manager/fleet`
+
+Every tab in the Manager view answers a question about **one** scope. Fleet answers it for the whole estate: for each workload it shows protection percentage, protected items, gaps, failing jobs, RPO attainment, vault posture score, estimated monthly cost and when the analysis was taken.
+
+The grid is served entirely from stored results and **never reads Azure**. Opening it costs nothing, however large the estate.
+
+### Launching a sweep
+
+Select workloads and choose **Analyze selected**. Each selection starts the same server-side analysis the Analyze button starts on a single scope, so:
+
+- Analyses continue if you navigate away or close the tab, and the grid reconnects to them when you return.
+- A workload that is already analyzing is not analyzed twice — the launch re-attaches to the running job.
+- **Two analyses run at a time.** A backup analysis is nine Resource Graph queries per subscription plus per-vault configuration reads, Cost Management and retail pricing calls; launching thirty at once would throttle the tenant. The client queues the rest and the server enforces the same cap independently, so a scripted caller cannot bypass it.
+- Starts are spaced so a large batch does not arrive as one burst.
+
+Rows show `analyzing…` with the current phase, `queued`, or `failed` with the error on hover. **Retry failed** re-queues only the failures. Demo workloads are listed but cannot be launched — they are synthetic and composed on read.
+
+Cost is included in a fleet sweep exactly as it is in a single-scope analysis: Cost Management actuals and retail list prices are both collected, so the money column is real rather than an estimate-only placeholder.
+
+### Sorting
+
+The default order is **worst first**: never-analyzed workloads lead (an unmeasured workload is the largest unknown), then the most gaps, then the lowest protection percentage, then the most failing jobs. Sort by any column to ask a narrower question — lowest RPO attainment, weakest vault posture, highest cost.
+
+Selecting a workload's name opens it in the per-scope tabs with its connection already set.
+
+### Where fleet numbers come from
+
+When an analysis finishes it writes a small summary row for that workload alongside the full stored analysis. The grid reads those rows, which is why it is instant and why it stays accurate even after the stored analysis for a scope has been evicted by the store's scope cap.
+
+A workload analyzed before this tab existed is backfilled from its stored analysis the first time the grid is opened, so history is not lost.
+
+## Cleanup
+
+**App route:** `/backup-manager/cleanup`
+
+Two different things accumulate, and the tab treats them separately.
+
+### Stored analyses
+
+These are the full documents every tab reads. They are large — a busy estate is hundreds of kilobytes — and the store keeps a bounded number of scopes, evicting the oldest when it is full. The table lists each stored scope with its size, age, protected items, gaps and state, so the operator decides what survives instead of discovering an eviction as an empty tab.
+
+A scope is flagged **orphaned** when it can never be opened again:
+
+- its workload has been deleted;
+- its Azure connection has been removed;
+- it was written by an older analysis shape.
+
+One-click selectors pick every orphan, or everything older than thirty days. Purging removes the stored analysis and the fleet summary row that pointed at it. Nothing in Azure changes and no backup data is touched — a purged scope simply has to be analyzed again. Purging requires `backup_manager.approve` and is audited.
+
+### Analysis history
+
+Every completed analysis also records a compact history entry — headline protection percentage, counts, cost totals and any source errors, but none of the row-level inventory. History is what makes "how did this workload look last week?" answerable without keeping thousands of rows per run.
+
+The history list groups by scope and offers the standard presets: retain the last N per scope, older than 7 / 30 / 90 days, demo runs, and empty runs. Deletion is two-stage — **Trash** is restorable, **Purge** is permanent and approver-gated.
+
 ## Freshness and scope behavior
 
 Backup Manager does **not** read Azure on page load, on tab switch, or when the scope changes. A full estate sweep is expensive, and numbers that move while an operator is working a decision are worse than numbers that are slightly old. Reading Azure happens only when **Analyze backups** is clicked.
@@ -72,7 +131,7 @@ One analysis produces the data for every tab, so the job count on the Overview i
 
 The analysis runs on the server and survives navigation: closing the tab or moving elsewhere in the app does not abandon it, and returning reconnects to its progress. Progress is reported per phase — resolving scope, reading Resource Graph, checking for orphans, reading vault configuration, analyzing, pricing, saving — with the row count each of the nine Resource Graph sources returned. Starting an analysis for a scope that is already analyzing re-attaches to the running job instead of launching a second sweep.
 
-Results are stored per tenant, connection and scope, and survive a restart. Row lists are bounded — 2,000 jobs, 5,000 protected items and 2,000 gaps — and a truncated section says so. The 24 most recently analyzed scopes are retained.
+Results are stored per tenant, connection and scope, and survive a restart. Row lists are bounded — 2,000 jobs, 5,000 protected items and 2,000 gaps — and a truncated section says so. The 24 most recently analyzed scopes are retained; the **Cleanup** tab shows what is held and lets you purge dead scopes so the cap protects the ones you actually use.
 
 If **every** Resource Graph source fails — an expired token or a revoked role — the analysis is reported as failed and the previous result is kept. An empty estate would otherwise be indistinguishable from a genuine "nothing is protected" answer and would overwrite a good analysis. A partial failure still saves and is flagged.
 
@@ -122,13 +181,30 @@ Changing the period or the cost type is an explicit action and fetches that peri
 
 Selecting a node offers the matching action — the unprotected terminal opens Gaps with those resources preselected, a vault opens its posture, a policy opens retention modelling.
 
+### Sweep the whole estate
+
+1. Open **Fleet** from the view strip at the top of the module. Every workload is listed with the headline of its last analysis; nothing is fetched from Azure to draw the grid.
+2. Sort worst-first (the default) to see what has never been measured, then what has the most gaps.
+3. Select the workloads to measure and choose **Analyze selected**. Two run at a time; the rest queue.
+4. Leave the tab if you want — the analyses run on the server. Come back and the grid reconnects to whatever is still running.
+5. Work the worst rows: open a workload to land in its per-scope tabs with the connection already set.
+
+### Reclaim storage
+
+1. Open **Cleanup** from the view strip.
+2. In **Stored analyses**, select **orphaned** scopes — deleted workloads, removed connections, old shapes — and purge them. This is the change that frees real space and stops useful scopes being evicted.
+3. In the history list below, apply a retention preset such as *retain last 2 per scope* or *older than 30 days*.
+4. **Trash** first if you are unsure: trashed entries can be restored. **Purge** is permanent and requires the approve permission.
+
 ## Interpretation of results
 
-- An **orphaned** item is a protected item whose source resource no longer exists; it is still billing. Orphan detection fails open: if the resource sweep cannot run, nothing is reported as orphaned rather than everything.
-- **RPO attainment** is measured against the retention tier configured in the editable reference, not an Azure setting.
+- An **orphaned** item is a protected item whose source resource no longer exists; it is still billing. Orphan detection fails open: if the resource sweep cannot run, nothing is reported as orphaned rather than everything.- **RPO attainment** is measured against the retention tier configured in the editable reference, not an Azure setting.
 - **Ransomware readiness** is a weighted score over vault controls. Controls that are portal-only are scored but never offered as an action.
 - **Estimated cost** is a list price. It is not a bill, and it will usually differ from invoiced spend because it assumes a full month at the current footprint.
 - **Applied** means the request completed. Only a fresh analysis proves Azure converged.
+- A Fleet **protection percentage** is measured against what the detectors judged backup-eligible — protected items plus open gaps — not against every resource in the workload. A workload with nothing eligible reports no percentage rather than 0% or 100%.
+- A Fleet row is only as fresh as its analysis. The **Last analysis** column is part of the reading, not decoration.
+- An **orphaned** stored analysis in Cleanup is about *this module's storage*, not about Azure. Purging one deletes a cached report, never backup data.
 
 ### How backup cost is attributed
 
@@ -170,6 +246,9 @@ The failure knowledge base, vault checks, retention tiers, service limits and co
 - A vault's storage redundancy cannot be changed after its first protected item; the module withdraws the action rather than failing the apply.
 - Backup Reports require vault diagnostics and a queryable workspace. A pasted-token connection cannot read Log Analytics.
 - Saved Protection flow perspectives are stored per browser. They do not follow a user to another machine and cannot be shared.
+- Fleet covers **workloads only**. Subscription and management-group scopes are analyzed individually from the per-scope tabs.
+- A fleet sweep is not instant. Two analyses run concurrently by design, so a large estate takes as long as it takes; the cap protects the tenant from throttling.
+- Purging analysis history does not delete audit records or Evidence Locker snapshots, which are retained independently.
 - Approving is not applying, and applying is not converging. Verify against Azure after apply.
 
 ## Troubleshooting
@@ -192,6 +271,11 @@ The failure knowledge base, vault checks, retention tiers, service limits and co
 | A gap cannot be remediated | The preview states why. The most common cause is a target vault in a different subscription from the resource. |
 | A vault redundancy action disappeared | The vault already holds a protected item, after which Azure locks redundancy. |
 | Saved flow perspectives vanished | They are stored per browser. A different browser, machine, or a cleared cache has no access to them. |
+| Fleet says a workload was never analyzed but I analyzed it | The analysis was for a different connection than the one the workload is registered with, or its stored analysis was purged. Analyze it from the Fleet row to record it against the workload's own connection. |
+| A fleet sweep seems slow | Two analyses run at a time on purpose. The header shows how many are outstanding; each row shows its current phase. |
+| A fleet row sat on "analyzing" and then went idle | The job stopped reporting for longer than the grace window — usually a backend restart. Nothing was applied; select the row and analyze again. |
+| A tab went back to "No backup analysis yet" | The stored analysis for that scope was evicted by the store's scope cap or purged in Cleanup. Analyze the scope again, and purge orphaned scopes so the cap protects the ones you use. |
+| Purge is disabled in Cleanup | Permanent deletion requires `backup_manager.approve`. Trash is available to anyone with read access and is restorable. |
 
 ## Related pages
 

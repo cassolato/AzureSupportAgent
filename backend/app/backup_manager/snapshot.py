@@ -173,6 +173,64 @@ def delete_snapshot(tenant_id: str, connection_id: str, scope_kind: str, scope_i
     return True
 
 
+def list_scopes(tenant_id: str) -> list[dict[str, Any]]:
+    """Every stored snapshot for a tenant with its size and age — drives the Cleanup tab.
+
+    The store is capped at :data:`MAX_SCOPES` and evicts the oldest scope on write, so an
+    operator who can see what is held (and drop what they no longer need) controls which
+    analyses survive instead of discovering the eviction by an empty tab."""
+    prefix = f"{str(tenant_id or 'default')}|"
+    out: list[dict[str, Any]] = []
+    for stored_key, value in _read().items():
+        if not stored_key.startswith(prefix) or not isinstance(value, dict):
+            continue
+        parts = stored_key.split("|")
+        if len(parts) != 4:
+            continue
+        try:
+            size = len(json.dumps(value, default=str))
+        except (TypeError, ValueError):
+            size = 0
+        counts = value.get("counts") or {}
+        out.append({
+            "key": stored_key,
+            "connection_id": parts[1] if parts[1] != "default" else "",
+            "scope_kind": parts[2],
+            "scope_id": parts[3],
+            "generated_at": str(value.get("generated_at") or ""),
+            "age_seconds": age_seconds(value),
+            "size_bytes": size,
+            "schema_version": value.get("schema_version"),
+            "schema_stale": value.get("schema_version") != SNAPSHOT_SCHEMA_VERSION,
+            "partial": bool(value.get("partial")),
+            "demo": bool(value.get("demo")),
+            "protected_items": int(counts.get("protected_items", 0) or 0),
+            "gaps": int(counts.get("gaps", 0) or 0),
+        })
+    out.sort(key=lambda row: str(row.get("generated_at") or ""), reverse=True)
+    return out
+
+
+def delete_keys(keys: list[str]) -> dict[str, int]:
+    """Purge stored snapshots by their exact store key. Returns count + bytes freed."""
+    data = _read()
+    removed = 0
+    freed = 0
+    for stored_key in keys:
+        value = data.pop(stored_key, None)
+        if value is None:
+            continue
+        removed += 1
+        try:
+            freed += len(json.dumps(value, default=str))
+        except (TypeError, ValueError):
+            pass
+    if removed:
+        _write(data)
+    return {"count": removed, "freed_bytes": freed}
+
+
+
 def age_seconds(snapshot: dict[str, Any]) -> float | None:
     generated = str(snapshot.get("generated_at") or "")
     if not generated:

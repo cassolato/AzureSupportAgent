@@ -11,6 +11,7 @@ gap is explicit: **restores** and **destructive backup operations**.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -27,6 +28,7 @@ from app.backup_manager import (
     dr as dr_ops,
     drills as drill_ops,
     export as export_ops,
+    fleet as fleet_store,
     gaps as gap_ops,
     inventory as inventory_ops,
     jobs as job_ops,
@@ -39,6 +41,7 @@ from app.backup_manager import (
     snapshot as snapshot_store,
 )
 from app.backup_manager.builtin_seed import PORTAL_ONLY_OPERATIONS
+from app.core import coverage_runs
 from app.core.db import SessionLocal, get_db
 from app.core.genjob import JobRegistry, ProgressFn
 from app.core.security import Principal, require_permission
@@ -46,10 +49,23 @@ from app.models import AuditLog, BackupDrill, BackupManagerChange
 
 router = APIRouter(prefix="/backup-manager", tags=["backup-manager"])
 
+log = logging.getLogger("app.api.backup_manager")
+
 #: Detached refresh jobs, one per (tenant, connection, scope). Starting a refresh for a scope
 #: that is already analyzing simply re-attaches to the running job, so a double click — or two
 #: operators on the same scope — cannot launch two sweeps.
 _refresh_jobs = JobRegistry("backup-manager-refresh")
+
+#: Feature key for the shared run-history / cleanup store.
+RUNS_FEATURE = "backup_manager"
+
+#: A single analysis is nine Resource Graph sources per subscription plus vault, Cost
+#: Management and Retail Prices calls. The job registry is idempotent per scope but has no
+#: global cap, so a fleet launch (or a scripted client) could otherwise fan out dozens of
+#: concurrent sweeps against one tenant. Jobs beyond the cap stay queued inside the runner and
+#: report that they are waiting, rather than being rejected.
+ANALYSIS_CONCURRENCY = 2
+_analysis_slots = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
 
 _read = require_permission("backup_manager.read")
 _protect_write = require_permission("backup_manager.protect_write")
@@ -446,6 +462,67 @@ async def _actionable_changes(db: AsyncSession, tenant_id: str, connection_id: s
     )).scalar_one() or 0)
 
 
+# ------------------------------------------------------------------- fleet + run history
+def _workloads() -> list[dict[str, Any]]:
+    from app.workloads.registry import list_workloads
+
+    return list_workloads()
+
+
+def _scope_name(scope_kind: str, scope_id: str, workload_id: str) -> str:
+    if scope_kind == "workload":
+        for workload in _workloads():
+            if str(workload.get("id") or "") == workload_id:
+                return str(workload.get("name") or workload_id)
+    return scope_id
+
+
+def _run_payload(snapshot: dict[str, Any], scope_name: str) -> dict[str, Any]:
+    """The slice of an analysis worth keeping as history.
+
+    Deliberately NOT the whole snapshot: inventory, jobs and gap rows are thousands of records
+    each, and thirty of those per scope would turn a JSON history file into hundreds of
+    megabytes. The headline sections are what a trend or an audit actually reads back."""
+    return {
+        "generated_at": snapshot.get("generated_at", ""),
+        "scope": snapshot.get("scope", {}),
+        "scope_name": scope_name,
+        "demo": bool(snapshot.get("demo")),
+        "partial": bool(snapshot.get("partial")),
+        "errors": snapshot.get("errors", {}),
+        "counts": snapshot.get("counts", {}),
+        "summary": snapshot.get("summary", {}),
+        "cost": {k: v for k, v in (snapshot.get("cost") or {}).items() if k != "rows"},
+    }
+
+
+def _record_analysis(
+    principal: Principal, snapshot: dict[str, Any], *, tenant: str, connection_id: str,
+    scope_kind: str, scope_id: str, workload_id: str,
+) -> None:
+    """Persist the two lightweight artifacts a finished analysis leaves behind.
+
+    Both are best-effort: an analysis that succeeded must not be reported as failed because a
+    summary file could not be written."""
+    counts = snapshot.get("counts") or {}
+    protected = int(counts.get("protected_items", 0) or 0)
+    gaps = int(counts.get("gaps", 0) or 0)
+    eligible = protected + gaps
+    scope_name = _scope_name(scope_kind, scope_id, workload_id)
+    try:
+        if scope_kind == "workload" and workload_id:
+            fleet_store.write_row(tenant, fleet_store.summarize(
+                snapshot, workload_id=workload_id, connection_id=connection_id,
+            ))
+        coverage_runs.save_run(
+            RUNS_FEATURE, tenant, scope_kind, scope_id, _run_payload(snapshot, scope_name),
+            headline=round(protected * 100 / eligible) if eligible else None,
+            counts=counts, resource_count=eligible, actor=principal.subject or "",
+        )
+    except (OSError, TypeError, ValueError) as exc:  # noqa: BLE001 - never fail a good analysis
+        log.warning("backup_manager: could not record analysis history: %s", exc)
+
+
 async def _demo_snapshot(workload_id: str) -> dict[str, Any]:
     """Demo estates are synthetic and instant, so they are composed on read.
 
@@ -539,23 +616,30 @@ async def refresh_start(
 
     async def runner(progress: ProgressFn) -> dict[str, Any]:
         await progress("start", "Starting a server-side backup estate analysis. It continues if you navigate away.")
-        lock = snapshot_store.get_lock(tenant, effective_connection, scope_kind, scope_id)
-        async with lock:
-            snapshot = await analysis_ops.build_snapshot(
-                connection, tenant_id=tenant, scope_kind=scope_kind, scope_id=scope_id,
-                workload_id=workload_id, subscription_id=subscription_id,
-                management_group_id=management_group_id, progress=progress,
-            )
-            await progress("save", "Saving the analysis so every tab reads the same numbers…")
-            snapshot_store.write_snapshot(tenant, effective_connection, scope_kind, scope_id, snapshot)
-            async with SessionLocal() as db:
-                db.add(_audit(principal, "backup_manager.analyze", f"{scope_kind}:{scope_id}", {
-                    "counts": snapshot.get("counts", {}),
-                    "errors": sorted((snapshot.get("errors") or {}).keys()),
-                }))
-                await db.commit()
-                snapshot["summary"]["actionable_changes"] = await _actionable_changes(
-                    db, tenant, effective_connection,
+        if _analysis_slots.locked():
+            await progress("start", f"Waiting for a free analysis slot ({ANALYSIS_CONCURRENCY} run at a time)…")
+        async with _analysis_slots:
+            lock = snapshot_store.get_lock(tenant, effective_connection, scope_kind, scope_id)
+            async with lock:
+                snapshot = await analysis_ops.build_snapshot(
+                    connection, tenant_id=tenant, scope_kind=scope_kind, scope_id=scope_id,
+                    workload_id=workload_id, subscription_id=subscription_id,
+                    management_group_id=management_group_id, progress=progress,
+                )
+                await progress("save", "Saving the analysis so every tab reads the same numbers…")
+                snapshot_store.write_snapshot(tenant, effective_connection, scope_kind, scope_id, snapshot)
+                async with SessionLocal() as db:
+                    db.add(_audit(principal, "backup_manager.analyze", f"{scope_kind}:{scope_id}", {
+                        "counts": snapshot.get("counts", {}),
+                        "errors": sorted((snapshot.get("errors") or {}).keys()),
+                    }))
+                    await db.commit()
+                    snapshot["summary"]["actionable_changes"] = await _actionable_changes(
+                        db, tenant, effective_connection,
+                    )
+                _record_analysis(
+                    principal, snapshot, tenant=tenant, connection_id=effective_connection,
+                    scope_kind=scope_kind, scope_id=scope_id, workload_id=workload_id,
                 )
         counts = snapshot.get("counts", {})
         await progress(
@@ -586,6 +670,227 @@ async def refresh_job(
     connection = _connection(connection_id, workload_id)
     key = _job_key(_tenant(principal), str(connection.get("id") or ""), scope_kind, scope_id)
     return _job_response(_refresh_jobs.get_job(key))
+
+
+@router.get("/refresh/jobs")
+async def refresh_jobs(principal: Principal = Depends(_read)) -> dict[str, Any]:
+    """Every in-flight or recent analysis for this tenant, keyed ``connection|kind|scope``.
+
+    The Fleet grid needs live status for dozens of rows at once; polling ``/refresh/job`` per
+    row would be dozens of requests per second. One call answers the whole grid."""
+    tenant = _tenant(principal)
+    prefix = f"{tenant}|"
+    jobs: dict[str, Any] = {}
+    for job in _refresh_jobs.jobs_with_prefix(prefix):
+        public = _refresh_jobs.public_job(job)
+        if not public:
+            continue
+        parts = str(public.get("key") or "").split("|")
+        if len(parts) != 4:
+            continue
+        jobs["|".join(parts[1:])] = {
+            "id": public["id"],
+            "status": public["status"],
+            "started_at": public["started_at"],
+            "finished_at": public["finished_at"],
+            "progress_count": public["progress_count"],
+            "last_message": public["last_message"],
+            "error": public["error"],
+        }
+    return {"jobs": jobs, "concurrency": ANALYSIS_CONCURRENCY}
+
+
+# --------------------------------------------------------------------------- fleet
+@router.get("/fleet")
+async def fleet(principal: Principal = Depends(_read)) -> dict[str, Any]:
+    """Latest analysis headline for every workload; never touches Azure.
+
+    Rows come from the fleet summary store rather than the snapshot document, so they survive
+    the snapshot store's scope cap and load instantly however large the estate is."""
+    tenant = _tenant(principal)
+    rows_by_key = fleet_store.read_rows(tenant)
+    out: list[dict[str, Any]] = []
+    for workload in _workloads():
+        workload_id = str(workload.get("id") or "")
+        connection_id = str(workload.get("connection_id") or "")
+        row_key = fleet_store.key(connection_id, workload_id)
+        row = rows_by_key.get(row_key) or {}
+        if not row:
+            # Backfill: a scope analyzed before this grid existed (or by another operator whose
+            # summary row was purged) still has its stored snapshot. Derive the row from it once
+            # and keep it, so the fleet is accurate the first time it is opened rather than
+            # claiming a workload was never analyzed.
+            stored = snapshot_store.read_snapshot(tenant, connection_id, "workload", workload_id)
+            if stored:
+                row = fleet_store.write_row(tenant, fleet_store.summarize(
+                    stored, workload_id=workload_id, connection_id=connection_id,
+                ))
+        age = fleet_store.age_seconds(row) if row else None
+        out.append({
+            "workload_id": workload_id,
+            "name": str(workload.get("name") or workload_id),
+            "connection_id": connection_id,
+            "criticality": str(workload.get("criticality") or ""),
+            "environment": str(workload.get("environment") or ""),
+            "demo": bool(row.get("demo") or _is_demo(workload_id)),
+            "has_analysis": bool(row),
+            "run_at": row.get("run_at", ""),
+            "age_seconds": age,
+            "partial": bool(row.get("partial")),
+            "errors": row.get("errors", []),
+            "vaults": row.get("vaults", 0),
+            "protected_items": row.get("protected_items", 0),
+            "stopped": row.get("stopped", 0),
+            "orphaned": row.get("orphaned", 0),
+            "policies": row.get("policies", 0),
+            "gaps": row.get("gaps", 0),
+            "pct_protected": row.get("pct_protected"),
+            "failed_jobs": row.get("failed_jobs", 0),
+            "chronic_failures": row.get("chronic_failures", 0),
+            "rpo_attainment_pct": row.get("rpo_attainment_pct"),
+            "rpo_breached": row.get("rpo_breached", 0),
+            "posture_score": row.get("posture_score", 0),
+            "posture_band": row.get("posture_band", ""),
+            "red_vaults": row.get("red_vaults", 0),
+            "vault_actions": row.get("vault_actions", 0),
+            "dr_replicated": row.get("dr_replicated", 0),
+            "dr_unhealthy": row.get("dr_unhealthy", 0),
+            "monthly_cost": row.get("monthly_cost", 0.0),
+            "recoverable_monthly": row.get("recoverable_monthly", 0.0),
+            "currency": row.get("currency", ""),
+            "cost_confidence": row.get("cost_confidence", ""),
+        })
+    # Worst first: never analyzed, then most gaps, then lowest protection, then most failures.
+    out.sort(key=lambda r: (
+        bool(r["has_analysis"]),
+        -int(r["gaps"] or 0),
+        r["pct_protected"] if r["pct_protected"] is not None else 999,
+        -int(r["failed_jobs"] or 0),
+        str(r["name"]).lower(),
+    ))
+    return {
+        "workloads": out,
+        "total": len(out),
+        "analyzed": sum(1 for r in out if r["has_analysis"]),
+        "concurrency": ANALYSIS_CONCURRENCY,
+    }
+
+
+# --------------------------------------------------------------------------- cleanup
+class _CleanupIds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+class _SnapshotKeys(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    keys: list[str] = Field(default_factory=list, max_length=200)
+
+
+@router.get("/cleanup")
+async def cleanup_list(principal: Principal = Depends(_read)) -> dict[str, Any]:
+    """Saved analysis history across every scope (active + trashed) with sizes."""
+    tenant = _tenant(principal)
+    return {
+        "runs": coverage_runs.list_all_runs(RUNS_FEATURE, tenant),
+        "stats": coverage_runs.cleanup_stats(RUNS_FEATURE, tenant),
+    }
+
+
+@router.post("/cleanup/trash")
+async def cleanup_trash(
+    body: _CleanupIds, principal: Principal = Depends(_read), db: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    result = coverage_runs.trash_runs(RUNS_FEATURE, _tenant(principal), body.ids)
+    db.add(_audit(principal, "backup_manager.cleanup.trash", "runs", result))
+    await db.commit()
+    return result
+
+
+@router.post("/cleanup/restore")
+async def cleanup_restore(
+    body: _CleanupIds, principal: Principal = Depends(_read), db: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    result = coverage_runs.restore_runs(RUNS_FEATURE, _tenant(principal), body.ids)
+    db.add(_audit(principal, "backup_manager.cleanup.restore", "runs", result))
+    await db.commit()
+    return result
+
+
+@router.post("/cleanup/purge")
+async def cleanup_purge(
+    body: _CleanupIds, principal: Principal = Depends(_approve), db: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    """Permanent deletion of run history \u2014 approver-gated and audited."""
+    result = coverage_runs.purge_runs(RUNS_FEATURE, _tenant(principal), body.ids)
+    db.add(_audit(principal, "backup_manager.cleanup.purge", "runs", result))
+    await db.commit()
+    return result
+
+
+@router.get("/cleanup/snapshots")
+async def cleanup_snapshots(principal: Principal = Depends(_read)) -> dict[str, Any]:
+    """Stored analyses (the heavy documents every tab reads) with size, age and orphan state.
+
+    A snapshot is orphaned when the workload it was taken for no longer exists, or its Azure
+    connection has been removed \u2014 it can never be opened again, so it is pure dead weight
+    against the store's scope cap."""
+    from app.core.azure_connections import list_connections
+
+    tenant = _tenant(principal)
+    workload_ids = {str(w.get("id") or "").lower() for w in _workloads()}
+    workload_names = {str(w.get("id") or "").lower(): str(w.get("name") or "") for w in _workloads()}
+    connection_ids = {str(c.get("id") or "") for c in list_connections()}
+    rows: list[dict[str, Any]] = []
+    for row in snapshot_store.list_scopes(tenant):
+        reasons: list[str] = []
+        if row["scope_kind"] == "workload" and row["scope_id"] not in workload_ids:
+            reasons.append("workload deleted")
+        if row["connection_id"] and row["connection_id"] not in connection_ids:
+            reasons.append("connection removed")
+        if row["schema_stale"]:
+            reasons.append("stale schema")
+        rows.append({
+            **row,
+            "scope_name": workload_names.get(row["scope_id"], row["scope_id"]),
+            "orphan_reasons": reasons,
+            "orphan": bool(reasons),
+        })
+    return {
+        "snapshots": rows,
+        "stats": {
+            "count": len(rows),
+            "total_bytes": sum(r["size_bytes"] for r in rows),
+            "orphans": sum(1 for r in rows if r["orphan"]),
+            "orphan_bytes": sum(r["size_bytes"] for r in rows if r["orphan"]),
+            "max_scopes": snapshot_store.MAX_SCOPES,
+        },
+    }
+
+
+@router.post("/cleanup/snapshots/purge")
+async def cleanup_snapshots_purge(
+    body: _SnapshotKeys, principal: Principal = Depends(_approve), db: AsyncSession = Depends(get_db),
+) -> dict[str, int]:
+    """Drop stored analyses by store key, plus the fleet rows that pointed at them.
+
+    Nothing here is irreversible in the Azure sense \u2014 a purged scope simply has to be
+    analyzed again \u2014 but it is still an explicit, audited operator action."""
+    tenant = _tenant(principal)
+    prefix = f"{tenant}|"
+    keys = [k for k in body.keys if k.startswith(prefix)]
+    result = snapshot_store.delete_keys(keys)
+    fleet_keys: list[str] = []
+    for stored_key in keys:
+        parts = stored_key.split("|")
+        if len(parts) == 4 and parts[2] == "workload":
+            fleet_keys.append(fleet_store.key(parts[1] if parts[1] != "default" else "", parts[3]))
+    result["fleet_rows"] = fleet_store.delete_rows(tenant, fleet_keys)
+    db.add(_audit(principal, "backup_manager.cleanup.snapshots", f"{len(keys)} scope(s)", result))
+    await db.commit()
+    return result
 
 
 # --------------------------------------------------------------------------- inventory

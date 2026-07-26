@@ -18,7 +18,7 @@ Coverage views compare the estate with operational baselines and expose the conn
 | [Alerts Manager]({{ site.baseurl }}/user-guide/coverage/alerts-manager/) | Triage fired alerts and safely manage rules, action groups, and proposed changes. |
 | [Telemetry Coverage]({{ site.baseurl }}/user-guide/coverage/telemetry-coverage/) | Find missing diagnostic settings, categories, and approved destinations. |
 | [Backup & DR Coverage]({{ site.baseurl }}/user-guide/coverage/backup-dr-coverage/) | Assess protection, recovery recency, resilience, and DR pairing. |
-| [Backup Manager]({{ site.baseurl }}/user-guide/coverage/backup-manager/) | Triage backup jobs and manage policies, vaults, DR drills, cost, and proposed changes. |
+| [Backup Manager]({{ site.baseurl }}/user-guide/coverage/backup-manager/) | Triage backup jobs and manage policies, vaults, DR drills, cost, and proposed changes. Sweep every workload from Fleet, and reclaim stored analyses from Cleanup. |
 | [Connection Capability]({{ site.baseurl }}/user-guide/coverage/connection-capability/) | See which configured connections can reach each required Azure surface. |
 
 ## Shared operating model

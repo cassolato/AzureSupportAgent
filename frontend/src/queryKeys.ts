@@ -74,6 +74,12 @@ export const queryKeys = {
     changesRoot: ["backup-manager-changes"] as const,
     changes: (connectionId: string, page: number, pageSize: number, view = "all", status = "") =>
       ["backup-manager-changes", connectionId, page, pageSize, view, status] as const,
+    /** Cached-only headline per workload; refreshed when an analysis finishes. */
+    fleet: ["backup-manager-fleet"] as const,
+    /** Batched status of every in-flight analysis — polled while the Fleet grid has work. */
+    analyzeJobs: ["backup-manager-analyze-jobs"] as const,
+    cleanup: ["backup-manager-cleanup"] as const,
+    snapshotStore: ["backup-manager-snapshot-store"] as const,
   },
   alertsManager: {
     rulesRoot: ["alerts-manager-rules"] as const,
