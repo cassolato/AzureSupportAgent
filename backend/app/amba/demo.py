@@ -41,7 +41,14 @@ def demo_resources(scope_id: str = DEMO_WORKLOAD_ID) -> list[dict[str, Any]]:
 def _baseline_metric_alerts(rtype: str) -> list[dict[str, Any]]:
     ref = load_reference()
     spec = ref.get("types", {}).get(rtype) or {}
-    return [a for a in (spec.get("alerts") or []) if str(a.get("signal", "metric")) == "metric" and a.get("metric")]
+    return [
+        a
+        for a in (spec.get("alerts") or [])
+        if str(a.get("alert_type") or a.get("signal") or "metric") == "metric"
+        and a.get("metric")
+        and a.get("deployable") is not False
+        and str(a.get("tier") or "recommended") in ("core", "recommended")
+    ]
 
 
 def _metric_alert(
@@ -66,10 +73,51 @@ def _metric_alert(
     }
 
 
+def _action_group(rg: str) -> dict[str, Any]:
+    """The on-call action group every demo rule points at (with a real receiver)."""
+    return {
+        "id": f"/subscriptions/{DEMO_SUB}/resourceGroups/{rg}/providers/microsoft.insights/actiongroups/oncall",
+        "name": "oncall",
+        "type": "microsoft.insights/actionGroups",
+        "properties": {
+            "enabled": True,
+            "groupShortName": "oncall",
+            "emailReceivers": [{"name": "sre", "emailAddress": "sre@contoso.example", "status": "Enabled"}],
+        },
+    }
+
+
+def _service_health_alert(rg: str, incident_type: str) -> dict[str, Any]:
+    """A subscription-scoped Service Health activity-log alert."""
+    name = f"servicehealth-{incident_type.lower()}"
+    ag_id = f"/subscriptions/{DEMO_SUB}/resourceGroups/{rg}/providers/microsoft.insights/actiongroups/oncall"
+    return {
+        "id": f"/subscriptions/{DEMO_SUB}/resourceGroups/{rg}/providers/microsoft.insights/activityLogAlerts/{name}",
+        "name": name,
+        "type": "microsoft.insights/activityLogAlerts",
+        "properties": {
+            "enabled": True,
+            "scopes": [f"/subscriptions/{DEMO_SUB}"],
+            "condition": {
+                "allOf": [
+                    {"field": "category", "equals": "ServiceHealth"},
+                    {"field": "properties.incidentType", "equals": incident_type},
+                ]
+            },
+            "actions": {"actionGroups": [{"actionGroupId": ag_id}]},
+        },
+    }
+
+
 def demo_alerts(scope_id: str = DEMO_WORKLOAD_ID) -> list[dict[str, Any]]:
     """Synthesize alert rules so each resource lands on its tier's coverage state."""
     rg = rg_for(scope_id)
-    out: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = [_action_group(rg)]
+    # Subscription-scoped platform alerts: two of the five Service Health baselines are
+    # wired, so the synthetic subscription row shows a realistic partial coverage state.
+    out.append(_service_health_alert(rg, "Incident"))
+    out.append(_service_health_alert(rg, "Maintenance"))
+
     for res in resources_for(scope_id):
         tier = res["tier"]
         if tier == "red":
@@ -101,6 +149,7 @@ def build_demo_snapshot(*, misconfig_counts_as_gap: bool, tolerance_pct: float,
         demo_alerts(scope_id),
         misconfig_counts_as_gap=misconfig_counts_as_gap,
         tolerance_pct=tolerance_pct,
+        subscriptions=[DEMO_SUB],
     )
     snap.update(
         {

@@ -15,15 +15,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.amba.builtin_seed import BUILTIN_SEED_VERSION, builtin_reference
+from app.amba.builtin_seed import (
+    ALERT_TYPES,
+    AMBA_CATEGORIES,
+    BUILTIN_SEED_VERSION,
+    OPERATORS,
+    PATTERNS,
+    SEVERITIES,
+    TIERS,
+    builtin_reference,
+)
 
 _PATH = Path(__file__).resolve().parents[2] / ".data" / "amba_reference.json"
 _REV_PATH = Path(__file__).resolve().parents[2] / ".data" / "amba_reference_revisions.json"
 
 _MAX_REVISIONS = 50
-_AMBA_CATEGORIES = ("availability", "performance", "security")
-_SEVERITIES = ("critical", "error", "warning", "info")
-_OPERATORS = ("GreaterThan", "LessThan", "GreaterOrLessThan", "Equals")
+_SEV_LABEL = {0: "critical", 1: "error", 2: "warning", 3: "info", 4: "info"}
+_SEV_NUM = {"critical": 0, "error": 1, "warning": 2, "info": 3}
 
 
 def _now() -> str:
@@ -63,98 +71,185 @@ def _write_revs(data: dict[str, Any]) -> None:
 
 
 def load_reference() -> dict[str, Any]:
-    """Return the active reference document, seeding it from the built-in set on first use."""
+    """Return the active reference document, seeding it from the built-in set on first use.
+
+    Seed v9 replaced the hand-curated 37-type seed with the full upstream AMBA catalogue and
+    a substantially wider alert schema (numeric severity, criterion type, separate evaluation
+    frequency, activity-log/log-search facts, tiers, patterns). Merging the two shapes would
+    produce half-populated entries, so crossing that boundary performs a clean reset — the
+    prior document is snapshotted into the revision history first, so nothing is lost and an
+    admin can diff or restore it from the Reference Set screen.
+    """
     doc = _read()
     if doc is None:
         doc = builtin_reference()
         _write(doc)
         return doc
-    # Additive upgrade: when the built-in seed version advances, merge in any NEW built-in
-    # types and any NEW alert keys into existing types. This is purely additive — it never
-    # overwrites or removes a user's edits — so newly-shipped recommended alerts (e.g. the
-    # Key Vault status-code metrics) appear without resetting customizations.
+
+    if int(doc.get("builtin_seed_version", 0) or 0) < _SCHEMA_RESET_VERSION:
+        _snapshot(
+            doc,
+            reason=(
+                f"Auto-archived before upgrading to built-in seed v{BUILTIN_SEED_VERSION} "
+                f"(AMBA {builtin_reference().get('amba_release', '')})"
+            ),
+            actor="system",
+        )
+        fresh = builtin_reference()
+        fresh["version"] = int(doc.get("version", 0)) + 1
+        fresh["updated_at"] = _now()
+        fresh["updated_by"] = "system"
+        _write(fresh)
+        return fresh
+
+    # Additive upgrade within the same schema generation: merge in any NEW built-in types and
+    # any NEW alert keys. Purely additive — it never overwrites or removes an admin's edits.
     if int(doc.get("builtin_seed_version", 0) or 0) < BUILTIN_SEED_VERSION:
         builtin = builtin_reference()
         types = doc.setdefault("types", {})
         changed = False
-        for t, spec in builtin.get("types", {}).items():
-            if t not in types:
-                types[t] = copy.deepcopy(spec)
+        for arm_type, spec in builtin.get("types", {}).items():
+            if arm_type not in types:
+                types[arm_type] = copy.deepcopy(spec)
                 changed = True
                 continue
-            existing = types[t].setdefault("alerts", [])
+            existing = types[arm_type].setdefault("alerts", [])
             have = {a.get("key") for a in existing}
-            for a in spec.get("alerts", []) or []:
-                if a.get("key") not in have:
-                    existing.append(copy.deepcopy(a))
-                    changed = True
-        # Targeted, edit-respecting threshold reconciliations. Each entry only applies when
-        # the persisted threshold still equals the PRIOR built-in default (i.e. untouched by
-        # an admin) — so any manual customization is preserved. (v7: the LB availability
-        # alerts demanded a perfect 100%, which flagged any sub-100% reading as a breach; the
-        # Microsoft AMBA baseline alerts below 90%.)
-        for t, key, old, new in _THRESHOLD_RECONCILE:
-            for a in types.get(t, {}).get("alerts", []) or []:
-                if a.get("key") == key and a.get("threshold") == old:
-                    a["threshold"] = new
-                    changed = True
-        for t, key, field, old, new in _ALERT_FIELD_RECONCILE:
-            for a in types.get(t, {}).get("alerts", []) or []:
-                if a.get("key") == key and a.get(field) == old:
-                    a[field] = new
+            for alert in spec.get("alerts", []) or []:
+                if alert.get("key") not in have:
+                    existing.append(copy.deepcopy(alert))
                     changed = True
         doc["builtin_seed_version"] = BUILTIN_SEED_VERSION
+        doc["amba_release"] = builtin.get("amba_release", doc.get("amba_release", ""))
         if changed:
             _write(doc)
     return doc
 
 
-# (type, alert key, prior built-in threshold, new built-in threshold). Applied during the
-# seed-version upgrade only to alerts still holding the prior default — never overrides edits.
-_THRESHOLD_RECONCILE: tuple[tuple[str, str, float, float], ...] = (
-    ("microsoft.network/loadbalancers", "lb_health_probe", 100.0, 90.0),
-    ("microsoft.network/loadbalancers", "lb_data_path", 100.0, 90.0),
-)
+# Crossing this built-in seed version rebuilds the reference from scratch because the alert
+# schema itself changed shape.
+_SCHEMA_RESET_VERSION = 9
 
-# Live Azure metricDefinitions reconciliation (v8). Missing fields are represented by None;
-# only untouched v7 definitions are changed, preserving explicit administrator overrides.
-_ALERT_FIELD_RECONCILE: tuple[tuple[str, str, str, Any, Any], ...] = (
-    ("microsoft.compute/disks", "disk_iops_saturation", "deployable", None, False),
-    ("microsoft.compute/disks", "disk_throughput_saturation", "deployable", None, False),
-    ("microsoft.logic/workflows", "logic_runs_throttled", "deployable", None, False),
-    ("microsoft.documentdb/databaseaccounts", "cosmos_429", "aggregation", None, "Count"),
-)
+
+def _clean_dimensions(raw: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return out
+    for dim in raw[:8]:
+        if not isinstance(dim, dict) or not dim.get("name"):
+            continue
+        out.append(
+            {
+                "name": str(dim["name"])[:64],
+                "operator": "Exclude" if str(dim.get("operator")) == "Exclude" else "Include",
+                "values": [str(v)[:64] for v in (dim.get("values") or [])[:16]],
+            }
+        )
+    return out
+
+
+def _clean_links(raw: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:12]:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")[:400]
+        if url.startswith(("http://", "https://")):
+            out.append({"name": str(item.get("name") or "")[:160], "url": url})
+    return out
 
 
 def _sanitize_alert(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate one admin-submitted alert definition against the extended AMBA schema."""
     key = str(raw.get("key", "")).strip()
     name = str(raw.get("name", "")).strip()
     if not key or not name:
         return None
-    cat = raw.get("amba_category")
-    sev = raw.get("severity")
-    op = raw.get("operator")
+
     threshold = raw.get("threshold")
     try:
         threshold = float(threshold) if threshold is not None and threshold != "" else None
     except (TypeError, ValueError):
         threshold = None
+
+    severity = raw.get("severity")
+    severity_num = raw.get("severity_num")
+    if not isinstance(severity_num, int) or not 0 <= severity_num <= 4:
+        severity_num = _SEV_NUM.get(str(severity), 2)
+    if severity not in SEVERITIES:
+        severity = _SEV_LABEL.get(severity_num, "info")
+
+    alert_type = str(raw.get("alert_type") or "metric")
+    criterion = str(raw.get("criterion_type") or "")
+    if criterion not in ("StaticThresholdCriterion", "DynamicThresholdCriterion", ""):
+        criterion = ""
+
+    sensitivity = raw.get("alert_sensitivity")
+    if sensitivity not in ("Low", "Medium", "High", None):
+        sensitivity = None
+
+    failing = raw.get("failing_periods")
+    if isinstance(failing, dict):
+        def _int_or_none(value: Any) -> int | None:
+            try:
+                return max(1, min(24, int(value)))
+            except (TypeError, ValueError):
+                return None
+
+        failing = {
+            "number_of_evaluation_periods": _int_or_none(failing.get("number_of_evaluation_periods")),
+            "min_failing_periods_to_alert": _int_or_none(failing.get("min_failing_periods_to_alert")),
+        }
+    else:
+        failing = None
+
+    activity = raw.get("activity_log")
+    activity = {str(k)[:64]: v for k, v in list(activity.items())[:12]} if isinstance(activity, dict) else {}
+
+    window_size = str(raw.get("window_size") or raw.get("window") or "PT5M")[:16]
     return {
         "key": key[:64],
+        "guid": str(raw.get("guid", "") or "")[:64],
         "name": name[:160],
-        "amba_category": cat if cat in _AMBA_CATEGORIES else "availability",
-        "signal": "log" if str(raw.get("signal")) == "log" else "metric",
+        "description": str(raw.get("description", "") or "")[:1000],
+        "why": str(raw.get("why", "") or "")[:2000],
+        "alert_type": alert_type if alert_type in ALERT_TYPES else "metric",
+        "amba_category": raw.get("amba_category") if raw.get("amba_category") in AMBA_CATEGORIES else "availability",
+        "severity": severity,
+        "severity_num": severity_num,
+        "tier": raw.get("tier") if raw.get("tier") in TIERS else "recommended",
+        "patterns": [p for p in (raw.get("patterns") or []) if p in PATTERNS][:8],
         "metric": str(raw.get("metric", "") or "")[:200],
-        "operator": op if op in _OPERATORS else "GreaterThan",
+        "metric_namespace": str(raw.get("metric_namespace", "") or "")[:200],
+        "counter_name": str(raw.get("counter_name", "") or "")[:200],
+        "operator": raw.get("operator") if raw.get("operator") in OPERATORS else "GreaterThan",
         "threshold": threshold,
         "unit": str(raw.get("unit", "") or "")[:16],
-        "window": str(raw.get("window", "PT5M") or "PT5M")[:16],
-        "severity": sev if sev in _SEVERITIES else "warning",
-        "requires_action_group": bool(raw.get("requires_action_group", True)),
+        "criterion_type": criterion,
+        "alert_sensitivity": sensitivity,
+        "failing_periods": failing,
+        "auto_mitigate": None if raw.get("auto_mitigate") is None else bool(raw.get("auto_mitigate")),
+        "time_aggregation": str(raw.get("time_aggregation") or raw.get("aggregation") or "")[:16],
+        "window_size": window_size,
+        "evaluation_frequency": str(raw.get("evaluation_frequency") or window_size)[:16],
+        "dimensions": _clean_dimensions(raw.get("dimensions")),
         "dimension_filter": str(raw.get("dimension_filter", "") or "")[:200],
-        "aggregation": str(raw.get("aggregation", "") or "")[:16],
+        "activity_log": activity,
+        "log_query": str(raw.get("log_query", "") or "")[:8000],
+        "visible": bool(raw.get("visible", True)),
+        "verified": bool(raw.get("verified", False)),
+        "default_enabled": bool(raw.get("default_enabled", True)),
+        "requires_action_group": bool(raw.get("requires_action_group", True)),
         "deployable": bool(raw.get("deployable", True)),
-        "why": str(raw.get("why", "") or "")[:600],
+        "references": _clean_links(raw.get("references")),
+        "deployments": raw.get("deployments") if isinstance(raw.get("deployments"), list) else [],
+        "policy_alert_name": str(raw.get("policy_alert_name", "") or "")[:160],
+        "policy_scope": str(raw.get("policy_scope", "") or "")[:32],
+        "threshold_override_tag": str(raw.get("threshold_override_tag", "") or "")[:160],
+        "amba_tags": [str(t)[:40] for t in (raw.get("amba_tags") or [])][:16],
+        "source": "local" if str(raw.get("source")) == "local" else "amba",
     }
 
 
@@ -181,6 +276,9 @@ def _sanitize_types(raw_types: Any) -> dict[str, Any]:
         out[t] = {
             "display": str(spec.get("display", arm_type) or arm_type)[:120],
             "category": str(spec.get("category", "other") or "other")[:40],
+            "source": "local" if str(spec.get("source")) == "local" else "amba",
+            "provider": str(spec.get("provider", "") or "")[:60],
+            "service": str(spec.get("service", "") or "")[:80],
             "alerts": alerts,
         }
     return out
@@ -228,6 +326,9 @@ def save_reference(types: Any, *, actor: str, reason: str = "Edited") -> dict[st
         "updated_at": _now(),
         "updated_by": actor or "",
         "builtin_seed_version": BUILTIN_SEED_VERSION,
+        "amba_release": current.get("amba_release", ""),
+        "amba_source": current.get("amba_source", ""),
+        "amba_imported_at": current.get("amba_imported_at", ""),
         "types": new_types,
     }
     _write(doc)

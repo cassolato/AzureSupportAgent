@@ -54,6 +54,12 @@ function StatusMark({ status }: { status: string }) {
     return <span title="Present" className="text-green-600">✓</span>;
   if (status === "misconfigured")
     return <span title="Misconfigured" className="text-amber-500">⚠</span>;
+  if (status === "suppressed")
+    return (
+      <span title="Suppressed — an enabled alert processing rule mutes this alert's notifications" className="text-fuchsia-600">
+        🔇
+      </span>
+    );
   return <span title="Missing" className="text-red-500">✗</span>;
 }
 
@@ -210,6 +216,8 @@ export function MonitoringCoveragePanel() {
   const [catFilter, setCatFilter] = useState(mp0.get("cat") || "all");
   const [sevFilter, setSevFilter] = useState(mp0.get("sev") || "all");
   const [statusFilter, setStatusFilter] = useState(mp0.get("status") || "all");
+  const [typeFilter, setTypeFilter] = useState(mp0.get("atype") || "all");
+  const [tierFilter, setTierFilter] = useState(mp0.get("tier") || "all");
   const [tab, setTab] = useState<"coverage" | "all">(mp0.get("tab") === "all" ? "all" : "coverage");
   const [density, setDensity] = usePersistedState<"compact" | "expanded">("azsup.amba.density", "expanded");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -299,6 +307,8 @@ export function MonitoringCoveragePanel() {
     if (catFilter !== "all" && c.amba_category !== catFilter) return false;
     if (sevFilter !== "all" && c.severity !== sevFilter) return false;
     if (statusFilter !== "all" && c.status !== statusFilter) return false;
+    if (typeFilter !== "all" && c.alert_type !== typeFilter) return false;
+    if (tierFilter !== "all" && c.tier !== tierFilter) return false;
     return true;
   }
   function rowVisible(r: AmbaRow): boolean {
@@ -350,7 +360,7 @@ export function MonitoringCoveragePanel() {
     } finally { setBusy(""); }
   }
 
-  async function genIac(gaps: AmbaGap[], format: "bicep" | "terraform", title: string) {
+  async function genIac(gaps: AmbaGap[], format: "bicep" | "terraform" | "policy", title: string) {
     if (gaps.length === 0) {
       setMsg({ text: "No gaps to generate IaC for.", ok: false });
       return;
@@ -442,7 +452,7 @@ export function MonitoringCoveragePanel() {
       .map((g) => ({ ...g, rows: g.rows.filter(rowVisible) }))
       .filter((g) => g.rows.length > 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, dQuery, catFilter, sevFilter, statusFilter]);
+  }, [data, dQuery, catFilter, sevFilter, statusFilter, typeFilter, tierFilter]);
 
   // MU1 — reflect the active tab + filters into the URL (shareable / restored on reload).
   const [, mSetParams] = useSearchParams();
@@ -451,10 +461,11 @@ export function MonitoringCoveragePanel() {
     if (tab !== "coverage") next.set("tab", tab); else next.delete("tab");
     const setOrDel = (k: string, v: string) => { if (v && v !== "all") next.set(k, v); else next.delete(k); };
     setOrDel("cat", catFilter); setOrDel("sev", sevFilter); setOrDel("status", statusFilter);
+    setOrDel("atype", typeFilter); setOrDel("tier", tierFilter);
     if (query.trim()) next.set("q", query.trim()); else next.delete("q");
     mSetParams(next, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, catFilter, sevFilter, statusFilter, query]);
+  }, [tab, catFilter, sevFilter, statusFilter, typeFilter, tierFilter, query]);
 
   // MU3 — active-filter chips (each removable).
   const ambaChips = useMemo(() => {
@@ -462,9 +473,11 @@ export function MonitoringCoveragePanel() {
     if (catFilter !== "all") out.push({ key: "cat", label: `Category: ${catFilter}`, clear: () => setCatFilter("all") });
     if (sevFilter !== "all") out.push({ key: "sev", label: `Severity: ${sevFilter}`, clear: () => setSevFilter("all") });
     if (statusFilter !== "all") out.push({ key: "status", label: `Status: ${statusFilter}`, clear: () => setStatusFilter("all") });
+    if (typeFilter !== "all") out.push({ key: "atype", label: `Class: ${typeFilter}`, clear: () => setTypeFilter("all") });
+    if (tierFilter !== "all") out.push({ key: "tier", label: `Tier: ${tierFilter}`, clear: () => setTierFilter("all") });
     if (query.trim()) out.push({ key: "q", label: `“${query.trim()}”`, clear: () => setQuery("") });
     return out;
-  }, [catFilter, sevFilter, statusFilter, query]);
+  }, [catFilter, sevFilter, statusFilter, typeFilter, tierFilter, query]);
 
   if (mainView === "fleet") {
     return <div className="flex h-full min-h-0 flex-col overflow-hidden bg-gray-50">
@@ -512,6 +525,11 @@ export function MonitoringCoveragePanel() {
               <span className="text-green-600">✓ {data?.kpis.alerts_present ?? 0}</span>
               <span className="text-red-500">✗ {data?.kpis.alerts_missing ?? 0}</span>
               <span className="text-amber-500">⚠ {data?.kpis.alerts_misconfigured ?? 0}</span>
+              {data?.kpis.alerts_suppressed ? (
+                <span className="text-fuchsia-600" title="Muted by an alert processing rule">
+                  🔇 {data.kpis.alerts_suppressed}
+                </span>
+              ) : null}
             </div>
           </div>
           {enabled && (
@@ -636,11 +654,56 @@ export function MonitoringCoveragePanel() {
             <option value="present">✓ Present</option>
             <option value="missing">✗ Missing</option>
             <option value="misconfigured">⚠ Misconfigured</option>
+            <option value="suppressed">🔇 Suppressed</option>
+          </select>
+          <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} className="rounded-lg border px-2 py-1.5" title="Alert class">
+            <option value="all">All alert classes</option>
+            <option value="metric">Metric</option>
+            <option value="log">Log search</option>
+            <option value="activitylog">Activity log</option>
+          </select>
+          <select value={tierFilter} onChange={(e) => setTierFilter(e.target.value)} className="rounded-lg border px-2 py-1.5" title="Core = shipped in an official AMBA policy initiative">
+            <option value="all">All tiers</option>
+            <option value="core">Core</option>
+            <option value="recommended">Recommended</option>
+            <option value="optional">Optional</option>
           </select>
           <span className="text-gray-300">·</span>
           <DensityToggle value={density} onChange={setDensity} title="Compact shows just the resource-type rows; Expanded shows the full alert matrix." />
         </div>
         )}
+
+        {/* Notification plumbing: suppression rules silently mute alerts that otherwise
+            look healthy, and MonitorDisable-tagged resources are intentionally unscored. */}
+        {tab === "coverage" && !!data && (data.suppression_rules?.length || data.excluded_resources?.length) ? (
+          <div className="mt-2 flex flex-wrap gap-2 text-[11px]">
+            {!!data.suppression_rules?.length && (
+              <span
+                className="rounded-md border border-fuchsia-200 bg-fuchsia-50 px-2 py-1 text-fuchsia-800"
+                title={data.suppression_rules.map((r) => `${r.name}${r.unconditional ? " (unconditional)" : ""}`).join("\n")}
+              >
+                🔇 {data.suppression_rules.length} alert processing rule{data.suppression_rules.length === 1 ? "" : "s"} mute
+                notifications in this scope
+                {data.kpis.alerts_suppressed ? ` · ${data.kpis.alerts_suppressed} alert(s) affected` : ""}
+              </span>
+            )}
+            {!!data.excluded_resources?.length && (
+              <span
+                className="rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-gray-600"
+                title={data.excluded_resources.map((r) => `${r.resource_name} — ${r.reason}`).join("\n")}
+              >
+                {data.excluded_resources.length} resource{data.excluded_resources.length === 1 ? "" : "s"} excluded by the
+                MonitorDisable tag
+              </span>
+            )}
+            {!!data.kpis.action_groups && data.kpis.action_groups_usable < data.kpis.action_groups && (
+              <span className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-amber-800">
+                {data.kpis.action_groups - data.kpis.action_groups_usable} of {data.kpis.action_groups} action groups have
+                no enabled receivers
+              </span>
+            )}
+          </div>
+        ) : null}
         {/* MU3 — active filter chips. */}
         {tab === "coverage" && ambaChips.length > 0 && (
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -650,7 +713,7 @@ export function MonitoringCoveragePanel() {
                 <button onClick={c.clear} className="text-brand/60 hover:text-brand">✕</button>
               </span>
             ))}
-            <button onClick={() => { setCatFilter("all"); setSevFilter("all"); setStatusFilter("all"); setQuery(""); }} className="rounded-md border px-2 py-0.5 text-[11px] text-gray-500 hover:bg-gray-50">Clear all</button>
+            <button onClick={() => { setCatFilter("all"); setSevFilter("all"); setStatusFilter("all"); setTypeFilter("all"); setTierFilter("all"); setQuery(""); }} className="rounded-md border px-2 py-0.5 text-[11px] text-gray-500 hover:bg-gray-50">Clear all</button>
           </div>
         )}
 
@@ -660,6 +723,14 @@ export function MonitoringCoveragePanel() {
           <span className="text-gray-500">{allGaps.length} gap(s):</span>
           <button onClick={() => void genIac(allGaps, "bicep", "All gaps — Bicep")} disabled={busy === "iac"} className="rounded-md border px-2 py-1 hover:bg-gray-50 disabled:opacity-50">Generate Bicep</button>
           <button onClick={() => void genIac(allGaps, "terraform", "All gaps — Terraform")} disabled={busy === "iac"} className="rounded-md border px-2 py-1 hover:bg-gray-50 disabled:opacity-50">Generate Terraform</button>
+          <button
+            onClick={() => void genIac(allGaps, "policy", "All gaps — Azure Policy plan")}
+            disabled={busy === "iac"}
+            title="How AMBA-ALZ deploys at scale: assign the policy initiatives at a management group so future resources are covered too."
+            className="rounded-md border px-2 py-1 hover:bg-gray-50 disabled:opacity-50"
+          >
+            Azure Policy plan
+          </button>
           <button onClick={() => void registerFindings()} disabled={busy === "findings"} className="rounded-md border px-2 py-1 hover:bg-gray-50 disabled:opacity-50">Create findings</button>
           <button onClick={() => void sendApproval()} disabled={busy === "approval"} className="rounded-md border px-2 py-1 hover:bg-gray-50 disabled:opacity-50">Send to Approval Inbox</button>
         </div>
@@ -791,8 +862,11 @@ export function MonitoringCoveragePanel() {
                     location: drawer.row.location,
                     alert_key: drawer.cell.alert_key,
                     alert_name: drawer.cell.alert_name,
+                    alert_type: drawer.cell.alert_type,
                     amba_category: drawer.cell.amba_category,
                     severity: drawer.cell.severity,
+                    severity_num: drawer.cell.severity_num,
+                    tier: drawer.cell.tier,
                     status: drawer.cell.status,
                     recommended: drawer.cell.recommended,
                     observed: drawer.cell.observed,
@@ -840,7 +914,12 @@ export function MonitoringCoveragePanel() {
               <div className="text-sm font-semibold text-gray-900">{iacView.title}</div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => download(iacView.text, `amba-gaps.${iacView.format === "terraform" ? "tf" : "bicep"}`)}
+                  onClick={() =>
+                    download(
+                      iacView.text,
+                      `amba-gaps.${iacView.format === "terraform" ? "tf" : iacView.format === "policy" ? "json" : "bicep"}`,
+                    )
+                  }
                   className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50"
                 >
                   ⬇ Download

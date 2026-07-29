@@ -1,0 +1,519 @@
+{
+ "types": {
+  "microsoft.compute/virtualmachines": {
+   "percentage_cpu": {
+    "why": "Sustained high CPU indicates the VM is undersized or runaway processes are degrading the workload.",
+    "unit": "%",
+    "legacy_key": "vm_cpu"
+   },
+   "available_memory_bytes_mbytes": {
+    "why": "Low available memory causes paging and process kills, hurting reliability.",
+    "unit": "bytes",
+    "legacy_key": "vm_available_memory"
+   },
+   "available_memory_bytes": {
+    "why": "Low available memory causes paging and process kills, hurting reliability.",
+    "unit": "bytes",
+    "legacy_key": "vm_available_memory"
+   },
+   "os_disk_iops_consumed_percentage": {
+    "why": "Disk IOPS saturation throttles the VM and slows every dependent service.",
+    "unit": "%",
+    "legacy_key": "vm_os_disk_iops"
+   },
+   "network_in_total": {
+    "why": "Abnormal inbound traffic can signal an incident or a misbehaving client.",
+    "unit": "bytes",
+    "legacy_key": "vm_network_in"
+   },
+   "network_out_total": {
+    "why": "A spike in outbound traffic can signal data exfiltration, a runaway backup/replication job, or a chatty dependency \u2014 and on metered egress it drives cost.",
+    "unit": "bytes",
+    "legacy_key": "vm_network_out"
+   }
+  },
+  "microsoft.web/sites": {
+   "slots_http5xx": {
+    "why": "5xx responses mean users are seeing failures \u2014 the single clearest availability signal.",
+    "unit": "count",
+    "legacy_key": "appsvc_http5xx"
+   },
+   "slots_httpresponsetime": {
+    "why": "Slow responses degrade UX and often precede outright failures.",
+    "unit": "s",
+    "legacy_key": "appsvc_response_time"
+   },
+   "cputime": {
+    "why": "High CPU time signals the plan is undersized for the load.",
+    "unit": "s",
+    "legacy_key": "appsvc_cpu_time"
+   },
+   "slots_healthcheckstatus": {
+    "why": "Failing instance health checks remove capacity and risk an outage.",
+    "unit": "%",
+    "legacy_key": "appsvc_health_check"
+   }
+  },
+  "microsoft.web/serverfarms": {
+   "cpupercentage": {
+    "why": "A saturated plan throttles every app hosted on it.",
+    "unit": "%",
+    "legacy_key": "plan_cpu"
+   },
+   "memorypercentage": {
+    "why": "Memory pressure on the plan causes restarts across all hosted apps.",
+    "unit": "%",
+    "legacy_key": "plan_memory"
+   }
+  },
+  "microsoft.storage/storageaccounts": {
+   "availability": {
+    "why": "Any availability dip on storage cascades to everything that depends on it.",
+    "unit": "%",
+    "legacy_key": "stor_availability"
+   },
+   "fileservices_availability": {
+    "why": "Any availability dip on storage cascades to everything that depends on it.",
+    "unit": "%",
+    "legacy_key": "stor_availability"
+   },
+   "blobservices_successe2elatency": {
+    "why": "High end-to-end storage latency slows every read/write across dependent apps. Compare against server latency below to tell storage-side slowness from client/network.",
+    "unit": "ms",
+    "legacy_key": "stor_latency"
+   },
+   "blobservices_successserverlatency": {
+    "why": "Server latency is the storage-side processing time only. High server latency points at the storage tier (large ops, archive/cool reads, onset of throttling); high E2E but normal server latency points at the client/network instead.",
+    "unit": "ms",
+    "legacy_key": "stor_server_latency"
+   },
+   "throttling": {
+    "why": "AuthenticationError (403) is the OTHER half of access failures, distinct from AuthorizationError: it's a network-ACL/firewall deny (public access disabled or default action Deny), an invalid/expired SAS token, or a wrong account key \u2014 the request is rejected before authorization is even evaluated. This is the single most common 'storage reports 100% available but the app can't reach it' outage, so it must be caught separately from RBAC-style AuthorizationError.",
+    "unit": "count",
+    "legacy_key": "stor_authn_failures"
+   },
+   "fileservices_transactions": {
+    "why": "AuthenticationError (403) is the OTHER half of access failures, distinct from AuthorizationError: it's a network-ACL/firewall deny (public access disabled or default action Deny), an invalid/expired SAS token, or a wrong account key \u2014 the request is rejected before authorization is even evaluated. This is the single most common 'storage reports 100% available but the app can't reach it' outage, so it must be caught separately from RBAC-style AuthorizationError.",
+    "unit": "count",
+    "legacy_key": "stor_authn_failures"
+   },
+   "usedcapacity": {
+    "why": "UsedCapacity is the total bytes stored. A sudden climb can signal a runaway producer, a stuck lifecycle/cleanup job, or unbounded log/blob growth \u2014 worth watching before it drives cost or hits a quota.",
+    "unit": "bytes",
+    "legacy_key": "stor_capacity"
+   }
+  },
+  "microsoft.containerservice/managedclusters": {
+   "node_cpu_usage_percentage": {
+    "why": "CPU-saturated nodes evict pods and degrade the whole cluster.",
+    "unit": "%",
+    "legacy_key": "aks_node_cpu"
+   },
+   "node_memory_working_set_percentage": {
+    "why": "Memory pressure triggers OOM kills and pod restarts.",
+    "unit": "%",
+    "legacy_key": "aks_node_memory"
+   },
+   "kube_node_status_condition": {
+    "why": "NotReady nodes silently shrink capacity and risk an outage.",
+    "unit": "count",
+    "legacy_key": "aks_not_ready"
+   }
+  },
+  "microsoft.keyvault/vaults": {
+   "availability": {
+    "why": "If the vault is unavailable, every app that fetches secrets/keys at runtime breaks.",
+    "unit": "%",
+    "legacy_key": "kv_availability"
+   },
+   "serviceapilatency": {
+    "why": "Slow vault calls add latency to app startup and token refresh.",
+    "unit": "ms",
+    "legacy_key": "kv_latency"
+   },
+   "saturationshoebox": {
+    "why": "Approaching the vault's transaction limits leads to throttling and failures.",
+    "unit": "%",
+    "legacy_key": "kv_saturation"
+   },
+   "serviceapiresult": {
+    "why": "429 responses mean the vault is hitting its per-vault transaction limits; callers should cache secrets and back off, and heavy workloads may need to spread load across vaults.",
+    "unit": "count",
+    "legacy_key": "kv_throttling"
+   }
+  },
+  "microsoft.network/frontdoors": {
+   "backendhealthpercentage": {
+    "why": "Unhealthy backends behind Front Door cause user-facing errors.",
+    "unit": "%",
+    "legacy_key": "fd_backend_health"
+   },
+   "totallatency": {
+    "why": "Edge latency directly impacts every request routed through Front Door.",
+    "unit": "ms",
+    "legacy_key": "fd_latency"
+   }
+  },
+  "microsoft.cdn/profiles": {
+   "originhealthpercentage": {
+    "why": "Unhealthy origins behind Front Door produce user-facing 5xx errors.",
+    "unit": "%",
+    "legacy_key": "afd_origin_health"
+   },
+   "percentage5xx": {
+    "why": "5xx at the edge means users are seeing failures right now.",
+    "unit": "%",
+    "legacy_key": "afd_5xx"
+   }
+  },
+  "microsoft.network/loadbalancers": {
+   "dipavailability": {
+    "why": "Failing backend probes remove targets and can black-hole traffic.",
+    "unit": "%",
+    "legacy_key": "lb_health_probe"
+   },
+   "vipavailability": {
+    "why": "VIP unavailability is a direct front-end outage.",
+    "unit": "%",
+    "legacy_key": "lb_data_path"
+   }
+  },
+  "microsoft.documentdb/databaseaccounts": {
+   "normalizedruconsumption": {
+    "why": "NormalizedRUConsumption is the MAX RU utilization across partition key ranges as a percent of provisioned (or autoscale-max) RU/s. Sustained values near 100% mean a single partition is saturated \u2014 requests there get 429-throttled even while the account average looks fine. This is the earliest, truest signal of a hot partition or an under-provisioned container. Note: this is a provisioned/autoscale metric \u2014 SERVERLESS accounts don't emit it (there is no provisioned RU/s to normalize against), so on serverless it reads 'no data' and you should watch server-side latency and 429s instead.",
+    "unit": "%",
+    "legacy_key": "cosmos_normalized_ru"
+   },
+   "totalrequests": {
+    "why": "A 429 means Cosmos rejected the request for exceeding the provisioned RU/s for that partition (or the serverless ceiling). The SDK retries with backoff, but sustained 429s surface to the app as added latency and eventually failures \u2014 the direct signal that the data tier is over its throughput budget.",
+    "unit": "count",
+    "legacy_key": "cosmos_429"
+   },
+   "serversidelatency": {
+    "why": "ServerSideLatency is the time Cosmos itself spent servicing the request (excludes network and SDK). Rising server latency points at expensive cross-partition queries, missing indexes, or large documents \u2014 tuning targets that no amount of client-side scaling fixes.",
+    "unit": "ms",
+    "legacy_key": "cosmos_server_latency"
+   },
+   "totalrequestunits": {
+    "why": "429s mean the container is over-provisioned RU/s limits and requests fail.",
+    "unit": "RU",
+    "legacy_key": "cosmos_throttle"
+   },
+   "serviceavailability": {
+    "why": "Any Cosmos availability dip directly impacts the application's data tier.",
+    "unit": "%",
+    "legacy_key": "cosmos_availability"
+   }
+  },
+  "microsoft.cache/redis": {
+   "serverload": {
+    "why": "A saturated Redis server slows or drops cache operations for dependent apps.",
+    "unit": "%",
+    "legacy_key": "redis_server_load"
+   },
+   "usedmemorypercentage": {
+    "why": "Memory pressure triggers eviction and breaks cache-dependent flows.",
+    "unit": "%",
+    "legacy_key": "redis_memory"
+   }
+  },
+  "microsoft.network/applicationgateways": {
+   "unhealthyhostcount": {
+    "why": "Unhealthy backends behind the gateway cause user-facing failures.",
+    "unit": "count",
+    "legacy_key": "appgw_unhealthy_hosts"
+   },
+   "failedrequests": {
+    "why": "A rise in failed requests signals backend or capacity problems.",
+    "unit": "count",
+    "legacy_key": "appgw_failed_requests"
+   }
+  },
+  "microsoft.apimanagement/service": {
+   "capacity": {
+    "why": "High gateway capacity means APIM is near saturation and will start throttling.",
+    "unit": "%",
+    "legacy_key": "apim_capacity"
+   },
+   "failedrequests": {
+    "why": "Gateway 5xx errors break every API consumer behind APIM.",
+    "unit": "count",
+    "legacy_key": "apim_5xx"
+   },
+   "backendduration": {
+    "why": "Slow backends behind APIM degrade all routed APIs.",
+    "unit": "ms",
+    "legacy_key": "apim_backend_duration"
+   }
+  },
+  "microsoft.compute/virtualmachinescalesets": {
+   "percentage_cpu": {
+    "why": "Sustained high CPU across instances means the scale set is undersized.",
+    "unit": "%",
+    "legacy_key": "vmss_cpu"
+   },
+   "available_memory_bytes": {
+    "why": "Low memory causes paging and instance instability.",
+    "unit": "bytes",
+    "legacy_key": "vmss_available_memory"
+   }
+  },
+  "microsoft.app/containerapps": {
+   "restartcount": {
+    "why": "Frequent replica restarts indicate crash-looping revisions (bad image, failing readiness probe, or OOM).",
+    "unit": "count",
+    "legacy_key": "aca_replica_restarts"
+   },
+   "replicas": {
+    "why": "Replicas is the current replica count. Pinned at the max scale bound under load means the app is capacity-capped (raise maxReplicas or the scale rule); flapping to zero explains cold-start latency on the next request.",
+    "unit": "count",
+    "legacy_key": "aca_replicas"
+   },
+   "usagenanocores": {
+    "why": "Absolute CPU consumption in nanocores \u2014 a raw companion to CpuPercentage for sizing.",
+    "unit": "ncores",
+    "legacy_key": "aca_cpu"
+   }
+  },
+  "microsoft.containerregistry/registries": {
+   "storageused_for_standard_pricing_plan": {
+    "why": "Approaching the registry storage quota blocks new pushes.",
+    "unit": "bytes",
+    "legacy_key": "acr_storage"
+   },
+   "storageused": {
+    "why": "Approaching the registry storage quota blocks new pushes.",
+    "unit": "bytes",
+    "legacy_key": "acr_storage"
+   }
+  },
+  "microsoft.sql/servers": {
+   "elasticpools_dtu_consumption_percent": {
+    "why": "A saturated elastic pool throttles every database in it.",
+    "unit": "%",
+    "legacy_key": "sqlsrv_dtu_pool"
+   }
+  },
+  "microsoft.dbforpostgresql/flexibleservers": {
+   "cpu_percent": {
+    "why": "Sustained high CPU throttles queries and stalls the application.",
+    "unit": "%",
+    "legacy_key": "pg_cpu"
+   },
+   "memory_percent": {
+    "why": "Memory pressure causes slow queries and connection failures.",
+    "unit": "%",
+    "legacy_key": "pg_memory"
+   },
+   "storage_percent": {
+    "why": "A full data disk takes the server read-only \u2014 a write outage.",
+    "unit": "%",
+    "legacy_key": "pg_storage"
+   },
+   "connections_failed": {
+    "why": "A rise in failed connections signals auth, limit, or capacity problems.",
+    "unit": "count",
+    "legacy_key": "pg_connections_failed"
+   }
+  },
+  "microsoft.dbformysql/flexibleservers": {
+   "cpu_percent": {
+    "why": "Sustained high CPU throttles queries and stalls the application.",
+    "unit": "%",
+    "legacy_key": "mysql_cpu"
+   },
+   "memory_percent": {
+    "why": "Memory pressure causes slow queries and connection failures.",
+    "unit": "%",
+    "legacy_key": "mysql_memory"
+   },
+   "storage_percent": {
+    "why": "A full data disk takes the server read-only \u2014 a write outage.",
+    "unit": "%",
+    "legacy_key": "mysql_storage"
+   },
+   "aborted_connections": {
+    "why": "Aborted connections signal client, auth, or capacity issues.",
+    "unit": "count",
+    "legacy_key": "mysql_aborted_connections"
+   }
+  },
+  "microsoft.servicebus/namespaces": {
+   "servererrors": {
+    "why": "Server errors mean the namespace is failing requests from producers/consumers.",
+    "unit": "count",
+    "legacy_key": "sb_server_errors"
+   },
+   "throttledrequests": {
+    "why": "Throttling means the namespace is over its limits and messages are rejected.",
+    "unit": "count",
+    "legacy_key": "sb_throttled"
+   },
+   "deadletteredmessages": {
+    "why": "Growing dead-letter queues mean messages can't be processed \u2014 data is stuck.",
+    "unit": "count",
+    "legacy_key": "sb_deadletter"
+   },
+   "activemessages": {
+    "why": "A growing backlog signals consumers can't keep up with the producers.",
+    "unit": "count",
+    "legacy_key": "sb_active_messages"
+   },
+   "usererrors": {
+    "why": "UserErrors are client-side failures (bad auth, message-too-large, entity-not-found, lock lost). Unlike ServerErrors they point at the producer/consumer code or config \u2014 a spike usually means a recent deploy broke how the app talks to the namespace.",
+    "unit": "count",
+    "legacy_key": "sb_user_errors"
+   }
+  },
+  "microsoft.eventhub/namespaces": {
+   "servererrors": {
+    "why": "Server errors mean events are being rejected by the namespace.",
+    "unit": "count",
+    "legacy_key": "eh_server_errors"
+   },
+   "throttledrequests": {
+    "why": "Throttling means ingestion is over the provisioned throughput units.",
+    "unit": "count",
+    "legacy_key": "eh_throttled"
+   },
+   "capturebacklog": {
+    "why": "A capture backlog means events aren't landing in storage on time.",
+    "unit": "count",
+    "legacy_key": "eh_capture_backlog"
+   },
+   "quotaexceedederrors": {
+    "why": "QuotaExceededErrors mean producers/consumers hit a hard namespace quota (throughput-unit ceiling, connection count, or entity size). Events are rejected outright \u2014 a sharper signal than generic throttling that the tier is undersized for the load.",
+    "unit": "count",
+    "legacy_key": "eh_quota_exceeded"
+   },
+   "incomingmessages": {
+    "why": "IncomingMessages is the ingest rate. Read alongside ThrottledRequests it shows whether a throttle is driven by real volume (scale up TUs) or a hot partition (fix the partition key).",
+    "unit": "count",
+    "legacy_key": "eh_incoming_messages"
+   },
+   "outgoingmessages": {
+    "why": "OutgoingMessages is the consumer egress rate. Persistently far below IncomingMessages means consumers are falling behind \u2014 the lag that eventually breaches retention and loses events.",
+    "unit": "count",
+    "legacy_key": "eh_outgoing_messages"
+   }
+  },
+  "microsoft.eventgrid/topics": {
+   "publishfailcount": {
+    "why": "Publish failures mean producers can't emit events.",
+    "unit": "count",
+    "legacy_key": "eg_publish_fail"
+   },
+   "deadletteredcount": {
+    "why": "Dead-lettered events were never delivered to any subscriber.",
+    "unit": "count",
+    "legacy_key": "eg_deadletter"
+   },
+   "deliveryattemptfailcount": {
+    "why": "Failed deliveries mean subscribers aren't receiving events.",
+    "unit": "count",
+    "legacy_key": "eg_delivery_fail"
+   }
+  },
+  "microsoft.logic/workflows": {
+   "runsfailed": {
+    "why": "Failed runs mean the workflow's business process isn't completing.",
+    "unit": "count",
+    "legacy_key": "logic_runs_failed"
+   },
+   "actionlatency": {
+    "why": "High action latency slows the end-to-end workflow.",
+    "unit": "ms",
+    "legacy_key": "logic_action_latency"
+   }
+  },
+  "microsoft.network/azurefirewalls": {
+   "snatportutilization": {
+    "why": "SNAT port exhaustion silently drops outbound connections across the whole network.",
+    "unit": "%",
+    "legacy_key": "afw_snat_ports"
+   },
+   "throughput": {
+    "why": "Approaching the firewall throughput ceiling adds latency and risks drops.",
+    "unit": "bps",
+    "legacy_key": "afw_throughput"
+   },
+   "firewallhealth": {
+    "why": "A degraded firewall can black-hole or bottleneck all routed traffic.",
+    "unit": "%",
+    "legacy_key": "afw_health"
+   }
+  },
+  "microsoft.network/publicipaddresses": {
+   "ifunderddosattack": {
+    "why": "An active DDoS attack on the public IP threatens the availability of the front-end.",
+    "unit": "flag",
+    "legacy_key": "pip_ddos_attack"
+   }
+  },
+  "microsoft.cognitiveservices/accounts": {
+   "clienterrors": {
+    "why": "429s mean requests are exceeding the deployment's TPM/RPM quota and failing.",
+    "unit": "count",
+    "legacy_key": "ai_throttle_429"
+   },
+   "latency": {
+    "why": "High inference latency degrades every dependent experience.",
+    "unit": "ms",
+    "legacy_key": "ai_latency"
+   },
+   "servererrors": {
+    "why": "5xx errors from the AI service break inference calls.",
+    "unit": "count",
+    "legacy_key": "ai_server_errors"
+   }
+  },
+  "microsoft.search/searchservices": {
+   "throttledsearchqueriespercentage": {
+    "why": "Throttled queries mean the service is over capacity and dropping requests.",
+    "unit": "%",
+    "legacy_key": "search_throttled"
+   },
+   "searchlatency": {
+    "why": "Slow search hurts every search-driven experience.",
+    "unit": "ms",
+    "legacy_key": "search_latency"
+   }
+  },
+  "microsoft.machinelearningservices/workspaces": {
+   "failed_runs": {
+    "why": "Failed runs mean training/scoring jobs aren't completing.",
+    "unit": "count",
+    "legacy_key": "ml_failed_runs"
+   },
+   "quota_utilization_percentage": {
+    "why": "Compute quota exhaustion blocks new jobs from starting.",
+    "unit": "%",
+    "legacy_key": "ml_quota_utilization"
+   }
+  },
+  "microsoft.datafactory/factories": {
+   "pipelinefailedruns": {
+    "why": "Failed pipelines mean data isn't moving \u2014 downstream reports/ETL go stale.",
+    "unit": "count",
+    "legacy_key": "adf_pipeline_failed"
+   },
+   "triggerfailedruns": {
+    "why": "Failed triggers mean scheduled pipelines never started.",
+    "unit": "count",
+    "legacy_key": "adf_trigger_failed"
+   },
+   "activityfailedruns": {
+    "why": "Failed activities point to the specific step breaking a pipeline.",
+    "unit": "count",
+    "legacy_key": "adf_activity_failed"
+   }
+  },
+  "microsoft.appconfiguration/configurationstores": {
+   "throttledhttprequestcount": {
+    "why": "ThrottledHttpRequestCount is requests rejected with 429 for exceeding the store's request quota (the Free tier caps daily requests hard, Standard caps per-second). Throttling means apps can't read their configuration/feature flags at runtime \u2014 startup stalls and flags go stale. The fix is client-side caching/Sentinel polling or moving off Free.",
+    "unit": "count",
+    "legacy_key": "appcfg_throttled"
+   }
+  }
+ }
+}

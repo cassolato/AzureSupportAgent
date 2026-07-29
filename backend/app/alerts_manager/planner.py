@@ -369,7 +369,8 @@ def _normalized_selected_gap(gap: dict[str, Any]) -> dict[str, Any]:
         "subscription_id": _text(gap.get("subscription_id"), 128),
         "location": _text(gap.get("location"), 128),
         "alert_key": _text(gap.get("alert_key"), 128),
-        "alert_name": _text(gap.get("signal") or gap.get("alert_name"), 256),
+        "alert_name": _text(gap.get("alert_name") or gap.get("signal"), 256),
+        "alert_type": _text(gap.get("alert_type") or "metric", 32).lower(),
         "amba_category": _text(gap.get("amba_category") or gap.get("category"), 128).lower(),
         "severity": _text(gap.get("risk") or gap.get("severity") or "warning", 32).lower(),
         "status": _SUPPORTED_GAP_TYPES.get(gap_type, _text(gap.get("status") or "unsupported", 32).lower()),
@@ -381,8 +382,11 @@ def _normalized_selected_gap(gap: dict[str, Any]) -> dict[str, Any]:
 def _proposal(assignment: dict[str, Any], blueprint: dict[str, Any], gap: dict[str, Any], action_group_ids: list[str]) -> tuple[dict[str, Any] | None, list[str]]:
     recommended = gap.get("recommended") or {}
     errors: list[str] = [str(value) for value in recommended.get("metric_validation_errors") or [] if str(value)]
-    if str(recommended.get("signal") or gap.get("signal") or "metric").lower() != "metric":
-        errors.append("Only metric-rule proposals are supported by this MVP.")
+    alert_type = str(gap.get("alert_type") or recommended.get("alert_type") or "metric").lower()
+    if alert_type != "metric":
+        errors.append(f"Only metric-rule proposals are supported by this MVP (this baseline entry is a {alert_type} alert).")
+    if str(recommended.get("criterion_type") or "") == "DynamicThresholdCriterion":
+        errors.append("Dynamic-threshold baselines are not supported by this MVP.")
     if not str(recommended.get("metric") or "").strip():
         errors.append("AMBA recommendation has no metric name.")
     if not isinstance(recommended.get("threshold"), (int, float)):
@@ -399,8 +403,9 @@ def _proposal(assignment: dict[str, Any], blueprint: dict[str, Any], gap: dict[s
         "name": _rule_name(gap), "enabled": True, "severity": _severity_for(blueprint, gap),
         "description": _text(gap.get("why") or f"AMBA baseline: {gap.get('alert_name', '')}", 2048),
         "scopes": [gap["resource_id"]], "subscription_id": gap["subscription_id"],
-        "resource_group": monitoring_group, "location": "global", "evaluation_frequency": "PT5M",
-        "window_size": recommended.get("window") or "PT5M", "auto_mitigate": True,
+        "resource_group": monitoring_group, "location": "global",
+        "evaluation_frequency": recommended.get("evaluation_frequency") or "PT5M",
+        "window_size": recommended.get("window_size") or recommended.get("window") or "PT5M", "auto_mitigate": True,
         "action_group_ids": action_group_ids, "target_resource_type": "", "target_resource_region": "",
         "tags": {"managed-by": "alerts-manager", "amba-blueprint": blueprint["blueprint_id"], "amba-version": str(blueprint["amba_version"])},
         "conditions": [{

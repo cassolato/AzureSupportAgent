@@ -82,8 +82,8 @@ def test_amba_thresholdless_metric_is_guidance_not_missing_alert():
     reference = {"types": {"microsoft.test/widgets": {
         "display": "Widget", "category": "test", "alerts": [{
             "key": "observe_capacity", "name": "Observe capacity", "amba_category": "performance",
-            "signal": "metric", "metric": "Capacity", "operator": "GreaterThan",
-            "threshold": None, "severity": "info", "requires_action_group": True,
+            "alert_type": "metric", "metric": "Capacity", "operator": "GreaterThan",
+            "threshold": None, "severity": "info", "tier": "core", "requires_action_group": True,
         }],
     }}}
     snap = amba_col.compute_coverage([resource], [], misconfig_counts_as_gap=True, tolerance_pct=0, reference=reference)

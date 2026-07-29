@@ -355,35 +355,78 @@ export type CoverageResource = {
   in_reference: boolean;
 };
 
-export type AmbaStatus = "present" | "missing" | "misconfigured";
+export type AmbaStatus = "present" | "missing" | "misconfigured" | "suppressed";
+export type AmbaAlertType = "metric" | "log" | "activitylog";
+export type AmbaTier = "core" | "recommended" | "optional";
+export type AmbaPattern = "alz" | "hpc" | "avd" | "rag" | "avs";
+
+export type AmbaDimension = { name: string; operator: string; values: string[] };
+export type AmbaFailingPeriods = {
+  number_of_evaluation_periods?: number | null;
+  min_failing_periods_to_alert?: number | null;
+};
 
 export type AmbaRecommended = {
   metric: string;
+  metric_namespace?: string;
   operator: string;
   threshold: number | null;
   unit: string;
+  /** Aggregation window. Kept as `window` for back-compat; prefer `window_size`. */
   window: string;
+  window_size?: string;
+  evaluation_frequency?: string;
+  aggregation?: string;
+  criterion_type?: string;
+  alert_sensitivity?: string | null;
+  failing_periods?: AmbaFailingPeriods | null;
+  dimensions?: AmbaDimension[];
   requires_action_group: boolean;
+  activity_log?: Record<string, unknown>;
+  log_query?: string;
+  threshold_override_tag?: string;
 };
+
+export type AmbaSuppressionRef = { id: string; name: string; unconditional: boolean };
 
 export type AmbaObserved = {
   rule_id?: string;
   rule_name?: string;
+  rule_type?: string;
   enabled?: boolean;
   has_action_group?: boolean;
+  action_group_usable?: boolean;
   observed_thresholds?: number[];
+  observed_criterion_types?: string[];
+  observed_sensitivities?: string[];
+  observed_severity?: number | null;
+  observed_window?: string;
+  observed_frequency?: string;
+  matched_rules?: number;
+  threshold_override_tag?: string;
+  effective_threshold?: number | null;
+  suppressed_by?: AmbaSuppressionRef[];
   issues?: string[];
 };
+
+export type AmbaReferenceLink = { name: string; url: string };
 
 export type AmbaCell = {
   alert_key: string;
   alert_name: string;
+  alert_type: AmbaAlertType;
   amba_category: string;
   severity: string;
+  severity_num?: number | null;
+  tier: AmbaTier;
+  patterns: AmbaPattern[];
+  source: "amba" | "local";
+  guid?: string;
   status: AmbaStatus;
   recommended: AmbaRecommended;
   observed: AmbaObserved;
   why: string;
+  references?: AmbaReferenceLink[];
 };
 
 export type AmbaRow = {
@@ -400,11 +443,21 @@ export type AmbaGroup = {
   resource_type: string;
   display: string;
   category: string;
-  recommended_alerts: { key: string; name: string; amba_category: string; severity: string }[];
+  source: "amba" | "local";
+  recommended_alerts: {
+    key: string;
+    name: string;
+    amba_category: string;
+    severity: string;
+    alert_type: AmbaAlertType;
+    tier: AmbaTier;
+    source: "amba" | "local";
+  }[];
   rows: AmbaRow[];
   present: number;
   missing: number;
   misconfigured: number;
+  suppressed: number;
   coverage_pct: number;
 };
 
@@ -417,13 +470,33 @@ export type AmbaGap = {
   location: string;
   alert_key: string;
   alert_name: string;
+  alert_type: AmbaAlertType;
   amba_category: string;
   severity: string;
+  severity_num?: number | null;
+  tier: AmbaTier;
   status: AmbaStatus;
   recommended: AmbaRecommended;
   observed: AmbaObserved;
   why: string;
 };
+
+export type AmbaExcludedResource = {
+  resource_id: string;
+  resource_name: string;
+  resource_type: string;
+  reason: string;
+};
+
+export type AmbaSuppressionRule = {
+  id: string;
+  name: string;
+  scopes: string[];
+  unconditional: boolean;
+};
+
+/** `policy` emits an Azure Policy assignment plan (how AMBA-ALZ deploys at scale). */
+export type AmbaIacFormat = "bicep" | "terraform" | "policy";
 
 export type AmbaCoverage = {
   generated_at: string;
@@ -434,15 +507,28 @@ export type AmbaCoverage = {
   source: string;
   demo: boolean;
   coverage_pct: number;
+  baseline?: {
+    amba_release: string;
+    version: number;
+    tiers: AmbaTier[];
+    patterns: AmbaPattern[];
+  };
   kpis: {
     total_resources_in_baseline: number;
     alerts_present: number;
     alerts_missing: number;
     alerts_misconfigured: number;
+    alerts_suppressed: number;
     recommended_total: number;
+    action_groups: number;
+    action_groups_usable: number;
+    suppression_rules: number;
+    resources_excluded: number;
   };
   groups: AmbaGroup[];
   gaps: AmbaGap[];
+  excluded_resources: AmbaExcludedResource[];
+  suppression_rules: AmbaSuppressionRule[];
   error: string;
   ttl_s: number;
   age_seconds: number | null;
@@ -1320,20 +1406,55 @@ export type AlertAnalysisRefreshJobResponse = {
 
 export type AmbaAlertRef = {
   key: string;
+  guid: string;
   name: string;
+  description: string;
+  why: string;
+  alert_type: AmbaAlertType;
   amba_category: "availability" | "performance" | "security";
-  signal: "metric" | "log";
+  severity: string;
+  severity_num: number;
+  tier: AmbaTier;
+  patterns: AmbaPattern[];
   metric: string;
+  metric_namespace: string;
+  counter_name: string;
   operator: string;
   threshold: number | null;
   unit: string;
-  window: string;
-  severity: string;
-  requires_action_group: boolean;
+  criterion_type: "" | "StaticThresholdCriterion" | "DynamicThresholdCriterion";
+  alert_sensitivity: "Low" | "Medium" | "High" | null;
+  failing_periods: AmbaFailingPeriods | null;
+  auto_mitigate: boolean | null;
+  time_aggregation: string;
+  window_size: string;
+  evaluation_frequency: string;
+  dimensions: AmbaDimension[];
+  /** Legacy single-dimension filter (`StatusCode eq '429'`), still honoured for local entries. */
   dimension_filter: string;
-  aggregation: string;
+  activity_log: Record<string, unknown>;
+  log_query: string;
+  visible: boolean;
+  verified: boolean;
+  default_enabled: boolean;
+  requires_action_group: boolean;
   deployable: boolean;
-  why: string;
+  references: AmbaReferenceLink[];
+  deployments: Record<string, unknown>[];
+  policy_alert_name: string;
+  policy_scope: string;
+  threshold_override_tag: string;
+  amba_tags: string[];
+  source: "amba" | "local";
+};
+
+export type AmbaReferenceType = {
+  display: string;
+  category: string;
+  source?: "amba" | "local";
+  provider?: string;
+  service?: string;
+  alerts: AmbaAlertRef[];
 };
 
 export type AmbaReference = {
@@ -1341,7 +1462,30 @@ export type AmbaReference = {
   updated_at: string;
   updated_by: string;
   builtin_seed_version: number;
-  types: Record<string, { display: string; category: string; alerts: AmbaAlertRef[] }>;
+  amba_release?: string;
+  amba_source?: string;
+  amba_imported_at?: string;
+  types: Record<string, AmbaReferenceType>;
+};
+
+/** The built-in upstream baseline, trimmed for the Reference Set editor's pickers. */
+export type AmbaCatalog = {
+  amba_release: string;
+  amba_source: string;
+  amba_imported_at: string;
+  builtin_seed_version: number;
+  enums: {
+    alert_types: AmbaAlertType[];
+    tiers: AmbaTier[];
+    patterns: AmbaPattern[];
+    severities: string[];
+    categories: string[];
+    operators: string[];
+  };
+  types: Record<
+    string,
+    { display: string; category: string; source: "amba" | "local"; alerts: Partial<AmbaAlertRef>[] }
+  >;
 };
 
 export type AmbaReferenceRevision = {
@@ -6114,7 +6258,7 @@ export const api = {
   },
   bulkAlertRuleChanges: (body: { connection_id?: string; action: "enable" | "disable" | "delete" | "add_action_group"; targets: { target_id: string; family: ManagedAlertRule["family"] }[]; action_group_id?: string; reason: string }) =>
     http<{ batch_id: string; atomic: false; count: number; changes: AlertsManagerChange[] }>("/alerts-manager/alert-rules/bulk-changes", { method: "POST", body: JSON.stringify(body) }),
-  ambaIac: (body: { gaps: AmbaGap[]; format: "bicep" | "terraform" }) =>
+  ambaIac: (body: { gaps: AmbaGap[]; format: AmbaIacFormat }) =>
     http<{ format: string; iac: string; gap_count: number }>("/amba/iac", {
       method: "POST",
       body: JSON.stringify(body),
@@ -6144,6 +6288,7 @@ export const api = {
     }),
   deleteAmbaApproval: (id: string) => http<{ ok: boolean }>(`/amba/approvals/${id}`, { method: "DELETE" }),
   ambaReference: () => http<AmbaReference>("/amba/reference"),
+  ambaCatalog: () => http<AmbaCatalog>("/amba/catalog"),
   updateAmbaReference: (body: { types: AmbaReference["types"]; reason?: string }) =>
     http<AmbaReference>("/amba/reference", { method: "PUT", body: JSON.stringify(body) }),
   ambaReferenceRevisions: () => http<{ revisions: AmbaReferenceRevision[] }>("/amba/reference/revisions"),
