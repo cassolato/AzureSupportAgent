@@ -40,12 +40,28 @@ def cost_overlay(*, tenant_id: str, connection_id: str, subscriptions: list[dict
         return out
     if not payload:
         return out
-    by_sub = {}
-    for row in payload.get("by_subscription", []) or payload.get("subscriptions", []) or []:
-        sid = (row.get("subscription_id") or row.get("id") or "").lower()
-        amt = row.get("cost") or row.get("amount") or row.get("total") or 0
-        if sid:
-            by_sub[sid] = float(amt or 0)
+    by_sub: dict[str, float] = {}
+    raw = payload.get("by_subscription") or payload.get("subscriptions") or {}
+    # ``by_subscription`` is a {subscription_id: amount} mapping, but older/alternate payloads
+    # carry a list of row dicts. Accept both, and ignore anything else rather than blowing up.
+    if isinstance(raw, dict):
+        for sid, amt in raw.items():
+            if sid:
+                try:
+                    by_sub[str(sid).lower()] = float(amt or 0)
+                except (TypeError, ValueError):
+                    continue
+    elif isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            sid = (row.get("subscription_id") or row.get("id") or "").lower()
+            amt = row.get("cost") or row.get("amount") or row.get("total") or 0
+            if sid:
+                try:
+                    by_sub[sid] = float(amt or 0)
+                except (TypeError, ValueError):
+                    continue
     currency = payload.get("currency", "USD")
     period = payload.get("period", "") or payload.get("period_label", "")
     for sub in subscriptions:
@@ -218,11 +234,27 @@ def apply_overlays(graph: dict[str, Any], overlays: list[dict[str, Any]]) -> dic
     existing_edge_ids = {e["id"] for e in graph["edges"]}
     patches: dict[str, Any] = {}
     for ov in overlays:
-        for n in ov.get("nodes", []):
-            if n["id"] not in existing_node_ids:
-                graph["nodes"].append(n)
-                existing_node_ids.add(n["id"])
-        for e in ov.get("edges", []):
+        # Overlays are assembled without knowing which scope the graph was built for, so they
+        # can reference anchors the graph does not contain (e.g. the RBAC overlay points at
+        # subscription nodes, which a focused-workload graph has none of). A dangling edge
+        # makes the client renderer reject the whole batch, so keep only edges whose endpoints
+        # resolve, and only those overlay nodes that a surviving edge actually attaches.
+        ov_nodes = {n["id"]: n for n in ov.get("nodes", [])}
+        reachable = existing_node_ids | set(ov_nodes)
+        kept_edges = [
+            e for e in ov.get("edges", [])
+            if e["source"] in reachable and e["target"] in reachable
+        ]
+        anchored = {e["source"] for e in kept_edges} | {e["target"] for e in kept_edges}
+        attached = {eid for e in ov.get("edges", []) for eid in (e["source"], e["target"])}
+        for nid, n in ov_nodes.items():
+            # Keep a node if an edge still holds it, or if this overlay never linked it at all
+            # (patch-only overlays add standalone nodes on purpose).
+            if nid in existing_node_ids or (nid in attached and nid not in anchored):
+                continue
+            graph["nodes"].append(n)
+            existing_node_ids.add(nid)
+        for e in kept_edges:
             if e["id"] not in existing_edge_ids:
                 graph["edges"].append(e)
                 existing_edge_ids.add(e["id"])

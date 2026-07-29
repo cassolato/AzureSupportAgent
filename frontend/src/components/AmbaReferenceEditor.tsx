@@ -3,15 +3,31 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type AmbaAlertRef, type AmbaReference } from "../api";
 import { formatError } from "../utils/format";
 import {
+  AMBA_AGGREGATIONS,
+  AMBA_ALERT_TYPES,
   AMBA_CATEGORIES,
+  AMBA_FREQUENCIES,
   AMBA_OPERATOR_SYMBOL,
   AMBA_OPERATORS,
+  AMBA_PATTERNS,
+  AMBA_SENSITIVITIES,
   AMBA_SEVERITIES,
+  AMBA_TIERS,
   AMBA_UNITS,
   AMBA_WINDOWS,
+  ALERT_TYPE_CLS,
+  ALERT_TYPE_LABEL,
   CATEGORY_COLOR,
+  PATTERN_LABEL,
+  TIER_CLS,
+  TIER_HINT,
+  TIER_LABEL,
+  blankAlert as makeBlankAlert,
   catalogFor,
-  KNOWN_ARM_TYPES,
+  fromCatalog as makeFromCatalog,
+  knownArmTypes,
+  sentence,
+  severityNumber,
   type CatalogMetric,
 } from "./ambaCatalog";
 
@@ -36,53 +52,12 @@ function uniqueKey(base: string, existing: Set<string>): string {
 }
 
 function blankAlert(existing: Set<string>): AmbaAlertRef {
-  return {
-    key: uniqueKey("new_alert", existing),
-    name: "New alert",
-    amba_category: "performance",
-    signal: "metric",
-    metric: "",
-    operator: "GreaterThan",
-    threshold: null,
-    unit: "%",
-    window: "PT5M",
-    severity: "warning",
-    requires_action_group: true,
-    dimension_filter: "",
-    aggregation: "",
-    deployable: true,
-    why: "",
-  };
+  return makeBlankAlert({ key: uniqueKey("new_alert", existing), name: "New alert" });
 }
 
 function fromCatalog(c: CatalogMetric, existing: Set<string>): AmbaAlertRef {
-  return {
-    key: uniqueKey(slugify(c.label), existing),
-    name: c.label,
-    amba_category: c.amba_category,
-    signal: "metric",
-    metric: c.metric,
-    operator: c.operator,
-    threshold: c.threshold,
-    unit: c.unit,
-    window: c.window,
-    severity: "warning",
-    requires_action_group: true,
-    dimension_filter: "",
-    aggregation: "",
-    deployable: true,
-    why: c.why || "",
-  };
-}
-
-// English sentence read-back for an alert.
-function sentence(a: AmbaAlertRef): string {
-  const op = AMBA_OPERATOR_SYMBOL[a.operator] || a.operator;
-  const thr = a.threshold != null ? `${a.threshold}${a.unit}` : "(exists)";
-  const win = a.window.replace("PT", "").replace("P", "").toLowerCase();
-  const ag = a.requires_action_group ? " · needs action group" : "";
-  if (a.signal === "log") return `${a.name}: log query → ${a.severity}${ag}`;
-  return `${a.metric || "metric"} ${op} ${thr} over ${win} → ${a.severity}${ag}`;
+  const entry = makeFromCatalog(c);
+  return { ...entry, key: uniqueKey(entry.key || slugify(entry.name), existing) };
 }
 
 // Threshold gauge for numeric % metrics (0-100). Returns null when not graphable.
@@ -98,6 +73,43 @@ function Gauge({ alert }: { alert: AmbaAlertRef }) {
       </div>
       <div className="mt-0.5 text-[10px] text-gray-400">threshold at {pct}%</div>
     </div>
+  );
+}
+
+/** Tier / class / pattern / provenance badges shown on every alert card. */
+function AlertBadges({ alert }: { alert: AmbaAlertRef }) {
+  return (
+    <span className="ml-1 inline-flex flex-wrap items-center gap-1 align-middle">
+      <span
+        title={ALERT_TYPE_LABEL[alert.alert_type]}
+        className={`rounded px-1.5 py-0.5 text-[10px] ${ALERT_TYPE_CLS[alert.alert_type] ?? ""}`}
+      >
+        {ALERT_TYPE_LABEL[alert.alert_type] ?? alert.alert_type}
+      </span>
+      <span title={TIER_HINT[alert.tier]} className={`rounded px-1.5 py-0.5 text-[10px] ${TIER_CLS[alert.tier] ?? ""}`}>
+        {TIER_LABEL[alert.tier] ?? alert.tier}
+      </span>
+      {alert.criterion_type === "DynamicThresholdCriterion" && (
+        <span title="Dynamic threshold" className="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] text-indigo-700">
+          dynamic
+        </span>
+      )}
+      {alert.patterns.map((p) => (
+        <span key={p} title={PATTERN_LABEL[p]} className="rounded bg-cyan-50 px-1.5 py-0.5 text-[10px] text-cyan-700">
+          {p}
+        </span>
+      ))}
+      {alert.source === "local" && (
+        <span title="Local addition — not published by AMBA" className="rounded bg-fuchsia-50 px-1.5 py-0.5 text-[10px] text-fuchsia-700">
+          local
+        </span>
+      )}
+      {!alert.visible && (
+        <span title="Hidden in the upstream AMBA site" className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500">
+          hidden
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -121,6 +133,16 @@ export function AmbaReferenceEditor() {
   const [addTypeOpen, setAddTypeOpen] = useState(false);
 
   const ref = refQ.data;
+
+  // The upstream AMBA baseline, served from the vendored snapshot. Drives the "add from
+  // baseline" picker, metric autocomplete and the add-resource-type list, so suggestions
+  // always match the release the reference was seeded from.
+  const catalogQ = useQuery({ queryKey: ["amba-catalog"], queryFn: api.ambaCatalog, staleTime: 30 * 60_000 });
+  const catalogEntries = useMemo(
+    () => catalogFor(catalogQ.data, selected),
+    [catalogQ.data, selected],
+  );
+  const knownTypes = useMemo(() => knownArmTypes(catalogQ.data), [catalogQ.data]);
 
   // Load the server reference into the draft once (and after a save resets dirty).
   useEffect(() => {
@@ -219,7 +241,7 @@ export function AmbaReferenceEditor() {
       return;
     }
     mutate((d) => {
-      d[t] = { display: display.trim() || armType, category: category || "other", alerts: [] };
+      d[t] = { display: display.trim() || armType, category: category || "other", source: "local", alerts: [] };
     });
     setSelected(t);
     setAddTypeOpen(false);
@@ -414,6 +436,7 @@ export function AmbaReferenceEditor() {
                           alert={a}
                           editing={editingKey === a.key}
                           armType={selected}
+                          catalog={catalogEntries}
                           onToggleEdit={() => setEditingKey(editingKey === a.key ? null : a.key)}
                           onChange={(patch) => updateAlert(a.key, patch)}
                           onDelete={() => { deleteAlert(a.key); if (editingKey === a.key) setEditingKey(null); }}
@@ -431,25 +454,46 @@ export function AmbaReferenceEditor() {
 
       {/* Add-from-catalog popover */}
       {catalogOpen && cur && (
-        <Modal title={`Add metric · ${cur.display}`} onClose={() => setCatalogOpen(false)}>
-          {catalogFor(selected).length === 0 ? (
-            <p className="text-sm text-gray-500">No catalog metrics for this type — use "+ Blank metric" and enter a metric name.</p>
+        <Modal title={`Add from the AMBA baseline · ${cur.display}`} onClose={() => setCatalogOpen(false)}>
+          {catalogEntries.length === 0 ? (
+            <p className="text-sm text-gray-500">
+              AMBA {catalogQ.data?.amba_release || ""} publishes no alerts for this type — use "+ Blank metric" and
+              enter a metric name.
+            </p>
           ) : (
             <div className="space-y-1.5">
-              {catalogFor(selected).map((c) => {
-                const already = (cur.alerts || []).some((a) => a.metric === c.metric);
+              <p className="pb-1 text-[11px] text-gray-500">
+                From the vendored AMBA {catalogQ.data?.amba_release} catalogue · {catalogEntries.length} published
+                alert{catalogEntries.length === 1 ? "" : "s"}.
+              </p>
+              {catalogEntries.map((c) => {
+                const already = (cur.alerts || []).some((a) => a.key === c.key);
+                const dynamic = c.criterion_type === "DynamicThresholdCriterion";
                 return (
                   <button
-                    key={c.metric}
+                    key={c.key}
                     onClick={() => addCatalogMetric(c)}
                     disabled={already}
                     className="flex w-full items-center gap-2 rounded border bg-white px-3 py-2 text-left text-sm hover:bg-gray-50 disabled:opacity-40"
                   >
-                    <span className="inline-block h-2 w-2 rounded-full" style={{ background: CATEGORY_COLOR[c.amba_category] }} />
-                    <span className="font-medium text-gray-800">{c.label}</span>
-                    <span className="font-mono text-[11px] text-gray-400">{c.metric}</span>
-                    <span className="ml-auto text-[11px] text-gray-500">
-                      {AMBA_OPERATOR_SYMBOL[c.operator]} {c.threshold != null ? `${c.threshold}${c.unit}` : "exists"}
+                    <span
+                      className="inline-block h-2 w-2 shrink-0 rounded-full"
+                      style={{ background: CATEGORY_COLOR[c.amba_category ?? "performance"] }}
+                    />
+                    <span className="font-medium text-gray-800">{c.name}</span>
+                    {c.metric && <span className="font-mono text-[11px] text-gray-400">{c.metric}</span>}
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] ${TIER_CLS[c.tier ?? "recommended"]}`}>
+                      {TIER_LABEL[c.tier ?? "recommended"]}
+                    </span>
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] ${ALERT_TYPE_CLS[c.alert_type ?? "metric"]}`}>
+                      {ALERT_TYPE_LABEL[c.alert_type ?? "metric"]}
+                    </span>
+                    <span className="ml-auto shrink-0 text-[11px] text-gray-500">
+                      {dynamic
+                        ? `dynamic · ${c.alert_sensitivity ?? "Medium"}`
+                        : `${AMBA_OPERATOR_SYMBOL[c.operator ?? ""] ?? ""} ${
+                            c.threshold != null ? `${c.threshold}${c.unit ?? ""}` : "exists"
+                          }`}
                     </span>
                     {already && <span className="text-[10px] text-gray-400">added</span>}
                   </button>
@@ -461,7 +505,14 @@ export function AmbaReferenceEditor() {
       )}
 
       {/* Add-resource-type popover */}
-      {addTypeOpen && <AddTypeModal existing={draft} onClose={() => setAddTypeOpen(false)} onAdd={addType} />}
+      {addTypeOpen && (
+        <AddTypeModal
+          existing={draft}
+          knownTypes={knownTypes}
+          onClose={() => setAddTypeOpen(false)}
+          onAdd={addType}
+        />
+      )}
 
       {/* Raw JSON */}
       {showRaw && (
@@ -496,24 +547,42 @@ export function AmbaReferenceEditor() {
 }
 
 function AlertCard({
-  alert, editing, armType, onToggleEdit, onChange, onDelete, onDuplicate,
+  alert, editing, armType, catalog, onToggleEdit, onChange, onDelete, onDuplicate,
 }: {
   alert: AmbaAlertRef;
   editing: boolean;
   armType: string;
+  catalog: CatalogMetric[];
   onToggleEdit: () => void;
   onChange: (patch: Partial<AmbaAlertRef>) => void;
   onDelete: () => void;
   onDuplicate: () => void;
 }) {
-  const metricOptions = catalogFor(armType);
+  const metricOptions = catalog.filter((m) => m.metric);
+  const isMetric = alert.alert_type === "metric";
+  const isLog = alert.alert_type === "log";
+  const isActivity = alert.alert_type === "activitylog";
+  const isDynamic = alert.criterion_type === "DynamicThresholdCriterion";
+  const activity = (alert.activity_log ?? {}) as Record<string, unknown>;
+
+  function patchActivity(field: string, value: string) {
+    const next = { ...activity };
+    if (value) next[field] = value;
+    else delete next[field];
+    onChange({ activity_log: next });
+  }
+
   return (
     <div className={`rounded-lg border bg-white ${editing ? "ring-1 ring-brand" : ""}`}>
       <div className="flex items-start gap-2 px-3 py-2">
         <button onClick={onToggleEdit} className="min-w-0 flex-1 text-left">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-medium text-gray-800">{alert.name}</span>
-            <span className={`rounded border px-1.5 py-0.5 text-[10px] ${SEV_TONE[alert.severity] || ""}`}>{alert.severity}</span>
+            <span className={`rounded border px-1.5 py-0.5 text-[10px] ${SEV_TONE[alert.severity] || ""}`}>
+              {alert.severity}
+              {typeof alert.severity_num === "number" ? ` (Sev${alert.severity_num})` : ""}
+            </span>
+            <AlertBadges alert={alert} />
           </div>
           <div className="mt-0.5 text-[11px] text-gray-500">{sentence(alert)}</div>
           <Gauge alert={alert} />
@@ -531,64 +600,25 @@ function AlertCard({
             <span className="text-gray-500">Name</span>
             <input value={alert.name} onChange={(e) => onChange({ name: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1" />
           </label>
+
           <label>
-            <span className="text-gray-500">Signal</span>
-            <select value={alert.signal} onChange={(e) => onChange({ signal: e.target.value as AmbaAlertRef["signal"] })} className="mt-0.5 w-full rounded border px-2 py-1">
-              <option value="metric">metric</option>
-              <option value="log">log</option>
-            </select>
-          </label>
-          <label className="col-span-2">
-            <span className="text-gray-500">Metric</span>
-            <input
-              list={`metriclist-${armType}`}
-              value={alert.metric}
-              onChange={(e) => {
-                const hit = metricOptions.find((m) => m.metric === e.target.value);
-                if (hit) {
-                  onChange({ metric: hit.metric, unit: hit.unit, operator: hit.operator, window: hit.window, threshold: hit.threshold, amba_category: hit.amba_category, name: alert.name === "New alert" ? hit.label : alert.name });
-                } else {
-                  onChange({ metric: e.target.value });
-                }
-              }}
-              className="mt-0.5 w-full rounded border px-2 py-1 font-mono"
-            />
-            <datalist id={`metriclist-${armType}`}>
-              {metricOptions.map((m) => <option key={m.metric} value={m.metric}>{m.label}</option>)}
-            </datalist>
-          </label>
-          <label>
-            <span className="text-gray-500">Operator</span>
-            <select value={alert.operator} onChange={(e) => onChange({ operator: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
-              {AMBA_OPERATORS.map((o) => <option key={o} value={o}>{AMBA_OPERATOR_SYMBOL[o]} {o}</option>)}
-            </select>
-          </label>
-          <label>
-            <span className="text-gray-500">Threshold</span>
-            <input
-              type="number"
-              value={alert.threshold ?? ""}
-              onChange={(e) => onChange({ threshold: e.target.value === "" ? null : Number(e.target.value) })}
-              placeholder="(exists)"
+            <span className="text-gray-500">Alert class</span>
+            <select
+              value={alert.alert_type}
+              onChange={(e) => onChange({ alert_type: e.target.value as AmbaAlertRef["alert_type"] })}
               className="mt-0.5 w-full rounded border px-2 py-1"
-            />
-          </label>
-          <label>
-            <span className="text-gray-500">Unit</span>
-            <input list="amba-units" value={alert.unit} onChange={(e) => onChange({ unit: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1" />
-            <datalist id="amba-units">{AMBA_UNITS.map((u) => <option key={u} value={u} />)}</datalist>
-          </label>
-          <label>
-            <span className="text-gray-500">Window</span>
-            <select value={alert.window} onChange={(e) => onChange({ window: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
-              {AMBA_WINDOWS.map((w) => <option key={w} value={w}>{w}</option>)}
+            >
+              {AMBA_ALERT_TYPES.map((t) => <option key={t} value={t}>{ALERT_TYPE_LABEL[t]}</option>)}
             </select>
           </label>
           <label>
-            <span className="text-gray-500">Aggregation</span>
-            <select value={alert.aggregation || ""} onChange={(e) => onChange({ aggregation: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
-              <option value="">automatic</option>
-              {['Average', 'Minimum', 'Maximum', 'Total', 'Count'].map((value) => <option key={value} value={value}>{value}</option>)}
+            <span className="text-gray-500" title={TIER_HINT[alert.tier]}>Tier</span>
+            <select
+              value={alert.tier}
+              onChange={(e) => onChange({ tier: e.target.value as AmbaAlertRef["tier"] })}
+              className="mt-0.5 w-full rounded border px-2 py-1"
+            >
+              {AMBA_TIERS.map((t) => <option key={t} value={t}>{TIER_LABEL[t]}</option>)}
             </select>
           </label>
           <label>
@@ -597,50 +627,304 @@ function AlertCard({
               {AMBA_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
           </label>
+
+          {isMetric && (
+            <>
+              <label className="col-span-2">
+                <span className="text-gray-500">Metric</span>
+                <input
+                  list={`metriclist-${armType}`}
+                  value={alert.metric}
+                  onChange={(e) => {
+                    const hit = metricOptions.find((m) => m.metric === e.target.value);
+                    if (hit) {
+                      onChange({
+                        metric: hit.metric ?? e.target.value,
+                        metric_namespace: hit.metric_namespace ?? alert.metric_namespace,
+                        unit: hit.unit ?? alert.unit,
+                        operator: hit.operator ?? alert.operator,
+                        window_size: hit.window_size ?? alert.window_size,
+                        evaluation_frequency: hit.evaluation_frequency ?? alert.evaluation_frequency,
+                        time_aggregation: hit.time_aggregation ?? alert.time_aggregation,
+                        threshold: hit.threshold ?? null,
+                        criterion_type: hit.criterion_type ?? alert.criterion_type,
+                        alert_sensitivity: hit.alert_sensitivity ?? null,
+                        amba_category: hit.amba_category ?? alert.amba_category,
+                        threshold_override_tag: hit.threshold_override_tag ?? alert.threshold_override_tag,
+                        name: alert.name === "New alert" ? hit.name ?? alert.name : alert.name,
+                      });
+                    } else {
+                      onChange({ metric: e.target.value });
+                    }
+                  }}
+                  className="mt-0.5 w-full rounded border px-2 py-1 font-mono"
+                />
+                <datalist id={`metriclist-${armType}`}>
+                  {metricOptions.map((m) => <option key={m.key} value={m.metric}>{m.name}</option>)}
+                </datalist>
+              </label>
+              <label>
+                <span className="text-gray-500">Threshold type</span>
+                <select
+                  value={alert.criterion_type || "StaticThresholdCriterion"}
+                  onChange={(e) =>
+                    onChange({
+                      criterion_type: e.target.value as AmbaAlertRef["criterion_type"],
+                      alert_sensitivity: e.target.value === "DynamicThresholdCriterion" ? alert.alert_sensitivity ?? "Medium" : null,
+                    })
+                  }
+                  className="mt-0.5 w-full rounded border px-2 py-1"
+                >
+                  <option value="StaticThresholdCriterion">Static</option>
+                  <option value="DynamicThresholdCriterion">Dynamic</option>
+                </select>
+              </label>
+            </>
+          )}
+
+          {isLog && (
+            <label className="col-span-2 sm:col-span-3">
+              <span className="text-gray-500">Log query (KQL)</span>
+              <textarea
+                value={alert.log_query}
+                onChange={(e) => onChange({ log_query: e.target.value })}
+                rows={5}
+                spellCheck={false}
+                className="mt-0.5 w-full rounded border px-2 py-1 font-mono text-[11px]"
+              />
+              <span className="text-[10px] text-gray-400">
+                Detection matches on the primary table plus the Name / MetricName / CounterName operands.
+              </span>
+            </label>
+          )}
+
+          {isActivity && (
+            <>
+              <label>
+                <span className="text-gray-500">Activity category</span>
+                <input
+                  value={String(activity["category"] ?? "")}
+                  onChange={(e) => patchActivity("category", e.target.value)}
+                  placeholder="ServiceHealth"
+                  className="mt-0.5 w-full rounded border px-2 py-1 font-mono"
+                />
+              </label>
+              <label>
+                <span className="text-gray-500">Incident type</span>
+                <input
+                  value={String(activity["incidentType"] ?? "")}
+                  onChange={(e) => patchActivity("incidentType", e.target.value)}
+                  placeholder="Incident"
+                  className="mt-0.5 w-full rounded border px-2 py-1 font-mono"
+                />
+              </label>
+              <label>
+                <span className="text-gray-500">Operation name</span>
+                <input
+                  value={String(activity["operationName"] ?? "")}
+                  onChange={(e) => patchActivity("operationName", e.target.value)}
+                  placeholder="Microsoft.KeyVault/vaults/delete"
+                  className="mt-0.5 w-full rounded border px-2 py-1 font-mono"
+                />
+              </label>
+            </>
+          )}
+
+          {!isActivity && (
+            <>
+              <label>
+                <span className="text-gray-500">Operator</span>
+                <select value={alert.operator} onChange={(e) => onChange({ operator: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
+                  {AMBA_OPERATORS.map((o) => <option key={o} value={o}>{AMBA_OPERATOR_SYMBOL[o]} {o}</option>)}
+                </select>
+              </label>
+              {isDynamic ? (
+                <>
+                  <label>
+                    <span className="text-gray-500">Sensitivity</span>
+                    <select
+                      value={alert.alert_sensitivity ?? "Medium"}
+                      onChange={(e) => onChange({ alert_sensitivity: e.target.value as AmbaAlertRef["alert_sensitivity"] })}
+                      className="mt-0.5 w-full rounded border px-2 py-1"
+                    >
+                      {AMBA_SENSITIVITIES.map((s) => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span className="text-gray-500">Failing periods (min / total)</span>
+                    <div className="mt-0.5 flex gap-1">
+                      <input
+                        type="number" min={1} max={24}
+                        value={alert.failing_periods?.min_failing_periods_to_alert ?? ""}
+                        onChange={(e) => onChange({ failing_periods: { ...alert.failing_periods, min_failing_periods_to_alert: e.target.value === "" ? null : Number(e.target.value) } })}
+                        className="w-full rounded border px-2 py-1"
+                      />
+                      <input
+                        type="number" min={1} max={24}
+                        value={alert.failing_periods?.number_of_evaluation_periods ?? ""}
+                        onChange={(e) => onChange({ failing_periods: { ...alert.failing_periods, number_of_evaluation_periods: e.target.value === "" ? null : Number(e.target.value) } })}
+                        className="w-full rounded border px-2 py-1"
+                      />
+                    </div>
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label>
+                    <span className="text-gray-500">Threshold</span>
+                    <input
+                      type="number"
+                      value={alert.threshold ?? ""}
+                      onChange={(e) => onChange({ threshold: e.target.value === "" ? null : Number(e.target.value) })}
+                      placeholder="(exists)"
+                      className="mt-0.5 w-full rounded border px-2 py-1"
+                    />
+                  </label>
+                  <label>
+                    <span className="text-gray-500">Unit</span>
+                    <input list="amba-units" value={alert.unit} onChange={(e) => onChange({ unit: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1" />
+                    <datalist id="amba-units">{AMBA_UNITS.map((u) => <option key={u} value={u} />)}</datalist>
+                  </label>
+                </>
+              )}
+              <label>
+                <span className="text-gray-500">Window</span>
+                <select value={alert.window_size} onChange={(e) => onChange({ window_size: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
+                  {AMBA_WINDOWS.map((w) => <option key={w} value={w}>{w}</option>)}
+                </select>
+              </label>
+              <label>
+                <span className="text-gray-500">Evaluation frequency</span>
+                <select value={alert.evaluation_frequency} onChange={(e) => onChange({ evaluation_frequency: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
+                  {AMBA_FREQUENCIES.map((w) => <option key={w} value={w}>{w}</option>)}
+                </select>
+              </label>
+              {isMetric && (
+                <label>
+                  <span className="text-gray-500">Aggregation</span>
+                  <select value={alert.time_aggregation || ""} onChange={(e) => onChange({ time_aggregation: e.target.value })} className="mt-0.5 w-full rounded border px-2 py-1">
+                    {AMBA_AGGREGATIONS.map((value) => <option key={value || "auto"} value={value}>{value || "automatic"}</option>)}
+                  </select>
+                </label>
+              )}
+            </>
+          )}
+
           <div className="col-span-2 sm:col-span-3">
             <span className="text-gray-500">Severity</span>
             <div className="mt-0.5 inline-flex overflow-hidden rounded border">
               {AMBA_SEVERITIES.map((s) => (
-                <button key={s} onClick={() => onChange({ severity: s })} className={`px-2.5 py-1 text-[11px] ${alert.severity === s ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}>{s}</button>
+                <button
+                  key={s}
+                  onClick={() => onChange({ severity: s, severity_num: severityNumber(s) })}
+                  className={`px-2.5 py-1 text-[11px] ${alert.severity === s ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}
+                >
+                  {s}
+                </button>
               ))}
             </div>
           </div>
+
+          <div className="col-span-2 sm:col-span-3">
+            <span className="text-gray-500">Workload patterns</span>
+            <div className="mt-0.5 flex flex-wrap gap-1">
+              {AMBA_PATTERNS.map((p) => {
+                const on = alert.patterns.includes(p);
+                return (
+                  <button
+                    key={p}
+                    title={PATTERN_LABEL[p]}
+                    onClick={() => onChange({ patterns: on ? alert.patterns.filter((x) => x !== p) : [...alert.patterns, p] })}
+                    className={`rounded border px-2 py-0.5 text-[11px] ${on ? "border-cyan-300 bg-cyan-50 text-cyan-800" : "bg-white text-gray-500 hover:bg-gray-50"}`}
+                  >
+                    {p}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <label className="col-span-2 flex items-center gap-2 sm:col-span-3">
             <input type="checkbox" checked={alert.requires_action_group} onChange={(e) => onChange({ requires_action_group: e.target.checked })} />
             <span className="text-gray-600">Requires a wired action group to count as "present"</span>
           </label>
           <label className="col-span-2 flex items-center gap-2 sm:col-span-3">
             <input type="checkbox" checked={alert.deployable !== false} onChange={(e) => onChange({ deployable: e.target.checked })} />
-            <span className="text-gray-600">Deployable as a native Azure Monitor alert</span>
+            <span className="text-gray-600">Deployable as a native Azure Monitor alert (uncheck for guidance-only entries)</span>
           </label>
+          <label className="col-span-2 flex items-center gap-2 sm:col-span-3">
+            <input type="checkbox" checked={alert.visible} onChange={(e) => onChange({ visible: e.target.checked })} />
+            <span className="text-gray-600">Visible (upstream AMBA publishes this alert on its site)</span>
+          </label>
+
+          {isMetric && (
+            <label className="col-span-2 sm:col-span-3">
+              <span className="text-gray-500">Threshold override tag</span>
+              <input
+                value={alert.threshold_override_tag || ""}
+                onChange={(e) => onChange({ threshold_override_tag: e.target.value })}
+                placeholder="_amba-Percentage CPU-threshold-Override_"
+                className="mt-0.5 w-full rounded border px-2 py-1 font-mono"
+              />
+              <span className="text-[10px] text-gray-400">
+                AMBA-ALZ convention. When a resource carries this tag, its value replaces the baseline threshold
+                for that resource only.
+              </span>
+            </label>
+          )}
+
           <label className="col-span-2 sm:col-span-3">
-            <span className="text-gray-500">Dimension filter</span>
+            <span className="text-gray-500">Dimension filter (legacy single-dimension form)</span>
             <input value={alert.dimension_filter || ""} onChange={(e) => onChange({ dimension_filter: e.target.value })} placeholder="StatusCode eq '429'" className="mt-0.5 w-full rounded border px-2 py-1 font-mono" />
+            {!!alert.dimensions?.length && (
+              <span className="text-[10px] text-gray-400">
+                Structured dimensions from AMBA: {alert.dimensions.map((d) => `${d.name} ${d.operator} [${d.values.join(", ")}]`).join(" · ")}
+              </span>
+            )}
           </label>
           <label className="col-span-2 sm:col-span-3">
             <span className="text-gray-500">Why it matters</span>
             <textarea value={alert.why} onChange={(e) => onChange({ why: e.target.value })} rows={2} className="mt-0.5 w-full rounded border px-2 py-1" />
           </label>
+
+          {!!alert.references?.length && (
+            <div className="col-span-2 sm:col-span-3 text-[11px]">
+              <span className="text-gray-500">Microsoft references</span>
+              <ul className="mt-0.5 list-inside list-disc space-y-0.5">
+                {alert.references.map((r) => (
+                  <li key={r.url}>
+                    <a href={r.url} target="_blank" rel="noreferrer" className="text-brand hover:underline">{r.name || r.url}</a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function AddTypeModal({ existing, onClose, onAdd }: { existing: RefTypes; onClose: () => void; onAdd: (t: string, d: string, c: string) => void }) {
+function AddTypeModal({ existing, knownTypes, onClose, onAdd }: {
+  existing: RefTypes;
+  knownTypes: { type: string; label: string; category: string; source: string; alertCount: number }[];
+  onClose: () => void;
+  onAdd: (t: string, d: string, c: string) => void;
+}) {
   const [armType, setArmType] = useState("");
   const [display, setDisplay] = useState("");
   const [category, setCategory] = useState("other");
-  const known = KNOWN_ARM_TYPES.filter((k) => !existing[k.type]);
+  const known = knownTypes.filter((k) => !existing[k.type]);
   return (
     <Modal title="Add resource type" onClose={onClose}>
       <div className="mb-3">
-        <div className="mb-1 text-xs font-medium text-gray-500">Pick a known type</div>
+        <div className="mb-1 text-xs font-medium text-gray-500">Pick a type published by AMBA</div>
         <div className="max-h-48 space-y-1 overflow-auto">
           {known.map((k) => (
             <button key={k.type} onClick={() => onAdd(k.type, k.label, k.category)} className="flex w-full items-center gap-2 rounded border bg-white px-2 py-1.5 text-left text-xs hover:bg-gray-50">
               <span className="font-medium text-gray-800">{k.label}</span>
               <span className="font-mono text-[10px] text-gray-400">{k.type}</span>
+              <span className="ml-auto text-[10px] text-gray-400">{k.alertCount} alerts</span>
             </button>
           ))}
           {known.length === 0 && <p className="text-xs text-gray-400">All known types are already in the reference.</p>}

@@ -459,7 +459,7 @@ def _amba_metrics_for(arm_type: str) -> list[str]:
         return []
     out: list[str] = []
     for a in spec.get("alerts", []) or []:
-        if (a.get("signal") or "metric") == "metric":
+        if str(a.get("alert_type") or a.get("signal") or "metric") == "metric":
             name = str(a.get("metric") or "").strip()
             if name and name not in out:
                 out.append(name)

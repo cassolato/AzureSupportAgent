@@ -42,9 +42,20 @@ def _series(base: float, end: float, *, points: int = 24, noise: float = 0.0) ->
 
 
 def _metric_alerts(rtype: str) -> list[dict[str, Any]]:
+    """Metric recommendations for a type, in the same tiers the profiler scores.
+
+    ``deployable: False`` entries stay in: that flag means "never propose this as an Azure
+    alert rule" (it is a derived/composite figure), but the profiler evaluates observed
+    metrics, where saturation percentages are exactly what an operator wants to see."""
     ref = load_reference()
     spec = ref.get("types", {}).get(rtype) or {}
-    return [a for a in (spec.get("alerts") or []) if str(a.get("signal", "metric")) == "metric" and a.get("metric")]
+    return [
+        a
+        for a in (spec.get("alerts") or [])
+        if str(a.get("alert_type") or a.get("signal") or "metric") == "metric"
+        and a.get("metric")
+        and str(a.get("tier") or "recommended") in ("core", "recommended")
+    ]
 
 
 def _value_series(state: str, rec: dict[str, Any], rtype: str) -> list[dict[str, Any]]:
@@ -90,10 +101,30 @@ def demo_metrics_by_resource(scope_id: str = CONTOSO_ID) -> dict[str, dict[str, 
         # Headline = first metric alert with a numeric threshold (so red actually breaches).
         headline = next((i for i, a in enumerate(alerts) if a.get("threshold")), 0)
         headline_state = {"red": "breaching", "amber": "approaching", "green": "healthy"}[tier]
+
+        # Several baseline alerts can share one metric series and differ only by threshold
+        # (e.g. Storage `Transactions` at >=1 and >10). One series has to satisfy them all,
+        # so synthesize against the strictest threshold — otherwise a "healthy" resource
+        # reads as breaching on the tighter rule.
+        strictest: dict[str, dict[str, Any]] = {}
+        for a in alerts:
+            key = _series_key(a)
+            current = strictest.get(key)
+            if current is None:
+                strictest[key] = a
+                continue
+            threshold, other = a.get("threshold"), current.get("threshold")
+            if threshold is None or other is None:
+                continue
+            lower_is_worse = a.get("operator") in ("LessThan", "LessThanOrEqual")
+            if (threshold > other) if lower_is_worse else (threshold < other):
+                strictest[key] = a
+
+        headline_key = _series_key(alerts[headline])
         series_map: dict[str, list[dict[str, Any]]] = {}
-        for i, a in enumerate(alerts):
-            state = headline_state if i == headline else "healthy"
-            series_map[_series_key(a)] = _value_series(state, a, res["type"])
+        for key, rec in strictest.items():
+            state = headline_state if key == headline_key else "healthy"
+            series_map[key] = _value_series(state, rec, res["type"])
         out[res["id"].lower()] = series_map
     return out
 

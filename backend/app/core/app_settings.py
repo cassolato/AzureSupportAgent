@@ -231,6 +231,18 @@ DEFAULTS: dict[str, Any] = {
     # Tolerance (%) for treating an existing alert's threshold as matching the baseline
     # before flagging it as misconfigured.
     "amba_threshold_tolerance_pct": 10,
+    # Which baseline tiers are scored. "core" = shipped in an official AMBA policy/initiative,
+    # "recommended" = published on the AMBA site, "optional" = upstream-hidden (noisy or
+    # experimental) and off by default.
+    "amba_tiers": ["core", "recommended"],
+    # Restrict scoring to AMBA workload patterns (alz / hpc / avd / rag / avs). Empty = all.
+    "amba_patterns": [],
+    # Flag an existing rule whose severity differs from the baseline as misconfigured.
+    # Off by default because severity is commonly tuned per organisation.
+    "amba_severity_counts_as_gap": False,
+    # Honour the AMBA-ALZ `MonitorDisable=true` tag: excluded resources are listed
+    # separately instead of being scored as coverage gaps.
+    "amba_honor_monitor_disable_tag": True,
     # --- Telemetry Coverage (diagnostic settings auditor) --------------------------
     # Server-side cache TTL (seconds) for telemetry snapshots (per-resource diag reads
     # are slow). Default 6h.
@@ -451,6 +463,17 @@ def save_settings(updates: dict[str, Any]) -> dict[str, Any]:
     current["amba_cache_ttl_s"] = max(0, min(604800, int(current.get("amba_cache_ttl_s", 21600) or 21600)))
     current["amba_misconfig_counts_as_gap"] = bool(current.get("amba_misconfig_counts_as_gap", True))
     current["amba_threshold_tolerance_pct"] = max(0, min(100, int(current.get("amba_threshold_tolerance_pct", 10) or 10)))
+    _valid_tiers = ("core", "recommended", "optional")
+    tiers = current.get("amba_tiers")
+    tiers = [t for t in tiers if t in _valid_tiers] if isinstance(tiers, list) else []
+    current["amba_tiers"] = tiers or ["core", "recommended"]
+    _valid_patterns = ("alz", "hpc", "avd", "rag", "avs")
+    patterns = current.get("amba_patterns")
+    current["amba_patterns"] = (
+        [p for p in patterns if p in _valid_patterns] if isinstance(patterns, list) else []
+    )
+    current["amba_severity_counts_as_gap"] = bool(current.get("amba_severity_counts_as_gap", False))
+    current["amba_honor_monitor_disable_tag"] = bool(current.get("amba_honor_monitor_disable_tag", True))
     # Telemetry: clamp cache TTL + scan cap; normalize the approved-workspace list.
     current["telemetry_cache_ttl_s"] = max(0, min(604800, int(current.get("telemetry_cache_ttl_s", 21600) or 21600)))
     current["telemetry_per_resource_scan_cap"] = max(1, min(2000, int(current.get("telemetry_per_resource_scan_cap", 200) or 200)))

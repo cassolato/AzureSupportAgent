@@ -26,10 +26,26 @@ def test_typed_reference_roundtrip(monkeypatch, tmp_path, mod):
     assert ref["version"] == 0  # fresh seed = builtin, unsaved
     assert ref["types"], "seed must include types"
     if mod is amba_ref:
+        # The AMBA baseline is imported from the upstream catalogue at a pinned release,
+        # then layered with local extensions; spot-check both layers survive the merge.
+        assert ref["amba_release"], "seed must record the upstream AMBA release tag"
         disks = {item["key"]: item for item in ref["types"]["microsoft.compute/disks"]["alerts"]}
-        cosmos = {item["key"]: item for item in ref["types"]["microsoft.documentdb/databaseaccounts"]["alerts"]}
         assert disks["disk_iops_saturation"]["deployable"] is False
-        assert cosmos["cosmos_429"]["aggregation"] == "Count"
+        assert disks["disk_iops_saturation"]["source"] == "local"
+
+        # Upstream layer: Service Health lives on the synthetic subscription row as an
+        # activity-log alert, and Application Gateway carries a dynamic-threshold entry.
+        subs = ref["types"]["microsoft.resources/subscriptions"]["alerts"]
+        assert any(a["alert_type"] == "activitylog" for a in subs)
+        assert any((a.get("activity_log") or {}).get("category") == "ServiceHealth" for a in subs)
+
+        gateways = ref["types"]["microsoft.network/applicationgateways"]["alerts"]
+        assert any(a["criterion_type"] == "DynamicThresholdCriterion" for a in gateways)
+        assert all(a["severity_num"] in range(5) for a in gateways)
+
+        vms = ref["types"]["microsoft.compute/virtualmachines"]["alerts"]
+        assert any(a["alert_type"] == "log" and a["log_query"] for a in vms)
+        assert any(a["threshold_override_tag"].startswith("_amba-") for a in vms)
     n_types = len(ref["types"])
 
     # Save an edit (drop one type) → version bumps, revision recorded.

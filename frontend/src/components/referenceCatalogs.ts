@@ -3,9 +3,49 @@
 // set. Purely client-side; the backend re-sanitizes everything on save (telemetry kinds/
 // groups are validated, backup/DR drops unknown check keys).
 
-import { CATEGORY_COLOR, KNOWN_ARM_TYPES } from "./ambaCatalog";
+import { CATEGORY_COLOR } from "./ambaCatalog";
 
-export { CATEGORY_COLOR, KNOWN_ARM_TYPES };
+export { CATEGORY_COLOR };
+
+// Quick-pick ARM types for the "add resource type" dialog in the Telemetry and Backup/DR
+// editors. These reference sets are independent of AMBA (which now draws its own type list
+// from the vendored upstream catalogue via GET /amba/catalog), so the list lives here.
+// Any ARM type can still be typed in free-form.
+export const KNOWN_ARM_TYPES: { type: string; label: string; category: string }[] = [
+  { type: "microsoft.compute/virtualmachines", label: "Virtual Machine", category: "compute" },
+  { type: "microsoft.compute/virtualmachinescalesets", label: "VM Scale Set", category: "compute" },
+  { type: "microsoft.compute/disks", label: "Managed Disk", category: "storage" },
+  { type: "microsoft.web/sites", label: "App Service", category: "web" },
+  { type: "microsoft.web/serverfarms", label: "App Service Plan", category: "compute" },
+  { type: "microsoft.sql/servers", label: "SQL Server", category: "data" },
+  { type: "microsoft.sql/servers/databases", label: "SQL Database", category: "data" },
+  { type: "microsoft.storage/storageaccounts", label: "Storage Account", category: "storage" },
+  { type: "microsoft.containerservice/managedclusters", label: "AKS Cluster", category: "containers" },
+  { type: "microsoft.keyvault/vaults", label: "Key Vault", category: "security" },
+  { type: "microsoft.cache/redis", label: "Redis Cache", category: "data" },
+  { type: "microsoft.documentdb/databaseaccounts", label: "Cosmos DB", category: "data" },
+  { type: "microsoft.network/applicationgateways", label: "Application Gateway", category: "network" },
+  { type: "microsoft.network/loadbalancers", label: "Load Balancer", category: "network" },
+  { type: "microsoft.network/azurefirewalls", label: "Azure Firewall", category: "network" },
+  { type: "microsoft.network/publicipaddresses", label: "Public IP", category: "network" },
+  { type: "microsoft.network/networksecuritygroups", label: "Network Security Group", category: "network" },
+  { type: "microsoft.network/virtualnetworks", label: "Virtual Network", category: "network" },
+  { type: "microsoft.network/frontdoors", label: "Front Door (classic)", category: "network" },
+  { type: "microsoft.cdn/profiles", label: "Front Door (Std/Premium)", category: "network" },
+  { type: "microsoft.servicebus/namespaces", label: "Service Bus", category: "integration" },
+  { type: "microsoft.eventhub/namespaces", label: "Event Hubs", category: "integration" },
+  { type: "microsoft.eventgrid/topics", label: "Event Grid", category: "integration" },
+  { type: "microsoft.logic/workflows", label: "Logic App", category: "integration" },
+  { type: "microsoft.apimanagement/service", label: "API Management", category: "integration" },
+  { type: "microsoft.app/containerapps", label: "Container App", category: "containers" },
+  { type: "microsoft.containerregistry/registries", label: "Container Registry", category: "containers" },
+  { type: "microsoft.dbforpostgresql/flexibleservers", label: "PostgreSQL Flexible", category: "data" },
+  { type: "microsoft.dbformysql/flexibleservers", label: "MySQL Flexible", category: "data" },
+  { type: "microsoft.cognitiveservices/accounts", label: "Azure AI / OpenAI", category: "ai" },
+  { type: "microsoft.search/searchservices", label: "AI Search", category: "ai" },
+  { type: "microsoft.recoveryservices/vaults", label: "Recovery Services Vault", category: "management" },
+  { type: "microsoft.operationalinsights/workspaces", label: "Log Analytics Workspace", category: "monitoring" },
+];
 
 // ---------------------------------------------------------------- Telemetry
 export const TELEMETRY_KINDS = ["log", "metric"] as const;

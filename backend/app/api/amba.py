@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.amba import cache, change_requests, demo
-from app.amba.collector import _empty_snapshot, collect_coverage
+from app.amba.collector import CoverageOptions, _empty_snapshot, collect_coverage
 from app.core.db import get_db
 from app.core.security import Principal, require_permission
 from app.models import AuditLog
@@ -38,6 +38,27 @@ def _settings() -> tuple[int, bool, float]:
     misconfig_gap = bool(s.get("amba_misconfig_counts_as_gap", True))
     tol = float(s.get("amba_threshold_tolerance_pct", 10) or 10)
     return ttl, misconfig_gap, tol
+
+
+def _coverage_options() -> CoverageOptions:
+    """Scoring knobs for the collector, assembled from app settings."""
+    from app.core.app_settings import load_settings
+
+    s = load_settings()
+    tiers = s.get("amba_tiers") or ["core", "recommended"]
+    if not isinstance(tiers, list):
+        tiers = ["core", "recommended"]
+    patterns = s.get("amba_patterns") or []
+    if not isinstance(patterns, list):
+        patterns = []
+    return CoverageOptions(
+        misconfig_counts_as_gap=bool(s.get("amba_misconfig_counts_as_gap", True)),
+        tolerance_pct=float(s.get("amba_threshold_tolerance_pct", 10) or 10),
+        tiers=tuple(str(t) for t in tiers),
+        patterns=tuple(str(p) for p in patterns),
+        severity_counts_as_gap=bool(s.get("amba_severity_counts_as_gap", False)),
+        honor_monitor_disable_tag=bool(s.get("amba_honor_monitor_disable_tag", True)),
+    )
 
 
 def _decorate(snap: dict[str, Any], ttl_s: int) -> dict[str, Any]:
@@ -98,8 +119,7 @@ async def _get_snapshot(
             scope_kind=scope_kind,
             scope_id=scope_id,
             workload=workload,
-            misconfig_counts_as_gap=misconfig_gap,
-            tolerance_pct=tol,
+            options=_coverage_options(),
         )
         cache.write_snapshot(tenant_id, scope_kind, scope_id, fresh)
         return _decorate(fresh, ttl)
@@ -394,6 +414,62 @@ async def get_reference(_: Principal = Depends(require_admin)) -> dict[str, Any]
     return load_reference()
 
 
+# Fields the Reference Set editor needs to offer "add from the AMBA baseline". The bulky
+# ones (log_query, references, deployments) are dropped so the picker stays light.
+_CATALOG_FIELDS = (
+    "key", "guid", "name", "description", "alert_type", "amba_category", "severity",
+    "severity_num", "tier", "patterns", "metric", "metric_namespace", "operator",
+    "threshold", "unit", "criterion_type", "alert_sensitivity", "time_aggregation",
+    "window_size", "evaluation_frequency", "dimensions", "visible", "default_enabled",
+    "deployable", "requires_action_group", "threshold_override_tag", "policy_alert_name",
+    "source",
+)
+
+
+@router.get("/catalog")
+async def get_catalog(_: Principal = Depends(require_admin)) -> dict[str, Any]:
+    """The built-in AMBA baseline, trimmed for the Reference Set editor's pickers.
+
+    Served from the vendored upstream snapshot rather than a hand-maintained client-side
+    list, so the editor's metric/threshold suggestions can never drift from the release the
+    baseline was imported from."""
+    from app.amba.builtin_seed import (
+        ALERT_TYPES,
+        AMBA_CATEGORIES,
+        BUILTIN_SEED_VERSION,
+        OPERATORS,
+        PATTERNS,
+        SEVERITIES,
+        TIERS,
+        builtin_reference,
+    )
+
+    seed = builtin_reference()
+    types: dict[str, Any] = {}
+    for arm_type, spec in (seed.get("types") or {}).items():
+        types[arm_type] = {
+            "display": spec.get("display", arm_type),
+            "category": spec.get("category", "other"),
+            "source": spec.get("source", "amba"),
+            "alerts": [{f: alert.get(f) for f in _CATALOG_FIELDS} for alert in spec.get("alerts") or []],
+        }
+    return {
+        "amba_release": seed.get("amba_release", ""),
+        "amba_source": seed.get("amba_source", ""),
+        "amba_imported_at": seed.get("amba_imported_at", ""),
+        "builtin_seed_version": BUILTIN_SEED_VERSION,
+        "enums": {
+            "alert_types": list(ALERT_TYPES),
+            "tiers": list(TIERS),
+            "patterns": list(PATTERNS),
+            "severities": list(SEVERITIES),
+            "categories": list(AMBA_CATEGORIES),
+            "operators": list(OPERATORS),
+        },
+        "types": types,
+    }
+
+
 class ReferenceUpdate(BaseModel):
     types: dict[str, Any]
     reason: str = "Edited"
@@ -461,8 +537,11 @@ class Gap(BaseModel):
     location: str = ""
     alert_key: str = ""
     alert_name: str = ""
+    alert_type: str = "metric"
     amba_category: str = ""
     severity: str = "warning"
+    severity_num: int | None = None
+    tier: str = "recommended"
     status: str = "missing"
     recommended: dict[str, Any] = Field(default_factory=dict)
     observed: dict[str, Any] = Field(default_factory=dict)
@@ -474,6 +553,9 @@ class IacRequest(BaseModel):
     format: str = "bicep"
 
 
+_IAC_FORMATS = ("bicep", "terraform", "policy")
+
+
 @router.post("/iac")
 async def generate_iac_endpoint(
     payload: IacRequest, _: Principal = Depends(require_admin)
@@ -481,7 +563,7 @@ async def generate_iac_endpoint(
     from app.amba.iac import generate_iac
 
     gaps = [g.model_dump() for g in payload.gaps]
-    fmt = payload.format if payload.format in ("bicep", "terraform") else "bicep"
+    fmt = payload.format if payload.format in _IAC_FORMATS else "bicep"
     text = generate_iac(gaps, fmt)
     return {"format": fmt, "iac": text, "gap_count": len(gaps)}
 

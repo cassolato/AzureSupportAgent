@@ -23,6 +23,7 @@ coverage scan can be captured as an immutable, hash-stamped evidence snapshot.
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
@@ -185,6 +186,145 @@ def _bdr_remediation(failed_checks: list[str]) -> str:
 # ---------------------------------------------------------------- snapshot → normalized model
 
 
+_OPERATOR_SYMBOL = {
+    "GreaterThan": ">",
+    "GreaterThanOrEqual": "≥",
+    "LessThan": "<",
+    "LessThanOrEqual": "≤",
+    "GreaterOrLessThan": "≷",
+    "Equals": "=",
+}
+
+
+_UNITLESS = {"%", ""}
+_DURATION_RE = re.compile(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$")
+
+
+def _duration(value: Any) -> str:
+    """ISO-8601 duration as a compact label: PT15M -> 15m, PT1H -> 1h, P1D -> 1d."""
+    text = str(value or "").strip().upper()
+    match = _DURATION_RE.match(text)
+    if not match:
+        return text
+    days, hours, minutes = match.groups()
+    parts = [f"{days}d" if days else "", f"{hours}h" if hours else "", f"{minutes}m" if minutes else ""]
+    return "".join(p for p in parts if p) or text
+
+
+def _fmt_threshold(value: Any, unit: Any) -> str:
+    """A human-readable threshold: no trailing '.0', byte counts scaled, unit spaced."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"{value}{unit or ''}"
+
+    unit_text = str(unit or "").strip()
+    if unit_text in ("bytes", "bytes/s") and abs(number) >= 1024:
+        suffixes = ["B", "KB", "MB", "GB", "TB", "PB"]
+        scaled, index = abs(number), 0
+        while scaled >= 1024 and index < len(suffixes) - 1:
+            scaled /= 1024.0
+            index += 1
+        sign = "-" if number < 0 else ""
+        per_second = "/s" if unit_text == "bytes/s" else ""
+        rendered = f"{scaled:.0f}" if scaled >= 10 or scaled == int(scaled) else f"{scaled:.1f}"
+        return f"{sign}{rendered} {suffixes[index]}{per_second}"
+
+    rendered = f"{number:.0f}" if number == int(number) else f"{number:g}"
+    if not unit_text or unit_text in _UNITLESS:
+        return f"{rendered}{unit_text}"
+    return f"{rendered} {unit_text}"
+
+
+def _amba_condition(rec: dict[str, Any], alert_type: str) -> str:
+    """The baseline condition in one readable clause, per alert class."""
+    if alert_type == "activitylog":
+        activity = rec.get("activity_log") or {}
+        bits = [
+            str(activity.get(k))
+            for k in ("category", "incidentType", "operationName")
+            if activity.get(k)
+        ]
+        return " · ".join(bits)
+
+    window = rec.get("window_size") or rec.get("window") or ""
+    frequency = rec.get("evaluation_frequency") or ""
+    cadence = f"over {_duration(window)}" if window else ""
+    if frequency and frequency != window:
+        cadence = (
+            f"{cadence}, checked every {_duration(frequency)}"
+            if cadence
+            else f"checked every {_duration(frequency)}"
+        )
+
+    if alert_type == "log":
+        query = str(rec.get("log_query") or "").strip()
+        table = query.split("|", 1)[0].strip().splitlines()[-1].strip() if query else ""
+        operator = _OPERATOR_SYMBOL.get(str(rec.get("operator") or ""), rec.get("operator") or "")
+        threshold = rec.get("threshold")
+        head = f"log search on {table}" if table else "log search"
+        if threshold is not None:
+            head = f"{head} {operator} {_fmt_threshold(threshold, rec.get('unit'))}"
+        return " ".join(p for p in (head, cadence) if p)
+
+    metric = rec.get("metric") or "metric"
+    if str(rec.get("criterion_type") or "") == "DynamicThresholdCriterion":
+        sensitivity = rec.get("alert_sensitivity") or "Medium"
+        return " ".join(p for p in (f"{metric} vs dynamic threshold ({sensitivity} sensitivity)", cadence) if p)
+
+    operator = _OPERATOR_SYMBOL.get(str(rec.get("operator") or ""), rec.get("operator") or "")
+    threshold = rec.get("threshold")
+    head = (
+        f"{metric} {operator} {_fmt_threshold(threshold, rec.get('unit'))}"
+        if threshold is not None
+        else f"{metric} (exists)"
+    )
+    dims = rec.get("dimensions") or []
+    if dims:
+        rendered = ", ".join(
+            f"{d.get('name')}={'/'.join(str(v) for v in (d.get('values') or []))}" for d in dims
+        )
+        head = f"{head} where {rendered}"
+    return " ".join(p for p in (head, cadence) if p)
+
+
+def _amba_remediation(gap: dict[str, Any], alert: str, alert_type: str, condition: str) -> str:
+    """A specific, actionable fix rather than a generic 'create an alert'."""
+    observed = gap.get("observed") or {}
+    status = str(gap.get("status") or "missing")
+    rule = observed.get("rule_name") or ""
+
+    if status == "suppressed":
+        muted = ", ".join(s.get("name", "") for s in (observed.get("suppressed_by") or []) if s.get("name"))
+        return (
+            f"Alert '{rule or alert}' exists but its notifications are removed by alert processing "
+            f"rule {muted or '(unnamed)'} — narrow or disable that rule."
+        )
+
+    issues = [str(i) for i in (observed.get("issues") or []) if i]
+    if status == "misconfigured" and rule:
+        if any("no action group" in i for i in issues):
+            return f"Wire an action group to the existing '{rule}' rule."
+        if any("no receivers" in i for i in issues):
+            return f"Add a receiver to the action group used by '{rule}'."
+        if any("disabled" in i for i in issues):
+            return f"Re-enable the existing '{rule}' rule."
+        if any("threshold differs" in i for i in issues):
+            tag = observed.get("threshold_override_tag")
+            suffix = f" (or set the {tag} tag to the intended value)" if not tag else ""
+            return f"Align '{rule}' with the baseline: {condition}{suffix}."
+        if any("threshold recommended" in i for i in issues):
+            return f"Change '{rule}' to the recommended criterion: {condition}."
+        return f"Reconfigure '{rule}' to match the baseline: {condition}."
+
+    kind = {
+        "activitylog": "activity log alert",
+        "log": "log search alert",
+    }.get(alert_type, "metric alert")
+    detail = f" ({condition})" if condition else ""
+    return f"Create the '{alert}' {kind}{detail} and wire it to an action group."
+
+
 def _adapt(feature: str, snap: dict[str, Any]) -> dict[str, Any]:
     """Normalize a feature snapshot into the common model the renderer consumes."""
     meta = _FEATURE_META.get(feature, _FEATURE_META["amba"])
@@ -292,41 +432,100 @@ def _adapt(feature: str, snap: dict[str, Any]) -> dict[str, Any]:
                 })
         else:  # amba
             total = _int(kpis.get("total_resources_in_baseline"))
+            suppressed = _int(kpis.get("alerts_suppressed"))
+            excluded = _int(kpis.get("resources_excluded"))
+            action_groups = _int(kpis.get("action_groups"))
+            action_groups_usable = _int(kpis.get("action_groups_usable"))
             model["kpis"] = [
                 ("In baseline", str(total), "resources in scope"),
                 ("Alerts present", str(_int(kpis.get("alerts_present"))), "configured"),
                 ("Alerts missing", str(_int(kpis.get("alerts_missing"))), "gaps"),
-                ("Misconfigured", str(_int(kpis.get("alerts_misconfigured"))), "wrong threshold"),
+                ("Misconfigured", str(_int(kpis.get("alerts_misconfigured"))), "wrong config"),
+                ("Suppressed", str(suppressed), "muted by a rule"),
                 ("Recommended", str(_int(kpis.get("recommended_total"))), "baseline alerts"),
             ]
-            model["summary_line"] = (
-                f"{model['headline_pct'] if model['headline_pct'] is not None else 0}% of recommended baseline "
-                f"alerts are configured across {total} resources."
-            )
+            headline = model["headline_pct"] if model["headline_pct"] is not None else 0
+            summary = [
+                f"{headline}% of recommended baseline alerts are configured across {total} resources."
+            ]
+            # Notification plumbing is invisible in a plain coverage percentage but decides
+            # whether anyone is actually told, so it is called out on the summary line.
+            if suppressed:
+                summary.append(
+                    f"{suppressed} alert(s) exist but are muted by an alert processing rule."
+                )
+            if action_groups and action_groups_usable < action_groups:
+                summary.append(
+                    f"{action_groups - action_groups_usable} of {action_groups} action groups "
+                    "have no enabled receivers."
+                )
+            if excluded:
+                summary.append(f"{excluded} resource(s) opted out via the MonitorDisable tag.")
+            model["summary_line"] = " ".join(summary)
+
+            # Friendly per-type labels for the rollups (the raw ARM type's last segment
+            # renders as "storageaccounts", which reads poorly in an executive report).
+            display_by_type = {
+                str(g.get("resource_type") or "").lower(): str(g.get("display") or "")
+                for g in (snap.get("groups") or [])
+            }
+            baseline = snap.get("baseline") or {}
+            model["baseline"] = {
+                "amba_release": baseline.get("amba_release") or "",
+                "version": baseline.get("version"),
+                "tiers": list(baseline.get("tiers") or []),
+                "patterns": list(baseline.get("patterns") or []),
+            }
+            model["notification_health"] = {
+                "action_groups": action_groups,
+                "action_groups_usable": action_groups_usable,
+                "suppression_rules": _int(kpis.get("suppression_rules")),
+                "excluded": excluded,
+            }
+
             for g in snap.get("gaps") or []:
                 alert = g.get("alert_name") or g.get("alert_key") or "alert"
                 category = g.get("amba_category") or "—"
+                rec = g.get("recommended") or {}
+                observed = g.get("observed") or {}
+                alert_type = str(g.get("alert_type") or "metric")
                 why = (g.get("why") or "").strip()
+
                 parts = [f"{alert} ({category})"]
+                condition = _amba_condition(rec, alert_type)
+                if condition:
+                    parts.append(condition)
+                issues = [str(i) for i in (observed.get("issues") or []) if i]
+                if issues:
+                    parts.append("Observed: " + "; ".join(issues))
                 if why:
                     parts.append(why)
+
                 model["gaps"].append({
                     "id": g.get("resource_id") or "",
                     "name": g.get("resource_name") or "—",
                     "type": g.get("resource_type") or "—",
+                    "type_display": display_by_type.get(
+                        str(g.get("resource_type") or "").lower(), ""
+                    ),
+                    "severity": normalize_severity(g.get("severity")),
                     "rg": g.get("resource_group") or "",
                     "sub": g.get("subscription_id") or "",
-                    "severity": normalize_severity(g.get("severity")),
                     "status": g.get("status") or "missing",
                     "detail": " · ".join(parts),
-                    "fix": f"Create the '{alert}' metric alert wired to an action group",
+                    "fix": _amba_remediation(g, alert, alert_type, condition),
                 })
 
     counts: Counter[str] = Counter(normalize_severity(g["severity"]) for g in model["gaps"])
     model["severity_counts"] = {s: counts.get(s, 0) for s in SEV_ORDER}
-    # Gap rollups used by the exec + inventory sections.
+    # Gap rollups used by the exec + inventory sections. Labelled with the baseline's
+    # display name where one exists, so the report reads "Storage Account" rather than
+    # the ARM type's last segment ("storageaccounts").
     type_counts: Counter[str] = Counter(g["type"] for g in model["gaps"])
-    model["gap_type_counts"] = type_counts.most_common()
+    labels = {g["type"]: g.get("type_display") or "" for g in model["gaps"]}
+    model["gap_type_counts"] = [
+        (labels.get(t) or _short_arm(t) or t, n) for t, n in type_counts.most_common()
+    ]
     model["gapped_ids"] = {g["id"] for g in model["gaps"] if g.get("id")}
     model["gapped_names"] = {g["name"] for g in model["gaps"] if g.get("name")}
     return model
@@ -379,11 +578,60 @@ def _sev_mix_bar(model: dict[str, Any]) -> str:
     """
 
 
+def _notification_readiness(model: dict[str, Any]) -> str:
+    """Whether anyone would actually be told. A healthy coverage percentage means nothing if
+    the action groups have no receivers or a processing rule is muting everything, so this
+    is surfaced on the cover rather than buried in an appendix."""
+    notify = model.get("notification_health")
+    if not notify:
+        return ""
+    groups = _int(notify.get("action_groups"))
+    usable = _int(notify.get("action_groups_usable"))
+    suppressing = _int(notify.get("suppression_rules"))
+    excluded = _int(notify.get("excluded"))
+
+    def _cell(label: str, value: str, note: str, bad: bool) -> str:
+        color = SEV_COLOR["error"] if bad else "#16a34a"
+        return (
+            f'<td class="nr">{swatch(color)}&nbsp;<b style="color:{color}">{esc(value)}</b>'
+            f'&nbsp;{esc(label)} <span class="nr-n">{esc(note)}</span></td>'
+        )
+
+    cells = [
+        _cell(
+            "Action groups",
+            f"{usable}/{groups}" if groups else "—",
+            "with receivers" if groups else "none in scope",
+            bool(groups) and usable < groups,
+        ),
+        _cell(
+            "Processing rules",
+            str(suppressing),
+            "muting notifications",
+            suppressing > 0,
+        ),
+        _cell("Opted out", str(excluded), "MonitorDisable tag", False),
+    ]
+    return f"""
+      <div class="cover-section-lbl">Notification readiness</div>
+      <table class="nr-strip" cellpadding="0" cellspacing="0"><tr>{''.join(cells)}</tr></table>
+    """
+
+
 def _cover(model: dict[str, Any]) -> str:
     gaps = model["gaps"]
     demo_note = "demo data — not a live Azure scan" if model["demo"] else (
         "configured" if model["connection_configured"] else "not configured"
     )
+    baseline = model.get("baseline") or {}
+    baseline_row = ""
+    if baseline.get("amba_release"):
+        tiers = ", ".join(baseline.get("tiers") or []) or "all"
+        baseline_row = (
+            f'<tr><td class="k">Baseline</td>'
+            f'<td class="v">AMBA {esc(baseline["amba_release"])} · reference v{esc(str(baseline.get("version", 0)))}</td>'
+            f'<td class="k">Tiers scored</td><td class="v">{esc(tiers)}</td></tr>'
+        )
     return f"""
     <div class="cover">
       <table class="cover-hero" cellpadding="0" cellspacing="0">
@@ -404,10 +652,13 @@ def _cover(model: dict[str, Any]) -> str:
       <div class="cover-section-lbl">Open gaps by severity ({len(gaps)} total)</div>
       {_sev_mix_bar(model)}
 
+      {_notification_readiness(model)}
+
       <table class="cover-meta" cellpadding="0" cellspacing="0">
         <tr><td class="k">Scope</td><td class="v">{esc(model['scope_name'])}</td><td class="k">Scope type</td><td class="v">{esc(model['scope_kind'].title())}</td></tr>
         <tr><td class="k">Generated</td><td class="v">{fmt_date(model['generated_at'])}</td><td class="k">Connection</td><td class="v">{esc(demo_note)}</td></tr>
         <tr><td class="k">Data source</td><td class="v">{esc(model['source'])}</td><td class="k">Resources</td><td class="v">{len(model['resources'])} evaluated</td></tr>
+        {baseline_row}
       </table>
 
       <table class="cover-includes" cellpadding="0" cellspacing="0">
@@ -460,7 +711,7 @@ def _gaps_by_type_card(model: dict[str, Any]) -> str:
         body = '<tr><td>No open gaps — baseline met.</td><td class="num">0</td></tr>'
     else:
         body = "".join(
-            f'<tr><td class="viz-lb">{swatch(accent)}&nbsp;{esc_breakable(_short_arm(t) or t)}</td>'
+            f'<tr><td class="viz-lb">{swatch(accent)}&nbsp;{esc_breakable(t)}</td>'
             f'<td class="num">{n}</td></tr>'
             for t, n in rows_data
         )
@@ -523,7 +774,7 @@ def _gaps_by_type_table(model: dict[str, Any]) -> str:
     if not data:
         return ""
     cells = "".join(
-        f'<td class="gt"><b>{n}</b>&nbsp;<span class="muted">{esc_breakable(_short_arm(t) or t)}</span></td>'
+        f'<td class="gt"><b>{n}</b>&nbsp;<span class="muted">{esc_breakable(t)}</span></td>'
         for t, n in data[:6]
     )
     return f'<table class="gaptypes" cellpadding="0" cellspacing="0"><tr>{cells}</tr></table>'
@@ -552,7 +803,7 @@ def _gaps_section(model: dict[str, Any], *, anchor: str = "gaps", cap: int | Non
         rows.append(
             f'<tr>'
             f'<td>{_sev_label_chip(g["severity"])}</td>'
-            f'<td>{name_link}<br/><span class="muted">{esc_breakable(_short_arm(g["type"]) or g["type"])}</span></td>'
+            f'<td>{name_link}<br/><span class="muted">{esc_breakable(g.get("type_display") or _short_arm(g["type"]) or g["type"])}</span></td>'
             f'<td>{loc or "—"}</td>'
             f'<td>{esc(g["detail"])}</td>'
             f'<td class="fix">{esc(g.get("fix") or "—")}</td>'
@@ -617,6 +868,37 @@ def _resources_section(model: dict[str, Any], *, anchor: str = "appendix-resourc
 
 
 def _methodology(model: dict[str, Any], *, anchor: str = "appendix-meta") -> str:
+    baseline = model.get("baseline") or {}
+    notify = model.get("notification_health") or {}
+    extra_rows = ""
+    if baseline.get("amba_release"):
+        tiers = ", ".join(baseline.get("tiers") or []) or "all"
+        patterns = ", ".join(baseline.get("patterns") or []) or "all"
+        extra_rows += (
+            f'<tr><td class="k">AMBA release</td><td class="v">{esc(baseline["amba_release"])}</td></tr>'
+            f'<tr><td class="k">Reference set version</td><td class="v">v{esc(str(baseline.get("version", 0)))}</td></tr>'
+            f'<tr><td class="k">Tiers scored</td><td class="v">{esc(tiers)}</td></tr>'
+            f'<tr><td class="k">Workload patterns</td><td class="v">{esc(patterns)}</td></tr>'
+        )
+    if notify:
+        extra_rows += (
+            f'<tr><td class="k">Action groups</td><td class="v">'
+            f'{_int(notify.get("action_groups_usable"))} of {_int(notify.get("action_groups"))} with receivers'
+            f"</td></tr>"
+            f'<tr><td class="k">Alert processing rules</td><td class="v">'
+            f'{_int(notify.get("suppression_rules"))} suppressing notifications</td></tr>'
+            f'<tr><td class="k">Excluded resources</td><td class="v">'
+            f'{_int(notify.get("excluded"))} via the MonitorDisable tag</td></tr>'
+        )
+
+    baseline_note = ""
+    if baseline.get("amba_release"):
+        baseline_note = (
+            " The baseline is imported from the published Azure Monitor Baseline Alerts "
+            f"catalogue (release {esc(baseline['amba_release'])}) and may then be curated per tenant; "
+            "'core' entries are those shipped in an official AMBA policy initiative."
+        )
+
     return f"""
     <div class="pagebreak"></div>
     <a name="{anchor}"></a>
@@ -629,12 +911,13 @@ def _methodology(model: dict[str, Any], *, anchor: str = "appendix-meta") -> str
       <tr><td class="k">Connection</td><td class="v">{'configured' if model['connection_configured'] else 'demo / not configured'}</td></tr>
       <tr><td class="k">Resources evaluated</td><td class="v">{len(model['resources'])}</td></tr>
       <tr><td class="k">Open gaps</td><td class="v">{len(model['gaps'])}</td></tr>
+      {extra_rows}
     </table>
     <p class="muted" style="margin-top:8px">
       Each resource in scope is audited against an editable, versioned per-type reference baseline.
       The headline percentage is the share of in-scope resources (or recommended controls) that meet the
       baseline. Gaps roll up into the relevant Well-Architected pillar. This report renders the latest cached
-      snapshot; re-run the scan in the app to refresh.
+      snapshot; re-run the scan in the app to refresh.{baseline_note}
     </p>
     """
 
@@ -656,6 +939,12 @@ def _doc_css() -> str:
 .score-lbl {{ font-size: 10px; color: {MUTED}; margin: 2px 0 7px 0; text-transform: uppercase; letter-spacing: 0.5px; }}
 .sevmix {{ width: 100%; margin-top: 4px; font-size: 8.5px; color: {INK}; }}
 .sevmix .lb {{ padding: 1px 14px 1px 0; vertical-align: middle; }}
+
+/* notification-readiness strip on the cover — one compact row so the cover never overflows */
+.nr-strip {{ width: 100%; margin: 2px 0 4px 0; }}
+.nr-strip .nr {{ width: 33.3%; border: 0.5px solid {LINE}; background: #f9fafb;
+    padding: 4px 8px; font-size: 8.5px; color: {INK}; vertical-align: middle; }}
+.nr-n {{ font-size: 7.5px; color: {MUTED}; }}
 .lead {{ font-size: 10px; color: {INK}; margin-bottom: 6px; }}
 
 /* gaps-by-type rollup row */

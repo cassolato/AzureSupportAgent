@@ -93,9 +93,17 @@ def _series_stats(series: list[dict[str, Any]]) -> dict[str, Any]:
 def _series_key(rec: dict[str, Any]) -> str:
     """Cache key for a metric series. Two alerts can share a metric name but differ by
     dimension filter (e.g. Key Vault ServiceApiResult split into 401/403 vs 429), so the
-    filter is folded into the key to keep their series distinct."""
+    filter is folded into the key to keep their series distinct. Alerts that share a metric
+    AND its dimensions (differing only by threshold) intentionally share one series."""
     metric = rec.get("metric", "")
     dim = (rec.get("dimension_filter") or "").strip()
+    if not dim:
+        parts = []
+        for dimension in rec.get("dimensions") or []:
+            if isinstance(dimension, dict) and dimension.get("name"):
+                values = ",".join(sorted(str(v) for v in dimension.get("values") or []))
+                parts.append(f"{dimension['name']}={values}")
+        dim = ";".join(sorted(parts))
     return f"{metric}|{dim}" if dim else metric
 
 
