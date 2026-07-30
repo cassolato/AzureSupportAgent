@@ -33,6 +33,27 @@ interface QueueState {
 }
 
 const _queues = new Map<string, QueueState>();
+
+// Ceiling on jobs in flight across ALL queues, not just one.
+//
+// Each queue caps ITSELF (maxParallel 2-3), but the caps were independent: launching the
+// monitoring, telemetry and performance fleets together ran 9 estate scans at once. Every one
+// of those scans hammers Azure Resource Graph, which meters ~15 queries per 5 seconds PER
+// SECURITY PRINCIPAL — and workloads sharing a connection share that one budget. The result
+// was self-inflicted 429s that surfaced as failed scans.
+//
+// The server-side limiter (app/azure/arg_throttle.py) is the authoritative defence, since it
+// also sees other tabs, the scheduler and Mission Control. This cap is the client's half: it
+// stops the browser queueing far more work than the backend can pace, which would otherwise
+// just convert throttling into long unexplained waits.
+const GLOBAL_MAX_PARALLEL = 4;
+
+// Re-drain poll used when the global cap (not a queue's own cap) is what's blocking. Queues
+// subscribe to their OWN run registry, so queue B is never notified when queue A's job frees a
+// global slot; this timer closes that gap.
+const GLOBAL_REDRAIN_MS = 250;
+let _globalTimer: number | null = null;
+
 let _version = 0;
 const _subs = new Set<() => void>();
 function _bump() {
@@ -69,6 +90,39 @@ export function fleetRunningCount(queueId: string): number {
 export function fleetOutstanding(queueId: string): number {
   const q = _queues.get(queueId);
   return q ? q.pending.length + q.started.size : 0;
+}
+
+/** Drop finished jobs from a queue's started set (its run registry is the source of truth). */
+function _reap(q: QueueState): void {
+  for (const k of [...q.started]) {
+    if (!q.isRunning(k)) q.started.delete(k);
+  }
+}
+
+/** Live job count across every queue, reaping finished jobs first so the count is exact. */
+function _runningTotal(): number {
+  let total = 0;
+  for (const q of _queues.values()) {
+    _reap(q);
+    total += q.started.size;
+  }
+  return total;
+}
+
+function _pendingAnywhere(): boolean {
+  for (const q of _queues.values()) {
+    if (q.pending.length > 0) return true;
+  }
+  return false;
+}
+
+/** Poll every queue again shortly — used when the GLOBAL cap is the blocker. */
+function _scheduleGlobalRedrain(): void {
+  if (_globalTimer != null || !_pendingAnywhere()) return;
+  _globalTimer = window.setTimeout(() => {
+    _globalTimer = null;
+    for (const id of [..._queues.keys()]) _drain(id);
+  }, GLOBAL_REDRAIN_MS);
 }
 
 /**
@@ -134,11 +188,15 @@ function _drain(queueId: string): void {
     do {
       q.redrainRequested = false;
       // Reap jobs we started that are no longer running.
-      for (const k of [...q.started]) {
-        if (!q.isRunning(k)) q.started.delete(k);
-      }
+      _reap(q);
       // Fill open slots ONE AT A TIME, re-reading started.size each iteration so the cap is exact.
       while (q.started.size < q.maxParallel && q.pending.length > 0) {
+        // Respect the cross-queue ceiling as well as this queue's own. Another fleet may be
+        // using the budget; wait for a slot rather than piling more scans onto Azure.
+        if (_runningTotal() >= GLOBAL_MAX_PARALLEL) {
+          _scheduleGlobalRedrain();
+          break;
+        }
         // Honor the start stagger: if not enough time has passed since the last start, defer the
         // next fill to a timer instead of bursting. (Re-drain fires again after the gap.)
         if (q.staggerMs > 0) {
@@ -169,5 +227,7 @@ function _drain(queueId: string): void {
     q.unsubscribe?.();
     _queues.delete(queueId);
   }
+  // This queue may have just freed a global slot another queue is waiting on.
+  _scheduleGlobalRedrain();
   _bump();
 }

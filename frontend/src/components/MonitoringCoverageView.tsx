@@ -743,6 +743,22 @@ export function MonitoringCoveragePanel() {
         </div>
       )}
 
+      {/* A refresh that failed leaves the previous scan on screen rather than blanking it to 0%.
+          Say so explicitly, and separate "Azure throttled us" from "the scan actually broke". */}
+      {data?.scan_error && (
+        <div className={`mx-6 mt-2 rounded-lg border p-2 text-xs ${data.scan_throttled ? "border-amber-200 bg-amber-50 text-amber-800" : "border-red-200 bg-red-50 text-red-700"}`}>
+          {data.scan_throttled ? (
+            <>
+              <b>Azure throttled this scan.</b> Resource Graph limits queries per identity, and
+              several scans were competing for that budget. The results below are from the previous
+              scan — they were not overwritten. Try again in a moment.
+            </>
+          ) : (
+            <><b>This scan didn't complete.</b> Showing the previous result. {data.scan_error}</>
+          )}
+        </div>
+      )}
+
       {/* Body */}
       <div className="min-h-0 flex-1 overflow-auto px-6 py-4">
         <PageIntro {...PAGE_INTROS["/coverage"]} icon="📡" storageKey="coverage" />
@@ -780,7 +796,21 @@ export function MonitoringCoveragePanel() {
         ) : tab === "all" ? (
           <AllResourcesTab resources={data?.all_resources ?? []} />
         ) : data?.error ? (
-          <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-700">{data.error}</div>
+          <div className={`rounded-lg border p-4 text-sm ${data.throttled ? "border-amber-200 bg-amber-50 text-amber-800" : "border-red-200 bg-red-50 text-red-700"}`}>
+            {data.throttled ? (
+              <>
+                <div className="font-medium">Azure throttled this scan — coverage couldn't be evaluated.</div>
+                <div className="mt-1 text-xs">
+                  Resource Graph limits how many queries an identity may run in a short window, and
+                  this scan exceeded it. This is <b>not</b> a coverage result: nothing here says the
+                  scope is unmonitored. Run the scan again — ideally with fewer workloads at once.
+                </div>
+                <button onClick={() => void doRefresh()} disabled={refreshing} className="mt-2 rounded-lg border border-amber-300 bg-white px-2.5 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50">
+                  {refreshing ? "Scanning…" : "↻ Retry scan"}
+                </button>
+              </>
+            ) : data.error}
+          </div>
         ) : visibleGroups.length === 0 ? (
           <div className="py-16 text-center text-sm text-gray-400">
             No resources match the current scope/filters, or none are covered by the baseline reference.

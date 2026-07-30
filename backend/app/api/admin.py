@@ -117,6 +117,11 @@ class AppSettingsUpdate(BaseModel):
     # Change Explorer.
     changeexplorer_resolve_identities: bool | None = None
     changeexplorer_change_limit: int | None = None
+    # Azure Resource Graph pacing. ARG meters ~15 queries / 5s per security principal,
+    # shared tenant-wide, so the default leaves headroom for other tooling.
+    arg_rate_limit_enabled: bool | None = None
+    arg_max_queries_per_window: int | None = Field(default=None, ge=1, le=100)
+    arg_rate_window_seconds: int | None = Field(default=None, ge=1, le=60)
 
 
 @router.get("/settings")

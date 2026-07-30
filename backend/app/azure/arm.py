@@ -262,6 +262,8 @@ async def query_resource_graph(
     query: str,
     subscriptions: list[str] | None = None,
     top: int = 1000,
+    *,
+    max_retries: int = 4,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Run a Resource Graph (KQL) query via ARM REST. Returns (rows, error).
 
@@ -270,7 +272,17 @@ async def query_resource_graph(
     pasted-token connection). Omitting ``subscriptions`` queries across every subscription
     the token's identity can access in the tenant — matching ``az graph query`` default
     scoping.
+
+    Paced by :mod:`app.azure.arg_throttle` and retried on throttle (429) / transient 5xx
+    with exponential backoff + jitter, honoring ``Retry-After``. Without this a single 429 —
+    easily provoked by a fleet launch, since ARG meters ~15 queries/5s per principal — would
+    abort the whole calling scan.
     """
+    import asyncio
+    import random
+
+    from app.azure import arg_throttle
+
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     options: dict[str, Any] = {"resultFormat": "objectArray"}
     if top:
@@ -280,21 +292,40 @@ async def query_resource_graph(
         body["subscriptions"] = subscriptions
     try:
         async with httpx.AsyncClient(timeout=60, base_url=_ARM) as client:
-            resp = await client.post(
-                "/providers/Microsoft.ResourceGraph/resources",
-                params={"api-version": "2022-10-01"},
-                headers=headers,
-                json=body,
-            )
-        if resp.status_code != 200:
-            try:
-                detail = resp.json().get("error", {}).get("message", resp.text)
-            except (ValueError, AttributeError):
-                detail = resp.text
-            return [], f"Resource Graph {resp.status_code}: {str(detail)[:300]}"
-        data = resp.json()
-        rows = data.get("data", [])
-        return (rows if isinstance(rows, list) else []), None
+            for attempt in range(max_retries + 1):
+                await arg_throttle.acquire()
+                try:
+                    resp = await client.post(
+                        "/providers/Microsoft.ResourceGraph/resources",
+                        params={"api-version": "2022-10-01"},
+                        headers=headers,
+                        json=body,
+                    )
+                except httpx.HTTPError as e:  # noqa: BLE001 - transient network
+                    if attempt >= max_retries:
+                        return [], f"Resource Graph request error: {e}"
+                    await asyncio.sleep(min(30.0, (2 ** attempt) + random.uniform(0, 0.5)))
+                    continue
+
+                arg_throttle.note_quota_headers(resp.headers)
+                if resp.status_code in _RETRYABLE_STATUS:
+                    retry_after = _retry_after_seconds(resp)
+                    if resp.status_code == 429:
+                        arg_throttle.note_throttled(retry_after)
+                    if attempt < max_retries:
+                        delay = retry_after if retry_after is not None else (2 ** attempt) + random.uniform(0, 0.5)
+                        await asyncio.sleep(min(60.0, delay))
+                        continue
+                if resp.status_code != 200:
+                    try:
+                        detail = resp.json().get("error", {}).get("message", resp.text)
+                    except (ValueError, AttributeError):
+                        detail = resp.text
+                    return [], f"Resource Graph {resp.status_code}: {str(detail)[:300]}"
+                data = resp.json()
+                rows = data.get("data", [])
+                return (rows if isinstance(rows, list) else []), None
+        return [], "Resource Graph request failed."
     except httpx.HTTPError as e:  # noqa: BLE001
         return [], f"Resource Graph request error: {e}"
 
@@ -326,10 +357,14 @@ async def query_resource_graph_paged(
                    ``rows`` was capped), or None if ARG didn't report it.
 
     Throttling (429) and transient 5xx responses are retried with exponential backoff +
-    jitter, honoring a ``Retry-After`` header when present.
+    jitter, honoring a ``Retry-After`` header when present. Each page is a separately metered
+    ARG query, so every page passes through :mod:`app.azure.arg_throttle` — a 10-page scan
+    costs 10 units of the principal's ~15-per-5s budget.
     """
     import asyncio
     import random
+
+    from app.azure import arg_throttle
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     rows: list[dict[str, Any]] = []
@@ -352,6 +387,7 @@ async def query_resource_graph_paged(
                 resp = None
                 last_err = ""
                 for attempt in range(max_retries + 1):
+                    await arg_throttle.acquire()
                     try:
                         resp = await client.post(
                             "/providers/Microsoft.ResourceGraph/resources",
@@ -366,11 +402,15 @@ async def query_resource_graph_paged(
                             return rows, last_err, False, total
                         await asyncio.sleep(min(30.0, (2 ** attempt) + random.uniform(0, 0.5)))
                         continue
-                    if resp.status_code in _RETRYABLE_STATUS and attempt < max_retries:
+                    arg_throttle.note_quota_headers(resp.headers)
+                    if resp.status_code in _RETRYABLE_STATUS:
                         retry_after = _retry_after_seconds(resp)
-                        delay = retry_after if retry_after is not None else (2 ** attempt) + random.uniform(0, 0.5)
-                        await asyncio.sleep(min(60.0, delay))
-                        continue
+                        if resp.status_code == 429:
+                            arg_throttle.note_throttled(retry_after)
+                        if attempt < max_retries:
+                            delay = retry_after if retry_after is not None else (2 ** attempt) + random.uniform(0, 0.5)
+                            await asyncio.sleep(min(60.0, delay))
+                            continue
                     break
 
                 if resp is None:

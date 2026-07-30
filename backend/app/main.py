@@ -181,6 +181,30 @@ async def _startup() -> None:
             logging.getLogger("app.main").info("Reaped %d orphaned mission(s)", reaped_missions)
     except Exception:  # noqa: BLE001
         logging.getLogger("app.main").warning("Mission orphan reaper failed", exc_info=True)
+    # One-off cleanup: drop coverage snapshots that recorded a hard scan failure. Coverage
+    # GETs are cached-only, so a scan that died mid-flight (classically an ARG 429 during a
+    # fleet launch) used to persist as a 0%-coverage snapshot and render as the workload's
+    # real posture until someone manually rescanned. Failures are no longer cached; this
+    # clears the ones already on disk. Idempotent, so it stays safe on every boot.
+    from app.amba import cache as _amba_cache
+    from app.backupdr import cache as _backupdr_cache
+    from app.telemetry import cache as _telemetry_cache
+
+    for _label, _cache_mod in (
+        ("monitoring", _amba_cache),
+        ("telemetry", _telemetry_cache),
+        ("backup/DR", _backupdr_cache),
+    ):
+        try:
+            _purged = _cache_mod.purge_errored()
+            if _purged:
+                logging.getLogger("app.main").info(
+                    "Purged %d errored %s coverage snapshot(s)", _purged, _label
+                )
+        except Exception:  # noqa: BLE001
+            logging.getLogger("app.main").warning(
+                "Errored %s coverage snapshot purge failed", _label, exc_info=True
+            )
     # Seed the curated starter sub-agents (a full Azure troubleshooting team) on first run,
     # then backfill categories. Both idempotent (seed only when the registry is empty).
     from app.automations.agents import seed_categories, seed_if_empty

@@ -530,6 +530,13 @@ export type AmbaCoverage = {
   excluded_resources: AmbaExcludedResource[];
   suppression_rules: AmbaSuppressionRule[];
   error: string;
+  // True when `error` was Azure Resource Graph throttling (429) rather than a real fault.
+  // "Could not evaluate, retry shortly" — NOT "this scope has no coverage".
+  throttled?: boolean;
+  // Set when a forced refresh FAILED: the payload is the previous good snapshot (failures are
+  // never cached), and these carry why the refresh didn't produce a new measurement.
+  scan_error?: string;
+  scan_throttled?: boolean;
   ttl_s: number;
   age_seconds: number | null;
   stale: boolean;
@@ -10695,6 +10702,11 @@ export interface AppSettings {
   // Change Explorer.
   changeexplorer_resolve_identities?: boolean;
   changeexplorer_change_limit?: number;
+  // Azure Resource Graph pacing. ARG meters ~15 queries / 5s per security principal, shared
+  // tenant-wide, so the app paces its own traffic server-side rather than trusting each caller.
+  arg_rate_limit_enabled?: boolean;
+  arg_max_queries_per_window?: number;
+  arg_rate_window_seconds?: number;
 }
 
 export interface ChatgptStatus {

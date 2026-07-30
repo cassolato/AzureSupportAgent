@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type AmbaCoverageFleetRow } from "../../api";
 import { queryClient } from "../../queryClient";
@@ -10,6 +10,10 @@ import { enqueueFleet, fleetOutstanding, fleetQueuedKeys, useFleetQueue } from "
 const MAX_PARALLEL = 3;
 const STAGGER_MS = 400;
 const QUEUE_ID = "ambaCoverageFleet";
+// Azure's Resource Graph query budget refills in seconds, so a throttled scan is worth one
+// automatic retry before bothering the operator. Long enough for the window to reset and for
+// sibling scans in the batch to finish drawing on the same budget.
+const AUTO_RETRY_MS = 15_000;
 
 type SortKey = "worst" | "coverage" | "missing" | "misconfigured" | "resources" | "name" | "run_at";
 type SortDir = "asc" | "desc";
@@ -103,6 +107,17 @@ export function MonitoringCoverageFleet({ onOpenWorkload }: { onOpenWorkload: (w
             queryClient.invalidateQueries({ queryKey: ["amba-trend", "workload", row.workload_id] }),
             queryClient.invalidateQueries({ queryKey: ["coverage-runs", "amba", "workload", row.workload_id] }),
           ]);
+          // A scan that couldn't complete still returns 200 — failures are never cached, so the
+          // body is the PREVIOUS snapshot. Raise it as an error so the row lands in "Retry
+          // failed" instead of silently looking like a successful rescan.
+          const failure = snapshot.scan_error || snapshot.error;
+          if (failure) {
+            throw new Error(
+              snapshot.scan_throttled || snapshot.throttled
+                ? "Azure throttled this scan — retrying shortly."
+                : failure,
+            );
+          }
         }),
       })),
       { maxParallel: MAX_PARALLEL, staggerMs: STAGGER_MS, isRunning: isRefreshing, subscribe: subscribeBackgroundRefresh },
@@ -125,6 +140,30 @@ export function MonitoringCoverageFleet({ onOpenWorkload }: { onOpenWorkload: (w
     enqueueRows(failedRows);
     setMessage({ text: `Retrying ${failedRows.length} failed coverage scan${failedRows.length === 1 ? "" : "s"}…`, ok: true });
   }
+
+  // Throttling is transient, so requeue throttled workloads automatically — ONCE each, after a
+  // pause. The ref makes the retry idempotent per workload so a scan that keeps getting
+  // throttled falls back to the manual "Retry failed" button instead of looping forever.
+  const autoRetried = useRef<Set<string>>(new Set());
+  const throttledKeys = rows
+    .map(refreshKey)
+    .filter((key) => (
+      !isRefreshing(key) && !queuedKeys.has(key) && !autoRetried.current.has(key)
+      && /throttl/i.test(peekRefreshError(key) || "")
+    ))
+    .join("|");
+  useEffect(() => {
+    if (!throttledKeys) return;
+    const keys = new Set(throttledKeys.split("|"));
+    const timer = window.setTimeout(() => {
+      keys.forEach((key) => autoRetried.current.add(key));
+      enqueueRows(rows.filter((row) => keys.has(refreshKey(row))));
+      setMessage({ text: `Azure throttled ${keys.size} scan${keys.size === 1 ? "" : "s"}. Retrying automatically…`, ok: true });
+    }, AUTO_RETRY_MS);
+    return () => window.clearTimeout(timer);
+    // `throttledKeys` is a stable joined string, so this re-arms only when the set changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [throttledKeys]);
 
   function clickSort(key: SortKey, defaultDirection: SortDir = "desc") {
     if (sortKey === key) setSortDir((current) => current === "asc" ? "desc" : "asc");
