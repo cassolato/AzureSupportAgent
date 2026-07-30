@@ -147,7 +147,7 @@ def test_resolve_via_workload_membership(monkeypatch):
     across the dev 'default' vs real-tenant id mismatch (workloads are global)."""
     import app.workloads.registry as wlreg
 
-    wl = {"id": "wl-apricer", "name": "APricer", "tenant_id": "739fb5dd-real-tenant",
+    wl = {"id": "wl-apricer", "name": "APricer", "tenant_id": "tenant-aaaa-real",
           "nodes": [{"kind": "resource", "id": RID}]}
     monkeypatch.setattr(wlreg, "list_workloads", lambda *a, **k: [wl])
 

@@ -28,8 +28,8 @@ LEAKED = (
     "</function_calls>\n"
     '<invoke name="containerapp">\n'
     '<parameter name="command">containerapp_list</parameter>\n'
-    '<parameter name="subscription">c3f6ae08-38a1-466d-abc2-972ad76b8661</parameter>\n'
-    '<parameter name="resource_group">rg-azsupagent</parameter>\n'
+    '<parameter name="subscription">11111111-2222-3333-4444-555555555555</parameter>\n'
+    '<parameter name="resource_group">rg-demo-app</parameter>\n'
     "</invoke>\n"
     "</function_calls>\n"
 )
@@ -44,8 +44,8 @@ def test_parses_invoke_blocks_including_malformed_wrapper():
     }
     assert calls[1].arguments == {
         "command": "containerapp_list",
-        "subscription": "c3f6ae08-38a1-466d-abc2-972ad76b8661",
-        "resource_group": "rg-azsupagent",
+        "subscription": "11111111-2222-3333-4444-555555555555",
+        "resource_group": "rg-demo-app",
     }
 
 
@@ -53,12 +53,12 @@ def test_coerces_numeric_and_keeps_guid_string():
     xml = (
         '<invoke name="monitor"><parameter name="hours">24</parameter>'
         '<parameter name="enabled">true</parameter>'
-        '<parameter name="sub">c3f6ae08-38a1-466d-abc2-972ad76b8661</parameter></invoke>'
+        '<parameter name="sub">11111111-2222-3333-4444-555555555555</parameter></invoke>'
     )
     (call,) = parse_anthropic_function_calls(xml)
     assert call.arguments["hours"] == 24
     assert call.arguments["enabled"] is True
-    assert call.arguments["sub"] == "c3f6ae08-38a1-466d-abc2-972ad76b8661"
+    assert call.arguments["sub"] == "11111111-2222-3333-4444-555555555555"
 
 
 def test_unescapes_html_entities_in_values():

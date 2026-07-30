@@ -108,7 +108,7 @@ You generate short follow-up suggestions for an Azure troubleshooting chat.
 Given the conversation so far, propose 4 concise next actions the user might pick.
 Rules:
 - Each suggestion is an imperative request the agent can act on (e.g. "Check NSGs in \
-CS Demo Sub for open inbound rules").
+the production subscription for open inbound rules").
 - Max 9 words each. No numbering, no quotes, no trailing punctuation.
 - Make them specific to the conversation context and to Azure troubleshooting.
 - Output ONLY the 4 suggestions, one per line, nothing else.
@@ -158,7 +158,7 @@ Examples:
 - "Check NSGs blocking traffic" -> NEEDS_SUBSCRIPTION
 - "List public IPs across all my subscriptions" -> OK
 - "List my subscriptions" -> OK
-- "Find NSGs in CS Demo Sub" -> OK
+- "Find NSGs in the Contoso Production subscription" -> OK
 - "How do private endpoints work?" -> OK
 """
 

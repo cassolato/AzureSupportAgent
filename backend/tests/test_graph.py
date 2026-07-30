@@ -25,7 +25,7 @@ def test_rg_and_finding_ids_compose():
 # --------------------------------------------------------------------- overview
 def _overview():
     return A.build_overview(
-        connection={"id": "c1", "display_name": "khspn", "tenant_id": "t", "status": "ok", "is_default": True},
+        connection={"id": "c1", "display_name": "conn-a", "tenant_id": "t", "status": "ok", "is_default": True},
         subscriptions=[
             {"id": "sub-1", "name": "Sub One", "resource_count": 12},
             {"id": "sub-2", "name": "Sub Two", "resource_count": 0},
