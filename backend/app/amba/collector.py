@@ -81,10 +81,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_rows(stdout: str) -> list[dict[str, Any]]:
-    from app.exec.command_runner import parse_kql_rows
+# Markers that identify an ARG throttling failure (``429 RateLimiting``) as opposed to a real
+# fault like a permission gap. A throttle means "could not evaluate, try again shortly" — very
+# different from a scan that genuinely found nothing, and the UI says so.
+_THROTTLE_MARKERS = ("429", "ratelimiting", "rate limit", "too many requests", "throttl")
 
-    return parse_kql_rows(stdout)
+
+def _is_throttle_error(error: str) -> bool:
+    blob = (error or "").lower()
+    return any(marker in blob for marker in _THROTTLE_MARKERS)
 
 
 def _esc(val: str) -> str:
@@ -715,6 +720,11 @@ def _match_status(
 
 
 # --------------------------------------------------------------------------- ARG queries
+# Ceiling for the paged alert-rule collection. Matches the estate-wide ceiling used by
+# ``query_resources_batched``; large tenants legitimately hold thousands of rules.
+_ALERT_QUERY_MAX_ROWS = 10_000
+
+
 async def _query_resources(predicates: list[str], connection: dict[str, Any] | None) -> list[dict[str, Any]]:
     from app.assessments.runner import query_resources_batched
 
@@ -726,8 +736,22 @@ async def _query_resources(predicates: list[str], connection: dict[str, Any] | N
 
 
 async def _query_alerts(subscriptions: list[str], connection: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Alert rules, action groups and alert processing rules across the in-scope subscriptions."""
-    from app.exec.command_runner import KQL_RESOURCE_CAPTURE_BYTES, run_kql_capture
+    """Alert rules, action groups and alert processing rules across the in-scope subscriptions.
+
+    Uses the PAGED, retrying collector rather than a single capture. Two reasons:
+
+    - **Correctness.** The old ``take 5000`` was never honoured: both the REST and CLI capture
+      paths cap a single page at 1000 rows (``KQL_MAX_ROWS`` / ``--first 1000``, and ARG itself
+      caps a page at 1000). A tenant with more than 1000 alert rules + action groups +
+      processing rules silently lost the remainder, and every rule that fell off the end made
+      its resource read as MISSING. Adding action groups and processing rules to this query made
+      hitting that ceiling considerably more likely.
+    - **Resilience.** The capture path has no retry, so one 429 aborted the entire scan into an
+      empty errored snapshot. ``run_kql_collect`` retries throttling with backoff.
+
+    Ordered by id so ``$skipToken`` paging is deterministic.
+    """
+    from app.exec.command_runner import run_kql_collect
 
     if not subscriptions:
         return []
@@ -737,12 +761,12 @@ async def _query_alerts(subscriptions: list[str], connection: dict[str, Any] | N
         f"| where type in~ ('{_METRIC_RULE}', '{_LOG_RULE}', '{_ACTIVITY_RULE}', "
         f"'{_ACTION_GROUP}', '{_ACTION_RULE}') "
         f"| where subscriptionId in~ ({joined}) "
-        "| project id, name, type, properties | take 5000"
+        "| project id, name, type, properties | order by id asc"
     )
-    cap = await run_kql_capture(kql, connection, output="json", max_bytes=KQL_RESOURCE_CAPTURE_BYTES)
-    if not cap.ok:
-        raise RuntimeError(cap.error or "Alert-rule query failed.")
-    return _parse_rows(cap.stdout)
+    res = await run_kql_collect(kql, connection, max_rows=_ALERT_QUERY_MAX_ROWS)
+    if not res.ok:
+        raise RuntimeError(res.error or "Alert-rule query failed.")
+    return res.rows
 
 
 # --------------------------------------------------------------------------- public API
@@ -1096,6 +1120,7 @@ async def collect_coverage(
             "source": "azure_resource_graph",
             "demo": False,
             "error": "",
+            "throttled": False,
         }
     )
     return snap
@@ -1130,4 +1155,5 @@ def _empty_snapshot(scope_kind: str, scope_id: str, *, error: str) -> dict[str, 
         "suppression_rules": [],
         "all_resources": [],
         "error": error,
+        "throttled": _is_throttle_error(error),
     }

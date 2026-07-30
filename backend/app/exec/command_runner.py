@@ -631,7 +631,12 @@ async def run_kql_stream(
     reuse this already-authenticated AZURE_CONFIG_DIR instead of doing a fresh ``az login``
     per query — a big speedup when running many queries (e.g. cache prefetch). The caller
     owns that dir's lifecycle.
+
+    Both paths are paced by :mod:`app.azure.arg_throttle` against the connection's security
+    principal, which is what Azure actually meters (~15 queries/5s, shared tenant-wide).
     """
+    from app.azure import arg_throttle
+
     settings = load_settings()
 
     query = (kql or "").strip()
@@ -663,7 +668,8 @@ async def run_kql_stream(
         if token:
             yield {"type": "exec_start", "command": "resource-graph (REST)", "destructive": False}
             start = time.time()
-            rows, qerr = await query_resource_graph(token, query, top=KQL_MAX_ROWS)
+            with arg_throttle.use_principal(connection):
+                rows, qerr = await query_resource_graph(token, query, top=KQL_MAX_ROWS)
             duration_ms = int((time.time() - start) * 1000)
             if qerr:
                 yield {"type": "error", "message": qerr}
@@ -717,6 +723,10 @@ async def run_kql_stream(
             "--output", output,
         ]
         label = f"az graph query (KQL, first {KQL_MAX_ROWS})"
+        # `az graph query` hits the same metered ARG endpoint as the REST path — pace it too,
+        # otherwise a service-principal connection bypasses the limiter entirely.
+        with arg_throttle.use_principal(connection):
+            await arg_throttle.acquire()
         async for ev in _stream_process(run_argv, env, timeout, label=label, destructive=False, max_bytes=max_bytes):
             yield ev
     finally:
@@ -815,6 +825,9 @@ async def run_kql_capture(
 KQL_COLLECT_MAX_ROWS = 5000
 # Substrings in CLI stderr that indicate a transient/throttle condition worth retrying.
 _CLI_RETRYABLE = ("429", "toomanyrequests", "throttl", "rate limit", "timed out", "503", "502", "504", "500 ")
+# The subset of the above that means "you exceeded the ARG quota" specifically — only these
+# should back the shared rate limiter off (a timeout or a 503 is not a quota signal).
+_CLI_THROTTLE = ("429", "toomanyrequests", "throttl", "rate limit")
 
 
 @dataclass
@@ -894,11 +907,14 @@ async def run_kql_collect(
       ``error`` (excluded from the score) instead of a false ``pass``.
 
     Mirrors ``run_kql_stream``'s SP-vs-REST branching so it works under service principals,
-    managed identity / pasted tokens (REST), and ambient local ``az`` login.
+    managed identity / pasted tokens (REST), and ambient local ``az`` login. Every page is
+    paced by :mod:`app.azure.arg_throttle` against the connection's security principal.
     """
     import asyncio
     import json as _json
     import random
+
+    from app.azure import arg_throttle
 
     query, qerr = _normalize_kql(kql)
     if qerr:
@@ -916,9 +932,10 @@ async def run_kql_collect(
 
         token, terr = await get_arm_token(connection)
         if token:
-            rows, err, complete, total = await query_resource_graph_paged(
-                token, query, page_size=page_size, max_rows=max_rows
-            )
+            with arg_throttle.use_principal(connection):
+                rows, err, complete, total = await query_resource_graph_paged(
+                    token, query, page_size=page_size, max_rows=max_rows
+                )
             if err:
                 return KqlResult(ok=False, rows=rows, error=err, complete=False, total=total)
             return KqlResult(ok=True, rows=rows, complete=complete, total=total)
@@ -956,11 +973,18 @@ async def run_kql_collect(
         for _page in range(200):
             cap: CaptureResult | None = None
             for attempt in range(max_retries + 1):
+                with arg_throttle.use_principal(connection):
+                    await arg_throttle.acquire()
                 cap = await _graph_page_cli(az_path, query, env, timeout, page_size, skip_token, max_bytes=max_bytes)
                 if cap.ok:
                     break
                 blob = f"{cap.error} {cap.stderr}".lower()
                 transient = any(s in blob for s in _CLI_RETRYABLE)
+                if any(s in blob for s in _CLI_THROTTLE):
+                    # Back the shared limiter off too, so sibling scans on this principal slow
+                    # down instead of each discovering the quota wall independently.
+                    with arg_throttle.use_principal(connection):
+                        arg_throttle.note_throttled(None)
                 if transient and attempt < max_retries:
                     await asyncio.sleep(min(60.0, (2 ** attempt) + random.uniform(0, 0.5)))
                     continue

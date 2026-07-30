@@ -88,6 +88,14 @@ DEFAULTS: dict[str, Any] = {
     # baseline comparisons. Recipient destinations are always masked/fingerprinted.
     "alert_analysis_cache_ttl_s": 21600,
     "alert_analysis_threshold_tolerance_pct": 10,
+    # --- Azure Resource Graph pacing ----------------------------------------------
+    # ARG meters ~15 queries per 5s PER SECURITY PRINCIPAL, shared tenant-wide. Fleet
+    # launches, the scheduler and Mission Control all draw on that one budget, so the app
+    # paces its own ARG traffic server-side (the only layer that sees every caller).
+    # Default 12/5s leaves headroom for other tooling in the tenant.
+    "arg_rate_limit_enabled": True,
+    "arg_max_queries_per_window": 12,
+    "arg_rate_window_seconds": 5,
     # --- Deep investigation -------------------------------------------------------
     # Run multiple hypothesis sub-agents at once (parallel validation), then combine
     # their evidence at the conclusion. Speeds up deep investigations significantly.
@@ -394,6 +402,14 @@ def save_settings(updates: dict[str, Any]) -> dict[str, Any]:
     current["command_timeout_seconds"] = max(5, min(900, int(current["command_timeout_seconds"])))
     current["deep_parallel_count"] = max(1, min(12, int(current.get("deep_parallel_count", 12))))
     current["deep_parallel_enabled"] = bool(current.get("deep_parallel_enabled", True))
+    # ARG pacing: keep the window sane and the burst under Azure's documented 15/5s.
+    current["arg_rate_limit_enabled"] = bool(current.get("arg_rate_limit_enabled", True))
+    current["arg_max_queries_per_window"] = max(
+        1, min(100, int(current.get("arg_max_queries_per_window", 12)))
+    )
+    current["arg_rate_window_seconds"] = max(
+        1, min(60, int(current.get("arg_rate_window_seconds", 5)))
+    )
     # Sanitize the command allowlist: keep only permitted, de-duplicated binaries.
     raw_allow = current.get("command_allowlist") or ["az"]
     if not isinstance(raw_allow, list):

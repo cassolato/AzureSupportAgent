@@ -3223,6 +3223,9 @@ function ScoringTaxonomyCard() {
         policy_exemption_block_never_expires: form.policy_exemption_block_never_expires,
         changeexplorer_resolve_identities: form.changeexplorer_resolve_identities,
         changeexplorer_change_limit: form.changeexplorer_change_limit,
+        arg_rate_limit_enabled: form.arg_rate_limit_enabled,
+        arg_max_queries_per_window: form.arg_max_queries_per_window,
+        arg_rate_window_seconds: form.arg_rate_window_seconds,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
@@ -3809,6 +3812,44 @@ function AppSettingsCard() {
             step={500}
             suffix="changes"
             onChange={(v) => set({ changeexplorer_change_limit: v })}
+          />
+        </div>
+      </Card>
+
+      <Card title="Azure Resource Graph pacing">
+        <p className="mb-2 text-xs text-gray-500">
+          Azure meters Resource Graph queries <b>per security principal</b> — roughly 15 every 5
+          seconds, shared across everything using that identity. Fleet scans, scheduled runs and
+          Mission Control all draw on the same budget, so the app paces its own queries server-side
+          and retries anything Azure still throttles. Lower the allowance if other tooling in your
+          tenant needs more headroom.
+        </p>
+        <Toggle
+          label="Pace Resource Graph queries"
+          hint="Strongly recommended. With this off, a fleet scan can exhaust the quota and scans start failing with 429 RateLimiting. Retry still applies, but recovery is slower and noisier than simply not tripping the limit."
+          checked={form.arg_rate_limit_enabled ?? true}
+          onChange={(v) => set({ arg_rate_limit_enabled: v })}
+        />
+        <div className="mt-2 grid gap-3 sm:grid-cols-2">
+          <NumberField
+            label="Queries per window"
+            hint="How many Resource Graph queries this app may start per window, per identity. Default 12 — deliberately under Azure's ~15 so other tools keep headroom."
+            value={form.arg_max_queries_per_window ?? 12}
+            min={1}
+            max={100}
+            step={1}
+            suffix="queries"
+            onChange={(v) => set({ arg_max_queries_per_window: v })}
+          />
+          <NumberField
+            label="Window length"
+            hint="The window the allowance is measured over. Default 5 seconds, matching Azure's own quota window."
+            value={form.arg_rate_window_seconds ?? 5}
+            min={1}
+            max={60}
+            step={1}
+            suffix="seconds"
+            onChange={(v) => set({ arg_rate_window_seconds: v })}
           />
         </div>
       </Card>

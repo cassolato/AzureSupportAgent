@@ -72,6 +72,31 @@ def delete_snapshot(tenant_id: str, scope_kind: str, scope_id: str) -> bool:
     return False
 
 
+def purge_errored() -> int:
+    """Drop cached snapshots that recorded a hard scan failure. Returns the count removed.
+
+    A failed scan used to be persisted like any other result — an empty snapshot with 0%
+    coverage and an ``error`` string. Because the coverage GET is cached-only, that failure
+    then rendered as the workload's posture indefinitely: a single throttled scan could show
+    "0% covered" for weeks. Failures are no longer written, but this clears the ones already
+    on disk. Idempotent, so it is safe to run on every startup.
+    """
+    data = _read()
+    removed = 0
+    for bucket in data.values():
+        if not isinstance(bucket, dict):
+            continue
+        for key in [
+            k for k, v in bucket.items()
+            if isinstance(v, dict) and str(v.get("error") or "").strip()
+        ]:
+            del bucket[key]
+            removed += 1
+    if removed:
+        _write(data)
+    return removed
+
+
 def age_seconds(snapshot: dict[str, Any]) -> float | None:
     ts = snapshot.get("generated_at")
     if not ts:

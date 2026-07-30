@@ -121,6 +121,19 @@ async def _get_snapshot(
             workload=workload,
             options=_coverage_options(),
         )
+        if str(fresh.get("error") or "").strip():
+            # A failed scan is NOT a result. Persisting it would overwrite the last good
+            # snapshot with an empty 0%-coverage one — and because coverage GETs are
+            # cached-only, that failure would then render as the workload's real posture
+            # until someone manually rescanned. Keep the cache intact and hand the caller
+            # the previous snapshot annotated with why this refresh failed.
+            previous = cache.read_snapshot(tenant_id, scope_kind, scope_id)
+            if previous:
+                out = _decorate(previous, ttl)
+                out["scan_error"] = fresh.get("error", "")
+                out["scan_throttled"] = bool(fresh.get("throttled"))
+                return out
+            return _decorate(fresh, ttl)
         cache.write_snapshot(tenant_id, scope_kind, scope_id, fresh)
         return _decorate(fresh, ttl)
 
@@ -253,19 +266,25 @@ async def refresh(
     scope_kind, scope_id = _resolve_scope_params(workload_id, subscription_id)
     # Shield so the compute finishes + caches even if the client navigates away mid-refresh.
     snap = await asyncio.shield(_get_snapshot(principal, scope_kind, scope_id, force=True, connection_id=connection_id))
-    # Record a compact trend point so this scan can be charted over time.
-    from app.core import coverage_trends, coverage_runs
+    # A refresh that failed (classically ARG throttling under a fleet launch) produced no new
+    # measurement: `snap` is either the previous snapshot or an empty errored one. Charting or
+    # archiving it would invent a data point that no scan ever observed — a 0%-coverage cliff
+    # in the trend, or a junk entry in run history. Record only genuine scans.
+    scan_failed = bool(str(snap.get("scan_error") or snap.get("error") or "").strip())
+    if not scan_failed:
+        # Record a compact trend point so this scan can be charted over time.
+        from app.core import coverage_trends, coverage_runs
 
-    coverage_trends.record(
-        "amba", principal.tenant_id or "default", scope_kind, scope_id,
-        pct=snap.get("coverage_pct"), extra=snap.get("kpis") or {}, demo=bool(snap.get("demo")),
-    )
-    # Persist the full snapshot as a history run so operators can review/compare past scans.
-    coverage_runs.save_run(
-        "amba", principal.tenant_id or "default", scope_kind, scope_id, snap,
-        headline=snap.get("coverage_pct"), counts=snap.get("kpis") or {},
-        resource_count=len(snap.get("all_resources") or []), actor=principal.subject,
-    )
+        coverage_trends.record(
+            "amba", principal.tenant_id or "default", scope_kind, scope_id,
+            pct=snap.get("coverage_pct"), extra=snap.get("kpis") or {}, demo=bool(snap.get("demo")),
+        )
+        # Persist the full snapshot as a history run so operators can review/compare past scans.
+        coverage_runs.save_run(
+            "amba", principal.tenant_id or "default", scope_kind, scope_id, snap,
+            headline=snap.get("coverage_pct"), counts=snap.get("kpis") or {},
+            resource_count=len(snap.get("all_resources") or []), actor=principal.subject,
+        )
     db.add(
         AuditLog(
             tenant_id=principal.tenant_id,
