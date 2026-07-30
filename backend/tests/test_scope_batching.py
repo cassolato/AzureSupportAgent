@@ -19,7 +19,7 @@ from app.assessments.runner import (
 )
 from app.exec.command_runner import CaptureResult, KqlResult
 
-_SUB = "c3f6ae08-38a1-466d-abc2-972ad76b8661"
+_SUB = "11111111-2222-3333-4444-555555555555"
 _PROJ = "id, name, type, resourceGroup, subscriptionId, location, properties, sku, tags"
 
 

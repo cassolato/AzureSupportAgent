@@ -3,24 +3,24 @@
 Comprehensive UI + contract test plan covering the central knowledge graph. Each test lists
 **Steps → Expected**. Status legend: ✅ pass · ❌ fail (with bug id) · ⏭ deferred.
 
-Connections used: `khspn` (default, 8 workloads / 13 archs), `FDPO` (3 / 1), `mat` (1 / 1),
+Connections used: `Conn-A` (default, 8 workloads / 13 archs), `Conn-B` (3 / 1), `Conn-C` (1 / 1),
 plus 3 connection-less demo workloads (Contoso Hotels, Zava x2). Automated coverage lives in
 `backend/tests/test_graph_scope.py` (T1–T40 contract) + Playwright batch (UI).
 
 ## A. Tenant / Connection scoping (the reported bug)
-1. Select khspn → only khspn + demo workloads (11), never FDPO/mat. ✅
-2. Select FDPO → only FDPO + demo (6); zero khspn/mat workloads. ✅
-3. Select mat → only mat + demo (4). ✅
-4. Switch khspn→FDPO→mat→khspn → counts change each time (11→6→4→11), no stale carry-over. ✅
-5. Architectures re-scope with the connection (khspn 13, FDPO 1, mat 1). ✅
+1. Select Conn-A → only Conn-A + demo workloads (11), never Conn-B/Conn-C. ✅
+2. Select Conn-B → only Conn-B + demo (6); zero Conn-A/Conn-C workloads. ✅
+3. Select Conn-C → only Conn-C + demo (4). ✅
+4. Switch Conn-A→Conn-B→Conn-C→Conn-A → counts change each time (11→6→4→11), no stale carry-over. ✅
+5. Architectures re-scope with the connection (Conn-A 13, Conn-B 1, Conn-C 1). ✅
 6. Connection-less demo workloads appear under every connection. ✅
-7. A khspn workload id is NOT buildable under FDPO (`/build` → "Workload not found"). ✅
-8. A khspn workload id is NOT inspectable under FDPO (`/node` → found:false). ✅
-9. Drift for a khspn workload under FDPO → found:false. ✅
-10. Search under FDPO never returns khspn-only workloads. ✅
-11. Search under mat never returns khspn/FDPO resources from another connection's cache. ✅
+7. A Conn-A workload id is NOT buildable under Conn-B (`/build` → "Workload not found"). ✅
+8. A Conn-A workload id is NOT inspectable under Conn-B (`/node` → found:false). ✅
+9. Drift for a Conn-A workload under Conn-B → found:false. ✅
+10. Search under Conn-B never returns Conn-A-only workloads. ✅
+11. Search under Conn-C never returns Conn-A/Conn-B resources from another connection's cache. ✅
 12. `_full_graph` (analytics/ask/narrative) honors connection scope. ✅
-13. Two connections sharing one tenant (khspn + xxx, tenant 739fb5dd) stay separate by connection_id. ✅
+13. Two connections sharing one tenant (Conn-A + Conn-D) stay separate by connection_id. ✅
 14. Empty/unknown connection_id → full unscoped list (single-tenant fallback), no crash. ✅
 15. Inventory cache never falls back to another connection's resources (no "" key). ✅
 16. Switching connection clears the canvas (old nodes removed, not merged). ✅
@@ -50,7 +50,7 @@ plus 3 connection-less demo workloads (Contoso Hotels, Zava x2). Automated cover
 36. Search is case-insensitive. ✅
 37. Click a search result → node focused + centered + selected. ✅
 38. Search a node NOT on canvas → it's added then focused. ✅
-39. Search under FDPO does not surface khspn-only names. ✅ (dup of T10, UI side)
+39. Search under Conn-B does not surface Conn-A-only names. ✅ (dup of T10, UI side)
 40. Special chars / regex-y input (`.*`, `'`, `()`) don't crash search. ✅
 41. Very long query string handled gracefully. ✅
 42. Rapid typing (debounce/латest-wins) doesn't wedge the dropdown. ✅

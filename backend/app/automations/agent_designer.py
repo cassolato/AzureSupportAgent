@@ -12,7 +12,7 @@ and a tenant that actually exist (it cannot invent tool names).
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from app.agent.factory import build_provider, build_provider_for
 from app.core.ai_prompts import get_full_prompt
@@ -26,16 +26,46 @@ _GUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
+# What a redacted connection reference is replaced with.
+_CONNECTION_PLACEHOLDER = "the configured Azure connection"
 
-def strip_resource_guids(text: str) -> str:
-    """Remove leaked Azure tenant/subscription/connection GUIDs from instruction text.
+# A connection display name is only scrubbed when it is distinctive enough to be safe to
+# remove. Redacting a connection literally named "Production" would mangle every sentence
+# that happens to use the word, which is a worse outcome than leaving it in place.
+_MIN_SCRUBBABLE_NAME = 4
+_GENERIC_CONNECTION_NAMES = frozenset({
+    "azure", "prod", "production", "dev", "development", "test", "testing", "stage",
+    "staging", "default", "main", "primary", "secondary", "tenant", "subscription",
+    "sandbox", "demo", "corp", "global", "shared", "internal", "external",
+})
+
+
+def _scrubbable_names(connection_names: Iterable[str]) -> list[str]:
+    """Connection display names distinctive enough to redact without mangling prose."""
+    out: set[str] = set()
+    for raw in connection_names:
+        name = str(raw or "").strip()
+        if len(name) < _MIN_SCRUBBABLE_NAME or name.lower() in _GENERIC_CONNECTION_NAMES:
+            continue
+        out.add(name)
+    # Longest first, so a name that contains a shorter one is replaced whole.
+    return sorted(out, key=len, reverse=True)
+
+
+def strip_tenant_specifics(text: str, connection_names: Iterable[str] = ()) -> str:
+    """Remove tenant-specific identifiers from generated agent instruction text.
 
     The generator/enhancer is given the real connection list for grounding, and models
-    sometimes hardcode a specific tenant/subscription/connection GUID into the agent's
-    instructions (e.g. ``**khspn** (`65fd…`)``). Those defaults shouldn't live in a
-    reusable persona, so we strip the GUID and its immediate backtick/paren wrapper, then
-    tidy the surrounding punctuation/whitespace."""
-    if not text or not _GUID_RE.search(text):
+    routinely hardcode a specific tenant/subscription/connection into the persona
+    (e.g. ``**contoso-sp** (`65fd…`)``). Those defaults are meaningless to anyone else and
+    quietly expose tenant detail if the agent is exported, seeded, or committed.
+
+    Both GUIDs **and** connection display names are stripped. Removing GUIDs alone is not
+    enough: the model tends to write the connection's *name* right next to its id, so a
+    GUID-only scrub leaves the name behind in an otherwise reusable persona.
+    """
+    names = _scrubbable_names(connection_names)
+    if not text or (not names and not _GUID_RE.search(text)):
         return text
     # Drop a parenthesized, backtick-wrapped GUID and its leading space: " (`GUID`)".
     text = re.sub(r"\s*\(\s*`?" + _GUID_RE.pattern + r"`?\s*\)", "", text)
@@ -43,6 +73,14 @@ def strip_resource_guids(text: str) -> str:
     text = re.sub(r"`\s*" + _GUID_RE.pattern + r"\s*`", "", text)
     # Drop any remaining bare GUIDs.
     text = _GUID_RE.sub("", text)
+    # Replace connection names, including any bold/backtick wrapper around them.
+    for name in names:
+        text = re.sub(
+            r"(?<![\w-])\*{0,2}`?" + re.escape(name) + r"`?\*{0,2}(?![\w-])",
+            _CONNECTION_PLACEHOLDER,
+            text,
+            flags=re.IGNORECASE,
+        )
     # Tidy: collapse doubled spaces, empty backticks/parens, and space-before-punct.
     text = text.replace("``", "").replace("()", "")
     text = re.sub(r"[ \t]{2,}", " ", text)
@@ -357,7 +395,9 @@ async def generate_agent(
 
     return {
         "name": str(parsed.get("name", "") or "New Agent")[:200],
-        "instructions": strip_resource_guids(str(parsed["instructions"]))[:20000],
+        "instructions": strip_tenant_specifics(
+            str(parsed["instructions"]), [c.get("display_name") or "" for c in connections]
+        )[:20000],
         "connector_tools": chosen,
         "allow_all_azure": bool(parsed.get("allow_all_azure", True)),
         "run_mode": run_mode,
@@ -471,7 +511,9 @@ async def enhance_agent(
     changes = [str(c)[:200] for c in (parsed.get("changes") or []) if str(c).strip()][:12]
     return {
         "name": str(parsed.get("name") or agent.get("name") or "Agent")[:200],
-        "instructions": strip_resource_guids(str(parsed["instructions"]))[:20000],
+        "instructions": strip_tenant_specifics(
+            str(parsed["instructions"]), [c.get("display_name") or "" for c in connections]
+        )[:20000],
         "connector_tools": chosen,
         "allow_all_azure": bool(parsed.get("allow_all_azure", agent.get("allow_all_azure", True))),
         "run_mode": run_mode,
