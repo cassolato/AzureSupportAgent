@@ -427,6 +427,6 @@ first.
 touches an agent, credential, or Azure control-plane path — apply generated fixes only
 through normal pull-request review, never automatically.
 
-> The exact `defender fix` argument syntax is not published on Microsoft Learn. See
-> [mdash-readiness.md](mdash-readiness.md#9-running-an-mdash-scan) — marked
-> **Documentation Required**.
+> `defender fix <sarif-file> [--severity high|medium|low] [-y]` edits files **in place**
+> using the Copilot CLI and expects a clean git tree. See
+> [mdash-readiness.md](mdash-readiness.md#9-running-an-mdash-scan).

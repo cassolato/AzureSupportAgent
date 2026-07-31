@@ -41,18 +41,23 @@ unauthorised Azure control-plane actions.
 
 ### Current readiness
 
-The read-only validation script was executed against the target environment. Result after
-applying this change:
+The read-only validation script was executed against the target environment, before and
+after provisioning the MDASH model deployments:
 
-| Outcome | Count | Before this change |
-|---|---|---|
-| Passed | 27 | 26 |
-| **Failed (blocking)** | **4** | 4 |
-| Warnings | 2 | 3 |
-| Skipped | 0 | 0 |
+| Outcome | Baseline | After CI scaffolding | **After model deployment** |
+|---|---|---|---|
+| Passed | 26 | 27 | **30** |
+| **Failed (blocking)** | 4 | 4 | **1** |
+| Warnings | 3 | 2 | 2 |
+| Skipped | 0 | 0 | 0 |
 
-The warning that cleared is `G3` — the repository now has GitHub Actions security
-workflows. The four failures are environmental and cannot be fixed from the repository.
+Three of the four original blockers are cleared: `gpt-5.4`, `gpt-5.3-codex`, and
+`gpt-5.4-mini` are deployed at 1,000,000 TPM each with a dedicated MDASH content filter.
+
+**One blocker remains, and it cannot be fixed from this subscription:** the Foundry account
+enforces `disableLocalAuth: true`, so no API key can be issued — and documented MDASH
+onboarding requires a project endpoint **and** an API key. See
+[section 6](#6-mdash-readiness-checklist).
 
 **The environment is not yet ready to run an MDASH scan.** Four blockers, all in the
 Foundry configuration, are listed in [section 6](#6-mdash-readiness-checklist). The
@@ -283,9 +288,10 @@ Or let the script do it, which resolves the ID from the name first:
 | Resource type | `Microsoft.CognitiveServices/accounts/projects` |
 | **Project endpoint** | `https://rafaelcas-msfoundry-resource-mda.services.ai.azure.com/api/projects/rafaelcas-msfoundry-project-mdash` |
 | Project identity | System-assigned, principal `0f362346-5555-46a0-8960-018c5be861c6` |
-| Local (key) auth | **Disabled** — `disableLocalAuth: true` |
+| Local (key) auth | **Disabled** — `disableLocalAuth: true`, tenant-enforced |
 | Public network access | `Enabled` |
-| Model deployments | **None** |
+| Model deployments | `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini` — all GlobalStandard @ 1000 K TPM |
+| Content filter | `mdash-permissive` (custom) on all three deployments |
 
 ### How discovery works
 
@@ -354,13 +360,14 @@ Legend: ✅ satisfied · ❌ blocking · ⚠️ recommended · 📄 Documentatio
 | 11 | Foundry project exists | ✅ | `rafaelcas-msfoundry-project-mdash` |
 | 12 | Project endpoint obtainable | ✅ | See [section 5](#5-existing-microsoft-foundry-project) |
 | 13 | Region offers all required models | ✅ | `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini` all in `swedencentral` |
-| 14 | `gpt-5.4` deployed | ❌ | Not deployed |
-| 15 | `gpt-5.3-codex` deployed | ❌ | Not deployed |
-| 16 | `gpt-5.4-mini` deployed | ❌ | Not deployed |
-| 17 | Each deployment ≥ 1,000,000 TPM | ❌ | No deployments to configure yet |
-| 18 | **API key obtainable for onboarding** | ❌ | `disableLocalAuth: true` — see below |
+| 14 | `gpt-5.4` deployed | ✅ | GlobalStandard, 1000 K TPM |
+| 15 | `gpt-5.3-codex` deployed | ✅ | GlobalStandard, 1000 K TPM |
+| 16 | `gpt-5.4-mini` deployed | ✅ | GlobalStandard, 1000 K TPM |
+| 17 | Each deployment ≥ 1,000,000 TPM | ✅ | All three at the minimum exactly |
+| 18 | **API key obtainable for onboarding** | ❌ | `disableLocalAuth: true`, tenant-enforced — see below |
 | 19 | MDASH can reach the endpoint | ✅ | `publicNetworkAccess: Enabled` = "All networks", no IP allow-list needed |
-| 20 | Permissive content filter applied | ⚠️ | Cannot be set until deployments exist |
+| 20 | Permissive content filter applied | ⚠️ | `mdash-permissive` applied; jailbreak shield and protected-material off, but harm categories cannot be fully disabled without an approved exception |
+| 20b | `MAI-Cyber-1-Flash` deployed | ❌ | **Not offered in any region of this subscription** — gated preview |
 
 ### Defender and identity
 
@@ -383,39 +390,60 @@ Legend: ✅ satisfied · ❌ blocking · ⚠️ recommended · 📄 Documentatio
 
 ### Blocker detail
 
-**Blockers 14–17 — no model deployments.** MDASH requires exactly three models. All three
-are available in `swedencentral`. Quota was verified (values are thousands of TPM):
+**Blockers 14–17 — RESOLVED.** All three models are now deployed at 1,000,000 TPM.
+Quota consumed (values are thousands of TPM):
 
-| Model | Used | Limit | Headroom at 1M TPM |
-|---|---|---|---|
-| `gpt-5.4` (GlobalStandard) | 0 | 1,000 | Exactly enough — **zero spare** |
-| `gpt-5.4-mini` (GlobalStandard) | 0 | 1,000 | Exactly enough — **zero spare** |
-| `gpt-5.3-codex` (GlobalStandard) | 500 | 3,000 | 2,500 spare |
+| Model | Used before | Deployed | Limit | Remaining |
+|---|---|---|---|---|
+| `gpt-5.4` (GlobalStandard) | 0 | 1,000 | 1,000 | **0** |
+| `gpt-5.4-mini` (GlobalStandard) | 0 | 1,000 | 1,000 | **0** |
+| `gpt-5.3-codex` (GlobalStandard) | 500 | 1,000 | 3,000 | 1,500 |
 
-Deploying at the 1,000,000 TPM minimum consumes **100 %** of the available `gpt-5.4` and
-`gpt-5.4-mini` GlobalStandard quota in this region. Request a quota increase before
-adding any other workload to this subscription in `swedencentral`.
+`gpt-5.4` and `gpt-5.4-mini` GlobalStandard quota in `swedencentral` is now **fully
+consumed**. Any other workload needing those models in this region will fail to deploy
+until a quota increase is granted.
 
-**Blocker 18 — `disableLocalAuth: true`.** This is the most consequential finding.
-Microsoft Learn's onboarding step 3 requires a **Project endpoint and an API key**:
+**Blocker 18 — `disableLocalAuth: true`, and it cannot be changed here.** This is the one
+remaining blocker. Microsoft Learn's onboarding step 3 requires a **Project endpoint and an
+API key**:
 
 > Enter the **Project endpoint** … and **API key**. Select **Validate** to verify the
 > connection.
 
-With `disableLocalAuth: true`, the account issues no API keys, so `az cognitiveservices
-account keys list` fails and portal validation cannot succeed. Two paths:
+Attempts to clear the flag were made and **rejected by the platform**:
 
-- **Path A (unblocks today).** Enable local auth on this dedicated MDASH-only resource.
-  Because the resource is dedicated to MDASH and already has a permissive content filter
-  requirement, the blast radius of a key is limited to MDASH inference. Store the key in
-  Key Vault; never commit it.
-- **Path B (preferred, needs confirmation).** Keep Entra-only auth and confirm with the
-  MDASH team whether managed-identity onboarding is supported. Learn does not document an
-  Entra-only onboarding path today → **Documentation Required**.
+```text
+# ARM accepted the request but returned the property unchanged
+az resource update ... --set properties.disableLocalAuth=false   # exit 0, value stays true
+az rest --method patch ... '{"properties":{"disableLocalAuth":false}}'  # 200 OK, value stays true
 
-The MAI-augmented profile is **not available in `swedencentral`**: `MAI-Cyber-1-Flash` is
-absent from the regional model catalogue. Use `gpt-general-profile`, which needs only the
-three models above.
+# And key retrieval fails accordingly
+az cognitiveservices account keys list ...
+#   (BadRequest) Failed to list key. disableLocalAuth is set to be true
+```
+
+No Azure Policy assignment in the subscription explains it, so the control is applied
+above the subscription — a management-group or tenant-level governance baseline in
+`Microsoft Non-Production` mandating Entra-only authentication on Cognitive Services
+accounts. Resolution requires a governance exception, or Entra-only onboarding support
+from the MDASH team.
+
+**Blocker 20b — `MAI-Cyber-1-Flash` is unobtainable in this subscription.** Every physical
+Azure region was queried; the model is absent from all of them. Only `MAI-Image-*` models
+are offered. It is a gated preview, so `mai-augmented-profile` cannot be used and
+`gpt-general-profile` is the only usable option here. See
+[section 9b](#9b-mai-cyber-1-flash-and-the-mai-augmented-profile).
+
+**Additional blocker found at scan time — tenant not on the MDASH allow-list.** With the
+Defender CLI installed and a valid Entra token, the service rejects the caller:
+
+```text
+Error: list model profiles: scannersvc: list model profiles: aiscan:
+       caller not authorized (token valid, allowed-callers list)
+```
+
+The token is accepted; the tenant is simply not enrolled in the MDASH preview. Portal
+onboarding must complete first.
 
 ---
 
@@ -541,20 +569,78 @@ defender scan profile model show-default
 
 ### Applying AI-generated fixes
 
-Microsoft Learn documents that the `defender fix` command generates and applies code fixes
-from scan results, but does **not** publish its argument syntax.
+Microsoft Learn documents that `defender fix` exists but publishes no argument syntax. The
+syntax below was obtained from the installed binary (`defender 3.0.0-rc.34`) via
+`defender fix --help`, so it is verified rather than guessed:
 
 ```text
-Documentation Required — exact `defender fix` invocation.
-Learn states the command exists and that it "generates and applies code fixes directly
-from scan results", but publishes no flags, arguments, or examples.
-Run `defender fix --help` against your installed CLI build to obtain the real syntax
-before adding it to any automation. Do not guess.
+defender fix <sarif-file> [flags]
+
+  --severity string   Minimum severity to fix: critical | high | medium | low
+                      (default "high" = high and critical only)
+  -y, --yes           Skip the interactive RAI apply confirmation prompt
+  -q, --quiet         Suppress lifecycle logs
 ```
 
+```powershell
+defender fix ./defender-fs-AzureSupportAgent-20260731-1500.sarif
+defender fix ./results.sarif --severity low     # fix everything
+```
+
+Two properties of this command matter for this repository:
+
+1. **It is not a dry run.** It calls the GitHub Copilot CLI to edit files in place in the
+   working directory. It requires the standalone `copilot` CLI, or `gh` with the Copilot
+   extension, on `PATH`.
+2. **It must be run on a clean git tree.** The CLI's own help says so, and it is the only
+   way to `git diff` the generated edits before keeping them.
+
 Regardless of syntax: treat `defender fix` output as a **proposal**, never an auto-merge.
-Every fix in this repository touches an agent, credential, or Azure control-plane path
-and must go through human review.
+Every Critical and High target in this repository touches an agent, credential, or Azure
+control-plane path and must go through human review.
+
+## 9b. MAI-Cyber-1-Flash and the MAI-augmented profile
+
+Microsoft announced **MAI-Cyber-1-Flash inside MDASH** on 27 July 2026. It is the
+highest-performing option MDASH offers:
+
+| Metric | Reported |
+|---|---|
+| CyberGym score, MDASH + MAI-Cyber-1-Flash + GPT-5.4 | **95.95 %** |
+| Next-best compared models | 83.2 % – 85.6 % |
+| Uplift over Mythos | +12 points |
+| Cost vs the GPT-5.4 + 5.4-mini + 5.3-codex trio | **50 % lower** |
+
+The design is a routing system: MAI-Cyber-1-Flash handles up to 90 % of tasks, and GPT-5.4
+is reserved for the ~10 % that are genuinely hard. That is where both the accuracy and the
+cost saving come from. The model is a compact, code-heavy security model from the
+MAI-Thinking-1 lineage.
+
+**It cannot be deployed in this environment.** Every physical Azure region in subscription
+`MCAPS-Hybrid-rafaelcas` was queried for the model:
+
+```bash
+# Returns MAI-Image-2, MAI-Image-2.5, MAI-Image-2.5-Flash, MAI-Image-2.5-Pro, MAI-Image-2e
+# MAI-Cyber-1-Flash is absent from every region.
+az cognitiveservices model list --location <region> --query "[].model.name" -o tsv \
+  | grep -i 'mai-cyber'
+```
+
+MDASH documentation also notes the MAI-augmented profile is Preview and *"currently
+available only for scans triggered through the Defender CLI"*. Access is therefore gated
+rather than self-service.
+
+**Consequence for this repository:** use `gpt-general-profile`, which the three deployed
+models satisfy. Once MAI-Cyber-1-Flash becomes available to this tenant, deploy it and
+switch:
+
+```powershell
+defender scan ai-scan submit . --model-profile mai-augmented-profile
+```
+
+Given the 50 % cost reduction and the +10-point accuracy gain, moving to
+`mai-augmented-profile` should be treated as the default target state for scanning this
+repository, not an optional upgrade.
 
 ### Network allow-list
 
@@ -640,11 +726,11 @@ jobs:
 ```
 
 ```text
-Documentation Required — SARIF output path and filename.
-Learn shows `defender status wait <JOB_ID> -o results.sarif` for the async flow and says
-the synchronous `submit` "downloads results to the target source directory", but does not
-publish the default filename. Confirm the emitted path before relying on the upload step,
-or switch to the async flow and pass -o explicitly.
+SARIF output path — RESOLVED from `defender scan ai-scan submit --help`.
+Default: <target>/defender-fs-<repo>-<YYYYMMDD-HHMMSS>.sarif
+Because the filename carries a timestamp, always pass -o explicitly in CI so the
+upload step has a deterministic path:
+    defender scan ai-scan submit . --async -o results.sarif
 ```
 
 The `--severity high` filter keeps token spend and run time predictable on a scheduled
@@ -721,21 +807,31 @@ Consolidated from [security-review.md](security-review.md) and
 
 ## 14. Known limitations
 
-1. **`defender fix` syntax is undocumented.** Marked Documentation Required in
-   [section 9](#9-running-an-mdash-scan). Not scripted.
-2. **SARIF output filename is undocumented** for the synchronous flow. Marked
-   Documentation Required in [section 10](#10-cicd-integration).
-3. **No MDASH scan has been run.** Blockers 14–18 prevent it. The scan scope is a
-   static, evidence-based prioritisation, not a triaged result set.
-4. **Directory-scoped prerequisites are unverifiable from here.** Entra role membership,
+1. **~~`defender fix` syntax is undocumented.~~ RESOLVED** from the installed CLI
+   (`3.0.0-rc.34`). See [section 9](#9-running-an-mdash-scan). Note it edits files in place
+   and needs the Copilot CLI on `PATH`.
+2. **~~SARIF output filename is undocumented.~~ RESOLVED** \u2014 default is
+   `<target>/defender-fs-<repo>-<YYYYMMDD-HHMMSS>.sarif`. Pass `-o` in CI for determinism.
+3. **No MDASH scan has been run.** Two blockers prevent it: the Foundry account cannot
+   issue an API key, and the tenant is not on the MDASH allow-list
+   (`caller not authorized`). The scan scope is a static, evidence-based prioritisation,
+   not a triaged result set.
+4. **`disableLocalAuth` cannot be changed from this subscription.** ARM accepts the write
+   and silently retains `true`, indicating enforcement above the subscription. A governance
+   exception is required.
+5. **`MAI-Cyber-1-Flash` is unobtainable here**, so the higher-accuracy, lower-cost
+   `mai-augmented-profile` cannot be used despite being the better option.
+6. **The permissive content filter is only partially permissive.** Jailbreak and
+   protected-material filters are off, but the four harm categories cannot be disabled
+   without an approved exception (`aka.ms/oai/rai/exceptions`); they sit at the most
+   permissive threshold allowed (`High`). MDASH may still see some content blocked.
+7. **Directory-scoped prerequisites are unverifiable from here.** Entra role membership,
    Defender unified RBAC roles, and the Microsoft Defender Code enterprise app are tenant
    and portal concerns; the scripts do not attempt them.
-5. **The scripts are read-only by design.** They never remediate. Every failure carries
-   guidance instead.
-6. **Findings in this document are from static review**, not runtime testing or
+8. **The validation scripts are read-only by design.** They never remediate. Every failure
+   carries guidance instead.
+9. **Findings in this document are from static review**, not runtime testing or
    exploitation. Severities are engineering judgement and should be re-rated against
    actual MDASH confidence scores.
-7. **`MAI-Cyber-1-Flash` is unavailable in `swedencentral`**, so `mai-augmented-profile`
-   cannot be used from this Foundry resource.
-8. **Quota is exactly at the minimum** for two of the three models. Any competing
-   workload in `swedencentral` will cause deployment failures.
+10. **Quota is fully consumed** for `gpt-5.4` and `gpt-5.4-mini` GlobalStandard in
+    `swedencentral`. Any competing workload will fail to deploy.

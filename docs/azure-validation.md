@@ -279,11 +279,12 @@ Recorded against `MCAPS-Hybrid-rafaelcas` / `rg-ip-mdash-AzureSupportAgent` on
 [ PASS ] F3   Foundry project endpoint resolved
 
 ── MDASH model deployments
-[ FAIL ] M-gpt-5.4 Model deployed: gpt-5.4
-            Not deployed in this Foundry account.
-            -> Deploy 'gpt-5.4' in the Foundry portal (Build > Deployments), then set TPM to 1000000.
-[ FAIL ] M-gpt-5.3-codex Model deployed: gpt-5.3-codex
-[ FAIL ] M-gpt-5.4-mini Model deployed: gpt-5.4-mini
+[ PASS ] M-gpt-5.4 Model deployed: gpt-5.4
+            capacity 1000K TPM (>= 1000K required)
+[ PASS ] M-gpt-5.3-codex Model deployed: gpt-5.3-codex
+            capacity 1000K TPM (>= 1000K required)
+[ PASS ] M-gpt-5.4-mini Model deployed: gpt-5.4-mini
+            capacity 1000K TPM (>= 1000K required)
 [ PASS ] M-REGION Required models offered in region
             All 3 available in swedencentral.
 
@@ -324,22 +325,20 @@ Recorded against `MCAPS-Hybrid-rafaelcas` / `rg-ip-mdash-AzureSupportAgent` on
             No .github/workflows directory.
 
 ── Summary
- Passed   : 26
- Failed   : 4
- Warnings : 3
+ Passed   : 30
+ Failed   : 1
+ Warnings : 2
  Skipped  : 0
 
 Blocking issues:
-  - [M-gpt-5.4] Model deployed: gpt-5.4
-  - [M-gpt-5.3-codex] Model deployed: gpt-5.3-codex
-  - [M-gpt-5.4-mini] Model deployed: gpt-5.4-mini
   - [F4] Foundry API key auth available
 ```
 
 Exit code `1`.
 
-> `G3` now passes, because this change adds `.github/workflows`. The transcript above is
-> the pre-change baseline.
+> Recorded **after** the three MDASH models were deployed and after this change added
+> `.github/workflows`. The baseline run before any of that was 26 passed / 4 failed /
+> 3 warnings.
 
 ---
 
@@ -351,7 +350,7 @@ stderr so stdout stays parseable.
 ```powershell
 $r = ./scripts/validate-azure-mdash-readiness.ps1 -Json | ConvertFrom-Json
 
-$r.summary.failed                      # 4
+$r.summary.failed                      # 1
 $r.facts.subscriptionId                # 4bd56768-1b2f-4c85-951f-68ce70b7c999
 $r.facts.foundryProjectEndpoint        # https://...
 $r.checks | Where-Object status -eq 'Fail' | Select-Object id, name, remediation
@@ -369,10 +368,10 @@ Shape:
     "foundryProjectName":     "rafaelcas-msfoundry-project-mdash",
     "foundryProjectEndpoint": "https://.../api/projects/...",
     "foundryLocalAuthDisabled": true,
-    "deployedModels":         [],
+    "deployedModels":         ["gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini"],
     "defenderStandardPlans":  ["CloudPosture", "AI", "..."]
   },
-  "summary": { "passed": 26, "failed": 4, "warnings": 3, "skipped": 0 },
+  "summary": { "passed": 30, "failed": 1, "warnings": 2, "skipped": 0 },
   "checks":  [ { "id": "F4", "name": "...", "status": "Fail",
                  "detail": "...", "remediation": "..." } ]
 }
