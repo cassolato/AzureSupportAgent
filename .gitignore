@@ -150,6 +150,9 @@ docs/_journey_render/
 # --- Per-section performance/UX improvement plans (review scratch, not shipped) ---
 docs/improvement-plans/
 
+# --- Agentic security scan output (regenerated every run) --------------------
+mdash-results/
+
 # --- Workspace agent customization (local-only, not shipped) -----------------
 # The .github folder is local-only by default: it holds the workspace custom agents
 # (.github/agents/documentation-regenerator.agent.md, .github/agents/ui-test-pilot.agent.md)
@@ -166,6 +169,7 @@ docs/improvement-plans/
 .github/workflows/*
 !.github/workflows/codeql.yml
 !.github/workflows/dependency-review.yml
+!.github/workflows/mdash-scan.yml
 .docs-work/
 docs/.jekyll-cache/
 docs/.sass-cache/

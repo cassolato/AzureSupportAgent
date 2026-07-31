@@ -1,0 +1,119 @@
+name: Agentic security scan
+
+# Multi-model agentic security review (tools/mdash), modelled on Microsoft's MDASH pipeline:
+# prepare -> scan -> debate -> dedupe -> report. Findings are uploaded as SARIF and appear
+# under Security > Code scanning.
+#
+# Authentication is Entra workload-identity federation - no stored API key or client secret.
+# See tools/mdash/README.md for the one-time federated-credential setup.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly full sweep. Model prices and prompts change; so do the findings.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      max_targets:
+        description: "Cap on files scanned"
+        required: false
+        default: "40"
+      agents:
+        description: "Comma-separated auditor subset (blank = all five)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mdash-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Agentic scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # A pull request from a fork cannot mint an OIDC token for this tenant, so the scan
+    # would fail on credentials rather than on findings. Skip it and let the scheduled
+    # run cover those changes after merge.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    permissions:
+      contents: read
+      id-token: write          # mint the federated token for azure/login
+      security-events: write   # upload SARIF to code scanning
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # Diff mode needs the merge base, which a depth-1 clone does not have.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install harness
+        run: python -m pip install --disable-pip-version-check ./tools/mdash
+
+      - name: Azure login (workload identity federation)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run agentic security scan
+        id: scan
+        # Never let a non-zero exit skip the upload: a scan that found something is the
+        # case where the SARIF matters most. The gate is re-applied after upload.
+        continue-on-error: true
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+        run: |
+          set +e
+          python -m mdash \
+            --root . \
+            --out mdash-results \
+            --fail-on high \
+            --max-targets "${{ github.event.inputs.max_targets || '40' }}" \
+            --agents "${{ github.event.inputs.agents || '' }}" \
+            ${{ github.event_name == 'pull_request' && format('--diff {0}', github.event.pull_request.base.sha) || '' }}
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('mdash-results/mdash.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: mdash-results/mdash.sarif
+          category: mdash
+
+      - name: Upload raw results
+        if: always() && hashFiles('mdash-results/*') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdash-results
+          path: mdash-results/
+          retention-days: 30
+
+      - name: Enforce severity gate
+        if: steps.scan.outcome == 'failure'
+        run: |
+          if [ "${{ steps.scan.outputs.exit_code }}" = "1" ]; then
+            echo "::error::Agentic scan reported findings at or above the configured severity."
+            echo "Review them under Security > Code scanning, or in the mdash-results artifact."
+          else
+            echo "::error::Agentic scan failed to complete (exit ${{ steps.scan.outputs.exit_code }})."
+            echo "This is a harness or credential failure, not a finding. Check the scan step log."
+          fi
+          exit 1

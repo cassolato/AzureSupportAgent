@@ -1,0 +1,32 @@
+[project]
+name = "mdash-harness"
+version = "0.1.0"
+description = "Multi-model agentic security scanning harness (MDASH-style) on Azure AI Foundry"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.54",
+    "azure-identity>=1.19",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.7",
+]
+
+[project.scripts]
+mdash = "mdash.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mdash"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
