@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import oidc as oidc_mod
 from app.auth import saml as saml_mod
 from app.auth.ip_lockout import ip_lockout
-from app.auth.passwords import hash_password, needs_rehash, verify_password
+from app.auth.passwords import burn_password_time, hash_password, needs_rehash, verify_password
 from app.auth.provisioning import provision_sso_user
 from app.auth.service import (
     create_session,
@@ -263,6 +263,9 @@ async def login(
         )
 
     if user is None or user.status != "active":
+        # Burn the same Argon2 time a real verification would, so an attacker can't tell
+        # "no such user" from "wrong password" by response latency (user enumeration).
+        burn_password_time(body.password)
         await _audit(db, body.username, "auth.login_failed", {"reason": "unknown_or_inactive", "ip": client_ip})
         await _ip_failure()
         raise fail

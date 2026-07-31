@@ -1,0 +1,8 @@
+# Shell scripts must keep LF line endings in the working tree on every platform.
+# With core.autocrlf=true (the Windows default) a checked-out .sh file gets CRLF, and
+# bash then fails with "bad interpreter: /usr/bin/env bash^M".
+# See the troubleshooting table in docs/azure-validation.md.
+*.sh text eol=lf
+
+# PowerShell is CRLF-tolerant, but keeping it consistent avoids noisy diffs.
+*.ps1 text eol=crlf

@@ -28,6 +28,15 @@ secret.key
 .acrname
 .stgname
 .imgdigest
+# PostgreSQL deployment scratch. `.pgpass` holds a live database password — these are
+# per-deployment machine state and must NEVER be committed.
+.pgpass
+**/.pgpass
+*.pgpass
+.pgname
+**/.pgname
+.pgloc
+**/.pgloc
 uvicorn.out.log
 uvicorn.err.log
 
@@ -142,11 +151,21 @@ docs/_journey_render/
 docs/improvement-plans/
 
 # --- Workspace agent customization (local-only, not shipped) -----------------
-# The whole .github folder stays local: it holds the workspace custom agents
+# The .github folder is local-only by default: it holds the workspace custom agents
 # (.github/agents/documentation-regenerator.agent.md, .github/agents/ui-test-pilot.agent.md)
 # and their design notes (.github/UITestAgent.md) — internal tooling, not product code.
 # Public documentation under docs/ remains tracked.
-.github/
+#
+# EXCEPTION: repository security configuration IS product code and must ship, so that
+# CodeQL, dependency review, and Dependabot run for every contributor and so MDASH SARIF
+# results have somewhere to land. See docs/mdash-readiness.md and docs/security-review.md.
+# Each tracked file is allow-listed by name; anything else under .github/ stays local.
+.github/*
+!.github/dependabot.yml
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/codeql.yml
+!.github/workflows/dependency-review.yml
 .docs-work/
 docs/.jekyll-cache/
 docs/.sass-cache/

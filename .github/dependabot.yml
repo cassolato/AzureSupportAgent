@@ -1,0 +1,88 @@
+# Dependabot configuration.
+#
+# Keeps dependencies current across every ecosystem in the repository. Security updates
+# are raised automatically by GitHub regardless of this file; the schedules below cover
+# routine version updates so the tree does not drift far enough that a security update
+# becomes a breaking change.
+#
+# Requires no secrets.
+#
+# Ecosystems present (see docs/recommended-scan-scope.md for the inventory):
+#   backend/pyproject.toml + backend/requirements.txt   Python backend
+#   frontend/package.json                                React/TypeScript SPA
+#   third_party/entraid-mcp-server/pyproject.toml        vendored Entra MCP server
+#   Dockerfile, backend/Dockerfile, frontend/Dockerfile  container base images
+#   .github/workflows                                    action versions
+
+version: 2
+
+updates:
+  # --- Python backend ------------------------------------------------------------
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, security]
+    commit-message:
+      prefix: "deps(backend)"
+    groups:
+      # Group patch and minor bumps so reviewers see one PR instead of twenty.
+      # Major versions stay separate because they need real review.
+      backend-minor-patch:
+        update-types: [minor, patch]
+
+  # --- Vendored Entra MCP server -------------------------------------------------
+  # Tracked separately: this is third-party code running with Microsoft Graph access.
+  # See SEC-07 in docs/security-review.md.
+  - package-ecosystem: pip
+    directory: /third_party/entraid-mcp-server
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies, python, third-party, security]
+    commit-message:
+      prefix: "deps(third_party)"
+
+  # --- Frontend ------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, javascript, security]
+    commit-message:
+      prefix: "deps(frontend)"
+    groups:
+      frontend-minor-patch:
+        update-types: [minor, patch]
+
+  # --- Container base images -----------------------------------------------------
+  # Base image drift is a supply-chain concern; see SEC-03 in docs/security-review.md.
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /backend
+      - /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker, security]
+    commit-message:
+      prefix: "deps(docker)"
+
+  # --- GitHub Actions ------------------------------------------------------------
+  # Action versions are executable dependencies with repository access.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies, github-actions, security]
+    commit-message:
+      prefix: "deps(actions)"

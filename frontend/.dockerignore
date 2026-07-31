@@ -1,3 +1,21 @@
 node_modules
 dist
 .vite
+
+# Secrets / credential scratch — the frontend Dockerfile does `COPY . .`, so anything
+# not listed here is baked into the published image layers.
+.env
+.env.*
+!.env.example
+.pgpass
+.pgname
+.pgloc
+*.pem
+*.pfx
+*.p12
+*.key
+
+# Build/VCS noise
+.git
+*.log
+*.tsbuildinfo

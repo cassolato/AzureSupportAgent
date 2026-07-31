@@ -48,6 +48,22 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _text(el: Any) -> str:
+    """Full text content of a signed element, comment-injection safe.
+
+    ``Element.text`` returns only the text node BEFORE the first child, so a signed
+    ``<NameID>victim@corp.com<!---->.attacker</NameID>`` would read back as
+    ``victim@corp.com``. Exclusive C14N strips comments before digesting, so injecting
+    one does not break the signature — this is the SAML comment-injection / identity
+    truncation class (cf. CVE-2017-11427, CVE-2018-0489). Concatenating every text node
+    via ``itertext()`` yields the value the IdP actually signed, so a truncation attempt
+    produces a non-matching identity instead of the victim's.
+    """
+    if el is None:
+        return ""
+    return "".join(el.itertext()).strip()
+
+
 def encode_relay(payload: dict[str, Any]) -> str:
     """Encrypt the in-flight SAML request state (AuthnRequest ID + idp) for the cookie."""
     return encrypt(json.dumps({**payload, "ts": int(time.time())}))
@@ -250,7 +266,7 @@ def validate_response(
     # Issuer check (read from the verified assertion).
     issuer_el = assertion.find("saml:Issuer", NS)
     expected_issuer = idp_cfg.get("entity_id", "")
-    if expected_issuer and (issuer_el is None or (issuer_el.text or "").strip() != expected_issuer):
+    if expected_issuer and (issuer_el is None or _text(issuer_el) != expected_issuer):
         raise RuntimeError("SAML issuer mismatch.")
 
     # Conditions: validity window + audience restriction.
@@ -263,9 +279,9 @@ def validate_response(
         if na and now >= _parse(na) + _CLOCK_SKEW:
             raise RuntimeError("SAML assertion expired.")
         audiences = [
-            (a.text or "").strip()
+            _text(a)
             for a in cond.findall(".//saml:AudienceRestriction/saml:Audience", NS)
-            if (a.text or "").strip()
+            if _text(a)
         ]
         if sp_entity_id and audiences and sp_entity_id not in audiences:
             raise RuntimeError("SAML audience restriction does not include this service provider.")
@@ -287,18 +303,19 @@ def validate_response(
         if not in_resp or in_resp != expected_in_response_to:
             raise RuntimeError("SAML InResponseTo mismatch (replayed or unsolicited response).")
 
-    # NameID (subject) — read from the verified subtree only.
+    # NameID (subject) — read from the verified subtree only, via _text() so an injected
+    # XML comment cannot truncate the signed identity (see _text docstring).
     nameid_el = assertion.find(".//saml:Subject/saml:NameID", NS)
-    name_id = (nameid_el.text or "").strip() if nameid_el is not None else ""
+    name_id = _text(nameid_el)
 
     # Attributes (verified subtree).
     attrs: dict[str, list[str]] = {}
     for attr in assertion.findall(".//saml:AttributeStatement/saml:Attribute", NS):
         name = attr.get("Name") or attr.get("FriendlyName") or ""
         vals = [
-            (v.text or "").strip()
+            _text(v)
             for v in attr.findall("saml:AttributeValue", NS)
-            if (v.text or "").strip()
+            if _text(v)
         ]
         if name:
             attrs[name] = vals

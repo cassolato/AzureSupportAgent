@@ -358,32 +358,66 @@ def _thread_reader(
             pass
 
 
+def _write_secret_file(content: str, *, suffix: str) -> str:
+    """Write a credential to a private temp file and return its path.
+
+    ``tempfile.mkstemp`` opens with ``O_CREAT | O_EXCL`` and mode 0600, so the secret
+    is never briefly world-readable and cannot be pre-created by a symlink attacker.
+    The explicit ``chmod`` is belt-and-braces for odd umask/platform behaviour.
+    Callers must unlink the path.
+    """
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="azcred-")
+    try:
+        os.write(fd, content.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:  # pragma: no cover - non-POSIX
+        pass
+    return path
+
+
 async def _sp_login(conn: dict[str, Any], az_path: str, config_dir: str) -> str | None:
     """Ephemeral `az login --service-principal` into an isolated config dir.
 
     Returns an error string on failure, or None on success. The SP secret/cert never
     persists outside this throwaway config dir.
+
+    The client secret is handed to the CLI through a 0600 temp file using Azure CLI's
+    ``@<file>`` argument-loading syntax rather than being written into argv. A plaintext
+    secret in argv is readable from the host process table (``ps``, ``/proc/<pid>/cmdline``)
+    by any co-located process for the duration of the login, and is picked up by process
+    monitoring agents and crash dumps. This mirrors how the certificate branch below
+    already avoids argv, and how the SSH runner pipes the sudo password via stdin.
     """
     tenant = conn.get("tenant_id", "")
     client_id = conn.get("client_id", "")
     if not (tenant and client_id):
         return "Service-principal connection is missing tenant or client id."
-    argv = [az_path, "login", "--service-principal", "-u", client_id, "--tenant", tenant, "--only-show-errors"]
+    base_argv = [
+        az_path, "login", "--service-principal",
+        "-u", client_id, "--tenant", tenant, "--only-show-errors",
+    ]
     cleanup: list[str] = []
+    # Fallback argv used only if the CLI build doesn't expand "@file" for this argument;
+    # keeps existing deployments working instead of hard-failing sign-in.
+    inline_argv: list[str] | None = None
     if conn.get("auth_method") == "service_principal_cert":
         pem = conn.get("certificate_pem", "")
         if not pem:
             return "Certificate connection is missing its PEM."
-        fd = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False, encoding="utf-8")
-        fd.write(pem)
-        fd.close()
-        cleanup.append(fd.name)
-        argv += ["-p", fd.name]
+        path = _write_secret_file(pem, suffix=".pem")
+        cleanup.append(path)
+        argv = base_argv + ["-p", path]
     else:
         secret = conn.get("client_secret", "")
         if not secret:
             return "Service-principal connection is missing its secret."
-        argv += ["-p", secret]
+        path = _write_secret_file(secret, suffix=".txt")
+        cleanup.append(path)
+        argv = base_argv + ["-p", f"@{path}"]
+        inline_argv = base_argv + ["-p", secret]
     env = dict(os.environ)
     env["AZURE_CONFIG_DIR"] = config_dir
     try:
@@ -396,6 +430,18 @@ async def _sp_login(conn: dict[str, Any], az_path: str, config_dir: str) -> str 
             env=env,
             timeout=60,
         )
+        if result.returncode != 0 and inline_argv is not None:
+            # Compatibility fallback: older/odd `az` builds may not expand "@file" for
+            # -p. Retrying inline restores the previous (argv-exposing) behaviour rather
+            # than locking an operator out of sign-in, and only happens after the safe
+            # path has already been attempted.
+            result = await asyncio.to_thread(
+                subprocess.run,
+                inline_argv,
+                capture_output=True,
+                env=env,
+                timeout=60,
+            )
         if result.returncode != 0:
             msg = (
                 result.stderr.decode("utf-8", errors="replace")[:300]

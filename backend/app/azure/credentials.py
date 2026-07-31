@@ -138,6 +138,11 @@ def _build_cert_assertion(tenant: str, client_id: str, pem: str) -> tuple[str | 
         from cryptography.x509 import load_pem_x509_certificate
 
         cert = load_pem_x509_certificate(pem.encode("utf-8"))
+        # SHA-1 here is not a security choice: RFC 7515 defines the `x5t` JOSE
+        # header as the base64url-encoded SHA-1 thumbprint of the certificate,
+        # and Microsoft Entra ID rejects client assertions that use anything
+        # else. It is an identifier for key selection, not a signature digest
+        # (the assertion itself is signed with RS256 below).
         thumbprint = cert.fingerprint(hashes.SHA1())
         x5t = base64.urlsafe_b64encode(thumbprint).decode("utf-8").rstrip("=")
         now = int(time.time())
