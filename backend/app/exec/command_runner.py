@@ -383,7 +383,18 @@ async def _sp_login(conn: dict[str, Any], az_path: str, config_dir: str) -> str 
         secret = conn.get("client_secret", "")
         if not secret:
             return "Service-principal connection is missing its secret."
-        argv += ["-p", secret]
+        # SECURITY: never place the secret in argv. Process arguments are world-readable on
+        # Linux via /proc/<pid>/cmdline and `ps`, and are routinely captured by container
+        # runtimes, EDR/monitoring agents, and crash dumps. Azure CLI's generic `@<file>`
+        # argument-loading syntax reads the value from disk instead. mkstemp() creates the
+        # file with O_CREAT|O_EXCL and mode 0600, so it is never briefly world-readable, and
+        # the `finally` block below unlinks it. This mirrors the certificate branch above and
+        # the SSH runner, which already pipes its sudo password via stdin rather than argv.
+        fd_no, secret_path = tempfile.mkstemp(suffix=".txt")
+        with os.fdopen(fd_no, "w", encoding="utf-8") as fh:
+            fh.write(secret)
+        cleanup.append(secret_path)
+        argv += ["-p", f"@{secret_path}"]
     env = dict(os.environ)
     env["AZURE_CONFIG_DIR"] = config_dir
     try:

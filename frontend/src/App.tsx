@@ -177,8 +177,14 @@ export default function App() {
           <Route path="/fmea/:id" element={<ChatView />} />
           <Route path="/policy" element={<ChatView />} />
           <Route path="/policy/:tab" element={<ChatView />} />
-          <Route path="/identity" element={<ChatView />} />
-          <Route path="/identity/:tab" element={<ChatView />} />
+          {/* The Identity screen was absorbed by Entra ID. Keep its three URLs working — each
+              lands on the tab that now hosts the panel it used to open. */}
+          <Route path="/identity" element={<Navigate to="/entra/findings?sub=hygiene" replace />} />
+          <Route path="/identity/pim" element={<Navigate to="/entra/privileged?sub=jit-hygiene" replace />} />
+          <Route path="/identity/app-registrations" element={<Navigate to="/entra/applications?sub=registrations" replace />} />
+          <Route path="/identity/*" element={<Navigate to="/entra" replace />} />
+          <Route path="/entra" element={<ChatView />} />
+          <Route path="/entra/:tab" element={<ChatView />} />
           <Route path="/coverage" element={<ChatView />} />
           <Route path="/alerts-manager" element={<ChatView />} />
           <Route path="/alerts-manager/simulator" element={<Navigate to="/alerts-manager/visualize" replace />} />

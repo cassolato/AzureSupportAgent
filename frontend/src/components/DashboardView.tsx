@@ -613,10 +613,10 @@ export function DashboardPanel() {
     }
     const idSecrets = (identityKpis?.expiring_secrets ?? 0) + (identityKpis?.expiring_certs ?? 0);
     if (idSecrets > 0) {
-      out.push({ id: "id-secrets", icon: "🔑", sev: idSecrets >= 3 ? "red" : "amber", text: `${plural(idSecrets, "credential")} expiring within 30 days`, to: "/identity", action: "Review" });
+      out.push({ id: "id-secrets", icon: "🔑", sev: idSecrets >= 3 ? "red" : "amber", text: `${plural(idSecrets, "credential")} expiring within 30 days`, to: "/entra/findings?sub=hygiene", action: "Review" });
     }
     if ((identityKpis?.users_without_mfa ?? 0) > 0) {
-      out.push({ id: "id-mfa", icon: "🔐", sev: "red", text: `${plural(identityKpis!.users_without_mfa, "privileged user")} without MFA`, to: "/identity", action: "Review" });
+      out.push({ id: "id-mfa", icon: "🔐", sev: "red", text: `${plural(identityKpis!.users_without_mfa, "privileged user")} without MFA`, to: "/entra/findings?sub=hygiene", action: "Review" });
     }
     for (const r of retirementsSoon.slice(0, 3)) {
       if ((r.days_until ?? 999) <= 60) {
@@ -997,7 +997,7 @@ export function DashboardPanel() {
 
             {/* Identity risk */}
             {isAdmin && (
-              <Card title="Identity risk" icon="🔑" manageTo="/identity">
+              <Card title="Identity risk" icon="🔑" manageTo="/entra/findings?sub=hygiene">
                 {identityQ.isError ? (
                   <Empty text="Identity data not available." />
                 ) : identityQ.data?.never_loaded ? (
@@ -1006,10 +1006,10 @@ export function DashboardPanel() {
                   <Empty text="No identity signals." />
                 ) : (
                   <div className="grid grid-cols-2 gap-2">
-                    <MiniStat to="/identity" label="Secrets ≤30d" value={identityKpis.expiring_secrets} tone={identityKpis.expiring_secrets > 0 ? "red" : "ok"} />
-                    <MiniStat to="/identity" label="Certs ≤30d" value={identityKpis.expiring_certs} tone={identityKpis.expiring_certs > 0 ? "red" : "ok"} />
-                    <MiniStat to="/identity" label="Ownerless apps" value={identityKpis.ownerless_apps} tone={identityKpis.ownerless_apps > 0 ? "amber" : "ok"} />
-                    <MiniStat to="/identity" label="Admins w/o MFA" value={identityKpis.users_without_mfa} tone={identityKpis.users_without_mfa > 0 ? "red" : "ok"} />
+                    <MiniStat to="/entra/findings?sub=hygiene" label="Secrets ≤30d" value={identityKpis.expiring_secrets} tone={identityKpis.expiring_secrets > 0 ? "red" : "ok"} />
+                    <MiniStat to="/entra/findings?sub=hygiene" label="Certs ≤30d" value={identityKpis.expiring_certs} tone={identityKpis.expiring_certs > 0 ? "red" : "ok"} />
+                    <MiniStat to="/entra/findings?sub=hygiene" label="Ownerless apps" value={identityKpis.ownerless_apps} tone={identityKpis.ownerless_apps > 0 ? "amber" : "ok"} />
+                    <MiniStat to="/entra/findings?sub=hygiene" label="Admins w/o MFA" value={identityKpis.users_without_mfa} tone={identityKpis.users_without_mfa > 0 ? "red" : "ok"} />
                   </div>
                 )}
               </Card>

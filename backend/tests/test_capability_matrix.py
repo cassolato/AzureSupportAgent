@@ -19,12 +19,19 @@ def test_service_principal_is_fully_capable(monkeypatch):
     }]
     m = _matrix(conns, monkeypatch)
     row = m["connections"][0]
-    assert row["score"] == 100
     assert row["blind_spots"] == []
     assert row["caps"]["graph_directory"]["status"] == probe.FULL
     assert row["caps"]["entra_directory"]["status"] == probe.FULL  # SP has a secret → EntraID MCP can run
     assert row["caps"]["log_analytics"]["status"] == probe.FULL
     assert row["caps"]["writes"]["status"] == probe.FULL
+    # The Entra ID Support Agent columns depend on the Graph permissions actually consented
+    # to this app registration, which is only knowable after a refresh has probed them.
+    # Before that we report DEGRADED ("not probed yet") rather than guessing FULL — so a
+    # never-refreshed connection is deliberately not a perfect 100.
+    for key in ("entra_bulk_read", "entra_ca_read", "entra_roles_read",
+                "entra_pim_read", "entra_logs_read", "entra_governance_read"):
+        assert row["caps"][key]["status"] == probe.DEGRADED
+    assert 0 < row["score"] < 100
     # Secrets must never leak into the response.
     assert "client_secret" not in row and "access_token" not in row
 
@@ -46,7 +53,14 @@ def test_pasted_token_is_blind_on_data_planes(monkeypatch):
     assert caps["log_analytics"]["status"] == probe.BLIND
     assert caps["key_vault_data"]["status"] == probe.BLIND
     assert caps["writes"]["status"] == probe.DISABLED  # read-only
-    assert set(row["blind_spots"]) == {"graph_directory", "entra_directory", "log_analytics", "key_vault_data"}
+    # A pasted ARM token cannot mint a Graph token, so every Entra ID Support Agent column
+    # is blind too — not merely unprobed.
+    entra_cols = {"entra_bulk_read", "entra_ca_read", "entra_roles_read",
+                  "entra_pim_read", "entra_logs_read", "entra_governance_read"}
+    for key in entra_cols:
+        assert caps[key]["status"] == probe.BLIND
+    assert set(row["blind_spots"]) == {
+        "graph_directory", "entra_directory", "log_analytics", "key_vault_data"} | entra_cols
     assert m["summary"]["with_blind_spots"] == 1
 
 

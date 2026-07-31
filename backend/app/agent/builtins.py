@@ -24,7 +24,7 @@ import re
 import socket
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -36,6 +36,7 @@ _MAX_TIMEOUT_S = 30
 _MAX_BODY_CHARS = 20000
 _MAX_PING_COUNT = 10
 _MAX_TRACE_HOPS = 30
+_UA = "AzureSupportAgent/1.0"
 
 # A hostname (RFC-1123 labels) or a bare IP literal. Anything else is rejected so a
 # target can never start with "-" (option injection) or contain shell metacharacters.
@@ -99,9 +100,9 @@ def _egress_check(host: str) -> str | None:
 def _resolve_safe_target(host: str) -> tuple[list[str], str | None]:
     """Validate + DNS-resolve a host, blocking SSRF targets. Returns (ips, error).
 
-    Note: there's a residual DNS-rebind window (we validate the resolved IPs, but the
-    eventual connection re-resolves). Acceptable for an admin-gated internal tool with a
-    kill-switch; the metadata IP and private ranges are still blocked at resolution time.
+    Callers that then make an HTTP request MUST connect to one of the returned IPs via
+    ``_pinned_request`` rather than handing the hostname back to httpx — otherwise the name
+    is resolved a second time and the validation here can be bypassed by DNS rebinding.
     """
     host = (host or "").strip()
     if not host:
@@ -141,31 +142,66 @@ def _host_of_url(url: str) -> tuple[str, str | None]:
     return p.hostname, None
 
 
+async def _pinned_request(
+    client: httpx.AsyncClient, method: str, url: str, ip: str
+) -> httpx.Response:
+    """Issue a request to an already-vetted IP instead of re-resolving the hostname.
+
+    SECURITY (DNS-rebind TOCTOU): ``_resolve_safe_target`` checks the addresses a name
+    resolves to, but passing the *name* to httpx makes it resolve again at connect time.
+    An attacker-controlled resolver can answer with a public address on the first lookup
+    and 169.254.169.254 on the second, reaching IMDS and exfiltrating managed-identity
+    tokens — and these tools take a model-supplied URL, so the trigger is prompt injection.
+    Connecting straight to the vetted IP removes the second lookup entirely.
+
+    The original ``Host`` header preserves virtual hosting, and the ``sni_hostname``
+    extension preserves TLS SNI *and* certificate hostname verification (httpcore validates
+    the peer certificate against ``sni_hostname``, not against the URL's host).
+    """
+    p = urlparse(url)
+    host = p.hostname or ""
+    literal = f"[{ip}]" if ":" in ip else ip
+    netloc = f"{literal}:{p.port}" if p.port else literal
+    pinned = urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    host_header = f"{host}:{p.port}" if p.port else host
+    return await client.request(
+        method,
+        pinned,
+        headers={"Host": host_header, "User-Agent": _UA},
+        extensions={"sni_hostname": host},
+    )
+
+
 # --- tool handlers --------------------------------------------------------------------
 async def _web_fetch(_config: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     url = str(args.get("url", "")).strip()
     host, herr = _host_of_url(url)
     if herr:
         return err(herr)
-    _, serr = _resolve_safe_target(host)
+    ips, serr = _resolve_safe_target(host)
     if serr:
         return err(serr)
     strip_html = bool(args.get("strip_html", True))
     timeout = _timeout(args)
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.get(url, headers={"User-Agent": "AzureSupportAgent/1.0"})
+            cur = url
+            resp = await _pinned_request(client, "GET", cur, ips[0])
             hops = 0
             while resp.is_redirect and hops < 5:
                 loc = resp.headers.get("location", "")
-                nxt = str(httpx.URL(resp.url).join(loc))
+                # Join against the URL we asked for, NOT resp.url — resp.url carries the
+                # pinned IP, so a relative Location would resolve against the IP and skip
+                # the hostname-based egress checks below.
+                nxt = str(httpx.URL(cur).join(loc))
                 nh, nerr = _host_of_url(nxt)
                 if nerr:
                     return err(f"Blocked redirect: {nerr}")
-                _, nserr = _resolve_safe_target(nh)
+                nips, nserr = _resolve_safe_target(nh)
                 if nserr:
                     return err(f"Blocked redirect to '{nh}': {nserr}")
-                resp = await client.get(nxt, headers={"User-Agent": "AzureSupportAgent/1.0"})
+                cur = nxt
+                resp = await _pinned_request(client, "GET", cur, nips[0])
                 hops += 1
     except httpx.HTTPError as exc:
         return err(f"Fetch failed: {exc}")
@@ -191,13 +227,13 @@ async def _http_request(_config: dict[str, Any], args: dict[str, Any]) -> dict[s
     host, herr = _host_of_url(url)
     if herr:
         return err(herr)
-    _, serr = _resolve_safe_target(host)
+    ips, serr = _resolve_safe_target(host)
     if serr:
         return err(serr)
     timeout = _timeout(args)
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.request(method, url, headers={"User-Agent": "AzureSupportAgent/1.0"})
+            resp = await _pinned_request(client, method, url, ips[0])
     except httpx.HTTPError as exc:
         return err(f"Request failed: {exc}")
     headers = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())

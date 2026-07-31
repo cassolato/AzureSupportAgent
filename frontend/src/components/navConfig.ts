@@ -131,7 +131,7 @@ export const PROACTIVE_NAV: ProactiveItem[] = [
   { id: "change-explorer", to: "/change-explorer", label: "Change Explorer", icon: "🕑", desc: "Analyze what changed in a workload over a time window, by risk, actor and dependency." },
   // Governance & identity — policy, identity posture and access review.
   { id: "policy", to: "/policy", label: "Azure Policy", icon: "🛡️", group: "Governance & identity", desc: "Policy inventory, compliance, effective policy, rollout planning and drift / IaC." },
-  { id: "identity", to: "/identity", label: "Identity", icon: "🆔", desc: "Identity security findings (expiry, MFA, secrets) and app-registration hygiene." },
+  { id: "entra", to: "/entra", label: "Entra ID", icon: "🛡️", desc: "Tenant-wide identity posture score, Conditional Access coverage and conflicts, privileged access, app-registration and credential-expiry hygiene, and a findings inbox — who can do what, and what breaks if you change it." },
   { id: "rbac", to: "/rbac", label: "RBAC", icon: "🔑", desc: "Azure RBAC access review — effective access, privileged exposure and scopes." },
   // Lifecycle & investigation — what's expiring, what's wrong, and the evidence trail.
   { id: "radar", to: "/radar", label: "Retirement Radar", icon: "🛰️", group: "Lifecycle & investigation", desc: "Track Azure retirements and breaking changes impacting your estate." },
@@ -374,14 +374,43 @@ export const OWNERSHIP_NAV: { id: OwnershipTab; label: string }[] = [
 export const OWNERSHIP_TAB_IDS = new Set<OwnershipTab>(OWNERSHIP_NAV.map((n) => n.id));
 
 // ---- Identity -------------------------------------------------------------------
-// Sub-tabs of the Identity screen, driven by the /identity/:tab URL so a refresh (or a
-// shared link) restores the same view. "overview" is the default (bare /identity).
-export type IdentityTab = "overview" | "pim" | "app-registrations";
+// The standalone Identity screen is gone. Its three tabs were absorbed by Entra ID, which
+// already owned the same subject matter and the same connection picker:
+//   /identity                    -> /entra/findings     ("Identity hygiene")
+//   /identity/pim                -> /entra/privileged   ("JIT hygiene")
+//   /identity/app-registrations  -> /entra/applications ("Registrations")
+// App.tsx keeps redirects for those three URLs so existing links and bookmarks still land
+// on the panel they used to open. The panels themselves still call the /identity/* API.
 
-export const IDENTITY_NAV: { id: IdentityTab; label: string }[] = [
-  { id: "overview", label: "🔍 Security Findings" },
-  { id: "pim", label: "🔑 PIM / JIT" },
-  { id: "app-registrations", label: "📝 App Registrations" },
+// ---- Entra ID Support Agent -----------------------------------------------------
+// The second product surface: tenant-wide identity posture, Conditional Access analysis
+// and the findings inbox. Sub-tab lives in the /entra/:tab URL so a refresh (or a shared
+// link) restores the same view. "posture" is the default (bare /entra).
+export type EntraTab =
+  | "posture" | "conditional-access" | "privileged" | "applications"
+  | "signals" | "governance" | "graph" | "findings" | "setup";
+
+export const ENTRA_NAV: { id: EntraTab; label: string }[] = [
+  { id: "posture", label: "🛡️ Posture" },
+  { id: "conditional-access", label: "🚦 Conditional Access" },
+  { id: "privileged", label: "👑 Privileged Access" },
+  { id: "applications", label: "🧩 Applications" },
+  { id: "signals", label: "📊 Risk & sign-ins" },
+  { id: "governance", label: "📜 Governance" },
+  { id: "graph", label: "🕸️ Blast radius" },
+  { id: "findings", label: "📋 Findings & scanners" },
+  { id: "setup", label: "🔌 Setup & coverage" },
 ];
 
-export const IDENTITY_TAB_IDS = new Set<IdentityTab>(IDENTITY_NAV.map((n) => n.id));
+export const ENTRA_TAB_IDS = new Set<EntraTab>(ENTRA_NAV.map((n) => n.id));
+
+// Sub-tabs of the Conditional Access Command Center.
+export type EntraCaTab = "coverage" | "policies" | "conflicts" | "breakglass" | "simulate";
+
+export const ENTRA_CA_NAV: { id: EntraCaTab; label: string }[] = [
+  { id: "coverage", label: "Coverage" },
+  { id: "policies", label: "Policies" },
+  { id: "conflicts", label: "Conflicts" },
+  { id: "breakglass", label: "Break-glass" },
+  { id: "simulate", label: "Simulate" },
+];

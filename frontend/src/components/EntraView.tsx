@@ -1,0 +1,472 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
+import { api, streamEntraRefresh, type EntraPillar, type EntraProgress } from "../api";
+import { formatError } from "../utils/format";
+import { usePersistedState } from "../utils/persistedState";
+import { ConnectionScopePicker } from "./ConnectionScopePicker";
+import { ENTRA_NAV, type EntraTab } from "./navConfig";
+import { EntraCaView } from "./entra/EntraCaView";
+import { EntraAppsView } from "./entra/EntraAppsView";
+import { EntraGovernanceView } from "./entra/EntraGovernanceView";
+import { EntraGraphView } from "./entra/EntraGraphView";
+import { EntraPrivilegedView } from "./entra/EntraPrivilegedView";
+import { EntraScannersView } from "./entra/EntraScannersView";
+import { EntraSignalsView } from "./entra/EntraSignalsView";
+import { EntraSetupView } from "./entra/EntraSetupView";
+import { Bar, CoverageBanner, EntraEmpty, FreshnessBadge, ScoreRing, SevBadge, StateChip } from "./entra/EntraShared";
+
+/**
+ * Entra ID Support Agent.
+ *
+ * Answers "who can do what in this tenant, what is exposed, and what breaks if I change it"
+ * — as opposed to the Azure estate tooling, which answers "what is wrong with my resources".
+ *
+ * Reads are cache-only: visiting a screen never triggers a tenant scan. Refresh is the only
+ * path that talks to Microsoft Graph, and it runs as a detached background job with SSE
+ * progress so a browser reload re-attaches instead of losing the run.
+ */
+/**
+ * A horizontally scrollable tab strip that admits when it is hiding something.
+ *
+ * Nine Entra tabs do not fit beside the freshness badge and connection picker at 1440px.
+ * Plain `overflow-x-auto` solved the layout and created a worse problem: four tabs sat
+ * off-screen with no edge cue, so the product looked like it had five screens. The
+ * gradients appear only when there is genuinely more in that direction.
+ *
+ * Three things here are load-bearing against a render loop that made the whole panel
+ * flicker, most visibly on the graph screen:
+ *   * `setEdges` must bail when nothing changed. A fresh object on every ResizeObserver
+ *     tick re-rendered the panel, which resized the strip, which fired the observer again.
+ *   * the observer effect must not depend on `children` — that is a new array every render,
+ *     so the observer was torn down and rebuilt in a loop.
+ *   * bringing the active tab into view uses `scrollLeft` arithmetic, not `scrollIntoView`,
+ *     which also scrolls every scrollable ancestor and was flicking the outer horizontal
+ *     scrollbar in and out of existence.
+ */
+function TabScroller({ activeId, children }: { activeId: string; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [edges, setEdges] = useState({ left: false, right: false });
+
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const left = el.scrollLeft > 4;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+    setEdges((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
+  }, []);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [measure]);
+
+  useEffect(() => {
+    const el = ref.current;
+    const active = el?.querySelector<HTMLElement>('[data-active="true"]');
+    if (!el || !active) return;
+    const start = active.offsetLeft;
+    const end = start + active.offsetWidth;
+    if (start < el.scrollLeft) el.scrollLeft = start;
+    else if (end > el.scrollLeft + el.clientWidth) el.scrollLeft = end - el.clientWidth;
+  }, [activeId]);
+
+  return (
+    <div className="relative min-w-0 flex-1">
+      <div ref={ref} onScroll={measure}
+           className="flex items-center gap-1 overflow-x-auto">
+        {children}
+      </div>
+      {edges.left && (
+        <div className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-white to-transparent" />
+      )}
+      {edges.right && (
+        <div className="pointer-events-none absolute inset-y-0 right-0 flex w-8 items-center justify-end bg-gradient-to-l from-white via-white to-transparent">
+          <span className="text-xs text-gray-400">{"\u203a"}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function EntraPanel({ tab = "posture" }: { tab?: EntraTab }) {
+  const navigate = useNavigate();
+  const qc = useQueryClient();
+  const [connectionId, setConnectionId] = usePersistedState("azsup.entra.connectionId", "");
+  const cid = connectionId || null;
+
+  const [refreshing, setRefreshing] = useState(false);
+  const [progress, setProgress] = useState<EntraProgress[]>([]);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const setTab = (v: EntraTab) => navigate(v === "posture" ? "/entra" : `/entra/${v}`);
+
+  const statusQ = useQuery({
+    queryKey: ["entra-status", cid],
+    queryFn: () => api.entraStatus(cid),
+    refetchInterval: refreshing ? 5000 : false,
+  });
+
+  const invalidate = useCallback(() => {
+    for (const key of [
+      "entra-status", "entra-posture", "entra-findings", "entra-setup", "entra-diagnostics",
+      "entra-ca-coverage", "entra-ca-policies", "entra-ca-conflicts", "entra-ca-breakglass",
+      "entra-priv-overview", "entra-priv-assignments", "entra-priv-pim", "entra-priv-activity",
+      "entra-priv-crossplane", "entra-apps", "entra-apps-consent", "entra-app360",
+      "entra-simulations",
+      "entra-signals-overview", "entra-auth-methods", "entra-legacy-auth", "entra-failures",
+      "entra-risky-users", "entra-patterns",
+      "entra-gov-overview", "entra-gov-coverage", "entra-gov-reviews", "entra-gov-entitlement",
+      "entra-gov-lifecycle",
+      "entra-graph", "entra-graph-targets", "entra-graph-escalations",
+      "entra-scanners", "entra-inbox",
+    ]) {
+      void qc.invalidateQueries({ queryKey: [key] });
+    }
+  }, [qc]);
+
+  const follow = useCallback(() => {
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setRefreshing(true);
+    void streamEntraRefresh(
+      {
+        onProgress: (p) => setProgress((prev) => [...prev.slice(-200), p]),
+        onDone: () => {
+          setRefreshing(false);
+          invalidate();
+        },
+        onError: (msg) => {
+          setProgress((prev) => [...prev, { seq: -1, ts: "", level: "error", message: msg }]);
+          setRefreshing(false);
+          invalidate();
+        },
+      },
+      cid,
+      ac.signal,
+    );
+  }, [cid, invalidate]);
+
+  // Re-attach to an in-flight job on mount / connection switch, so a page reload during a
+  // long collection picks the stream back up instead of looking like nothing is happening.
+  useEffect(() => {
+    if (statusQ.data?.refreshing && !refreshing) {
+      setProgress([]);
+      follow();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusQ.data?.refreshing]);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const startRefresh = async () => {
+    setProgress([]);
+    try {
+      await api.entraRefresh(cid);
+      follow();
+    } catch (err) {
+      setProgress([{ seq: -1, ts: "", level: "error", message: formatError(err) }]);
+    }
+  };
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden bg-gray-50">
+      <div className="flex items-center gap-1 border-b bg-white px-4 pt-2">
+        {/* Nine tabs with real names do not fit at 1440px. Scrolling horizontally keeps
+            every label on one line and readable; wrapping them turned the bar into three
+            ragged rows that pushed the content below the fold. Scrolling alone is not
+            enough though — with four tabs off-screen and no edge cue, a live tenant looked
+            like it simply had five screens. */}
+        <TabScroller activeId={tab}>
+          {ENTRA_NAV.map(({ id, label }) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              title={label}
+              data-active={tab === id ? "true" : undefined}
+              className={`shrink-0 whitespace-nowrap rounded-t-lg px-3 py-1.5 text-sm font-medium ${
+                tab === id ? "border-b-2 border-brand text-brand" : "text-gray-500 hover:text-gray-700"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </TabScroller>
+        <div className="ml-auto flex shrink-0 items-center gap-3 pb-1.5">
+          <FreshnessBadge meta={statusQ.data?.meta} onRefresh={startRefresh} refreshing={refreshing} />
+          <ConnectionScopePicker value={connectionId} onChange={setConnectionId} />
+        </div>
+      </div>
+
+      {(refreshing || progress.length > 0) && (
+        <ProgressStrip progress={progress} refreshing={refreshing} onDismiss={() => setProgress([])} />
+      )}
+
+      <div className="min-h-0 flex-1 overflow-auto">
+        {tab === "posture" && (
+          <PostureTab connectionId={cid} onRefresh={startRefresh} onOpenSetup={() => setTab("setup")} onOpenPillar={() => setTab("findings")} />
+        )}
+        {tab === "conditional-access" && <EntraCaView connectionId={cid} onOpenSetup={() => setTab("setup")} />}
+        {tab === "privileged" && <EntraPrivilegedView connectionId={cid} onOpenSetup={() => setTab("setup")} />}
+        {tab === "applications" && <EntraAppsView connectionId={cid} />}
+        {tab === "signals" && <EntraSignalsView connectionId={cid} onOpenSetup={() => setTab("setup")} />}
+        {tab === "governance" && <EntraGovernanceView connectionId={cid} onOpenSetup={() => setTab("setup")} />}
+        {tab === "graph" && <EntraGraphView connectionId={cid} onOpenSetup={() => setTab("setup")} />}
+        {tab === "findings" && <EntraScannersView connectionId={cid} onOpenSetup={() => setTab("setup")} />}
+        {tab === "setup" && <EntraSetupView connectionId={cid} />}
+      </div>
+    </div>
+  );
+}
+
+function ProgressStrip({
+  progress,
+  refreshing,
+  onDismiss,
+}: {
+  progress: EntraProgress[];
+  refreshing: boolean;
+  onDismiss: () => void;
+}) {
+  const last = progress[progress.length - 1];
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="border-b bg-indigo-50 px-4 py-1.5 text-xs text-indigo-900">
+      <div className="flex items-center gap-2">
+        <span className="font-medium">{refreshing ? "Collecting…" : "Collection finished"}</span>
+        <span className="truncate text-indigo-700">{last?.message}</span>
+        <button onClick={() => setOpen((v) => !v)} className="ml-auto underline underline-offset-2">
+          {open ? "hide log" : `log (${progress.length})`}
+        </button>
+        {!refreshing && (
+          <button onClick={onDismiss} className="text-indigo-500 hover:text-indigo-800">
+            ✕
+          </button>
+        )}
+      </div>
+      {open && (
+        <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-white/70 p-2 text-[11px] leading-relaxed">
+          {progress.map((p) => `${p.level.toUpperCase().padEnd(5)} ${p.message}`).join("\n")}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------------- posture
+function PostureTab({
+  connectionId,
+  onRefresh,
+  onOpenSetup,
+  onOpenPillar,
+}: {
+  connectionId: string | null;
+  onRefresh: () => void;
+  onOpenSetup: () => void;
+  onOpenPillar: (pillar: string) => void;
+}) {
+  const q = useQuery({
+    queryKey: ["entra-posture", connectionId],
+    queryFn: () => api.entraPosture(connectionId),
+  });
+
+  if (q.isLoading) return <div className="p-6 text-sm text-gray-500">Loading posture…</div>;
+  if (q.isError) return <div className="p-6 text-sm text-red-600">{formatError(q.error)}</div>;
+  const data = q.data!;
+  if (!data.meta.loaded) {
+    return (
+      <EntraEmpty
+        kind="cold"
+        detail="Nothing has been collected for this tenant yet. A refresh reads the directory read-only and never writes."
+        onRefresh={onRefresh}
+      />
+    );
+  }
+
+  const s = data.score;
+  const tenantName = data.tenant?.display_name || data.tenant?.primary_domain || data.meta.tenant_id;
+
+  return (
+    <div className="space-y-4 p-4">
+      <CoverageBanner meta={data.meta} onOpenSetup={onOpenSetup} />
+
+      {/* Headline: the score is meaningless without its coverage, so they are never split. */}
+      <div className="rounded-lg border bg-white p-4">
+        <div className="flex flex-wrap items-center gap-5">
+          <ScoreRing score={s.score} coverage={s.coverage} />
+          <div className="min-w-0 flex-1">
+            <div className="text-sm text-gray-500">{tenantName}</div>
+            <div className="flex flex-wrap items-baseline gap-2">
+              <span className="text-2xl font-semibold text-gray-900">Identity posture {s.score}/100</span>
+              {s.grade ? (
+                <span className="rounded bg-gray-100 px-2 py-0.5 text-sm font-medium text-gray-700">
+                  Grade {s.grade} · {s.grade_label}
+                </span>
+              ) : (
+                <span className="text-xs text-amber-700">{s.grade_withheld_reason}</span>
+              )}
+              {data.trend.delta != null && data.trend.delta !== 0 && (
+                <span className={`text-sm font-medium ${data.trend.delta > 0 ? "text-green-600" : "text-red-600"}`}>
+                  {data.trend.delta > 0 ? "▲" : "▼"} {Math.abs(data.trend.delta)} point
+                  {Math.abs(data.trend.delta) === 1 ? "" : "s"} since the previous run
+                </span>
+              )}
+            </div>
+            <div className="mt-1 text-xs text-gray-500">
+              Measured {Math.round(s.coverage * 100)}% of the model · {s.measured_signals} of {s.total_signals} checks ·
+              registry v{s.registry_version}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {(["critical", "high", "medium", "low"] as const).map((sev) => (
+                <span key={sev} className="inline-flex items-center gap-1 text-xs text-gray-600">
+                  <SevBadge sev={sev} />
+                  {s.findings_by_severity?.[sev] ?? 0}
+                </span>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Pillars */}
+      <div className="rounded-lg border bg-white">
+        <div className="border-b px-4 py-2 text-[13px] font-semibold text-gray-800">Pillars</div>
+        <div className="divide-y">
+          {s.pillars.map((p) => (
+            <PillarRow key={p.key} pillar={p} onOpen={() => onOpenPillar(p.key)} onOpenSetup={onOpenSetup} />
+          ))}
+        </div>
+      </div>
+
+      {/* Recoverable points — falls out of the score model for free and is the most useful
+          single list on the page. */}
+      {s.top_wins.length > 0 && (
+        <div className="rounded-lg border bg-white">
+          <div className="border-b px-4 py-2 text-[13px] font-semibold text-gray-800">Biggest wins available</div>
+          <div className="divide-y">
+            {s.top_wins.map((w) => (
+              <div key={w.signal_id} className="flex items-start gap-3 px-4 py-2.5">
+                <span className="mt-0.5 w-12 shrink-0 text-right text-sm font-semibold text-green-700">
+                  +{w.points.toFixed(1)}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <SevBadge sev={w.severity} />
+                    <span className="text-[13px] font-medium text-gray-900">{w.title}</span>
+                    <span className="text-xs text-gray-400">({w.findings})</span>
+                  </div>
+                  <div className="mt-0.5 text-xs text-gray-600">{w.remediation}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Trend */}
+      {data.trend.points.length > 1 && <Trend points={data.trend.points} />}
+
+      {/* Inventory counts */}
+      <div className="grid gap-3 md:grid-cols-4">
+        {Object.entries(data.counts ?? {}).map(([domain, counts]) => (
+          <div key={domain} className="rounded-lg border bg-white p-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-gray-400">{domain}</div>
+            <div className="mt-1 space-y-0.5 text-[13px]">
+              {Object.entries(counts ?? {}).slice(0, 6).map(([k, v]) => (
+                <div key={k} className="flex justify-between">
+                  <span className="text-gray-500">{k.replace(/_/g, " ")}</span>
+                  <span className="font-medium text-gray-800">{Number(v).toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PillarRow({
+  pillar,
+  onOpen,
+  onOpenSetup,
+}: {
+  pillar: EntraPillar;
+  onOpen: () => void;
+  onOpenSetup: () => void;
+}) {
+  const measured = pillar.score != null;
+  const tone =
+    pillar.score == null
+      ? "bg-gray-300"
+      : pillar.score >= 80
+      ? "bg-green-500"
+      : pillar.score >= 60
+      ? "bg-amber-500"
+      : "bg-red-500";
+  const reason = pillar.reason || pillar.not_measured[0]?.reason || "";
+  return (
+    <div className="flex items-center gap-3 px-4 py-2.5">
+      <div className="w-52 shrink-0">
+        <div className="text-[13px] font-medium text-gray-900">{pillar.label}</div>
+        <div className="text-[11px] text-gray-400">weight {pillar.weight}</div>
+      </div>
+      <div className="w-40 shrink-0">
+        <Bar value={pillar.score ?? 0} tone={tone} />
+      </div>
+      <div className="w-12 shrink-0 text-right text-sm font-semibold text-gray-800">
+        {measured ? pillar.score : "—"}
+      </div>
+      <div className="w-28 shrink-0">
+        <StateChip state={pillar.state} title={reason} />
+      </div>
+      <div className="min-w-0 flex-1 text-xs text-gray-500">
+        {measured ? (
+          <>
+            {pillar.findings} finding{pillar.findings === 1 ? "" : "s"} · measured{" "}
+            {pillar.measured_signals}/{pillar.total_signals} checks
+            {pillar.measured_fraction < 1 && ` (${Math.round(pillar.measured_fraction * 100)}% of this pillar)`}
+          </>
+        ) : (
+          <span title={reason}>{reason || "Not measured."}</span>
+        )}
+      </div>
+      {measured ? (
+        <button onClick={onOpen} className="shrink-0 text-xs font-medium text-brand underline underline-offset-2">
+          View findings
+        </button>
+      ) : (
+        <button onClick={onOpenSetup} className="shrink-0 text-xs font-medium text-brand underline underline-offset-2">
+          Fix coverage
+        </button>
+      )}
+    </div>
+  );
+}
+
+function Trend({ points }: { points: { at: string; score: number; coverage: number }[] }) {
+  const w = 600;
+  const h = 80;
+  const max = 100;
+  const step = points.length > 1 ? w / (points.length - 1) : w;
+  const path = points
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${(i * step).toFixed(1)} ${(h - (p.score / max) * h).toFixed(1)}`)
+    .join(" ");
+  return (
+    <div className="rounded-lg border bg-white p-3">
+      <div className="mb-1 text-[13px] font-semibold text-gray-800">Trend</div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="h-20 w-full" preserveAspectRatio="none">
+        <path d={path} fill="none" stroke="#4f46e5" strokeWidth="2" />
+      </svg>
+      <div className="flex justify-between text-[11px] text-gray-400">
+        <span>{points[0]?.at?.slice(0, 10)}</span>
+        <span>{points[points.length - 1]?.at?.slice(0, 10)}</span>
+      </div>
+    </div>
+  );
+}

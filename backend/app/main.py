@@ -32,6 +32,7 @@ from app.api import (
     connectors,
     coverage_reports,
     dnsdebug,
+    entra,
     evidence,
     fmea,
     graph,
@@ -530,6 +531,7 @@ api.include_router(inventory.router)
 api.include_router(tagintel.router)
 api.include_router(changeexplorer.router)
 api.include_router(identity.router)
+api.include_router(entra.router)
 api.include_router(alert_analysis.router)
 api.include_router(alerts_manager.router)
 api.include_router(amba.router)

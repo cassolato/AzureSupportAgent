@@ -8,12 +8,7 @@ import {
   type IdentityOverview,
 } from "../api";
 import { formatError } from "../utils/format";
-import { usePersistedState } from "../utils/persistedState";
 import { Skeleton, useDebounced } from "../utils/perf";
-import { IDENTITY_NAV, type IdentityTab } from "./navConfig";
-import { AppRegistrationsView } from "./AppRegistrationsView";
-import { PimReviewPanel } from "./PimReviewView";
-import { ConnectionScopePicker } from "./ConnectionScopePicker";
 
 const SEV_META: Record<string, { label: string; cls: string; dot: string; rank: number }> = {
   critical: { label: "Critical", cls: "bg-red-100 text-red-700", dot: "bg-red-500", rank: 4 },
@@ -74,41 +69,17 @@ function DaysBadge({ days }: { days?: number | null }) {
   );
 }
 
-export function IdentityPanel({ tab = "overview" }: { tab?: IdentityTab }) {
-  const navigate = useNavigate();
-  const setTab = (v: IdentityTab) => navigate(v === "overview" ? "/identity" : `/identity/${v}`);
-  const [connectionId, setConnectionId] = usePersistedState("azsup.identity.connectionId", "");
-  return (
-    <div className="flex h-full flex-col overflow-hidden bg-gray-50">
-      {/* Tab bar */}
-      <div className="flex items-center gap-1 border-b bg-white px-4 pt-2">
-        {IDENTITY_NAV.map(({ id: v, label }) => (
-          <button
-            key={v}
-            onClick={() => setTab(v)}
-            className={`rounded-t-lg px-3 py-1.5 text-sm font-medium ${
-              tab === v ? "border-b-2 border-brand text-brand" : "text-gray-500 hover:text-gray-700"
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-        <div className="ml-auto pb-1.5">
-          <ConnectionScopePicker value={connectionId} onChange={setConnectionId} />
-        </div>
-      </div>
-      {tab === "app-registrations" ? (
-        <AppRegistrationsView connectionId={connectionId || null} />
-      ) : tab === "pim" ? (
-        <PimReviewPanel connectionId={connectionId || null} />
-      ) : (
-        <IdentityFindingsPanel connectionId={connectionId || null} />
-      )}
-    </div>
-  );
-}
-
-function IdentityFindingsPanel({ connectionId = null }: { connectionId?: string | null }) {
+/**
+ * Identity security findings — expiring credentials, conditional-access gaps, ownerless app
+ * registrations, privileged users without MFA and Key Vault expiry.
+ *
+ * This was the /identity screen's default tab. That route is gone: the panel now lives as the
+ * "Identity hygiene" tab of Entra ID -> Findings & scanners, and its two siblings moved to
+ * Privileged Access -> JIT hygiene and Applications -> Registrations. It still reads the
+ * ARM-backed /identity/* endpoints with its own refresh button, which is why it stays a
+ * self-contained panel rather than being folded into the Entra snapshot.
+ */
+export function IdentityFindingsPanel({ connectionId = null }: { connectionId?: string | null }) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const [, setParams] = useSearchParams();

@@ -25,10 +25,14 @@ param adminPassword string
 @maxLength(63)
 param postgresAdminLogin string = 'azsupadmin'
 
-@description('Auto-generated PostgreSQL administrator password. Leave unchanged unless you need to supply your own.')
+// SECURITY: this must NOT have a default. It previously defaulted to a uniqueString()
+// expression, which is a documented deterministic hash — not a random value. Its inputs
+// (subscription id, resource group id, app name) are all discoverable from resource ids,
+// portal URLs, ARM exports, and Resource Graph, so the password could be recomputed offline.
+@description('PostgreSQL administrator password. Supply a strong, random value — this is a real credential and there is deliberately no default.')
 @secure()
 @minLength(16)
-param postgresAdminPassword string = 'Azsup!${uniqueString(subscription().id, resourceGroup().id, appName)}2026'
+param postgresAdminPassword string
 
 @description('PostgreSQL database name used by the app.')
 @minLength(1)
@@ -63,6 +67,20 @@ param containerMemory string = '2Gi'
 ])
 param privateNetworking string = 'No'
 
+// SECURITY: the 'AllowAzureServices' firewall rule below is Azure's 0.0.0.0-0.0.0.0 switch.
+// Despite the name it is NOT scoped to your subscription or tenant — it admits traffic from
+// ANY resource in ANY Azure tenant. It is nonetheless required in public mode, because a
+// Container Apps consumption environment egresses from addresses that are not stable, so
+// there is no narrower rule to write. That makes it a trade-off the operator must accept
+// knowingly rather than inherit silently, so this parameter has no default: a deployment
+// cannot proceed without answering it.
+@description('PUBLIC MODE ONLY — acknowledge that the PostgreSQL server will accept connections from ANY Azure tenant, via the AllowAzureServices 0.0.0.0 rule, because Container Apps egress IPs are not stable. Choose No only when Private networking = Yes, or when you will add your own scoped firewall rules; otherwise the app cannot reach its database. Ignored when Private networking = Yes.')
+@allowed([
+  'Yes'
+  'No'
+])
+param acknowledgePublicDatabaseAccess string
+
 @description('VNet address space (CIDR) used only when Private networking = Yes. Pick a range that does not overlap your existing networks.')
 param vnetAddressSpace string = '10.42.0.0/22'
 
@@ -73,6 +91,10 @@ param infraSubnetPrefix string = '10.42.0.0/23'
 param privateEndpointSubnetPrefix string = '10.42.2.0/27'
 
 var isPrivate = privateNetworking == 'Yes'
+
+// The public 0.0.0.0 firewall rule is deployed only in public mode AND only when the
+// operator has explicitly acknowledged the cross-tenant exposure it creates.
+var allowPublicDatabaseAccess = !isPrivate && acknowledgePublicDatabaseAccess == 'Yes'
 
 var normalizedAppName = toLower(appName)
 var unique = uniqueString(resourceGroup().id, normalizedAppName)
@@ -331,7 +353,9 @@ resource postgresDatabase 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2
 
 // Firewall rules are a public-access construct — only meaningful in public mode. In private mode
 // the server has public access disabled and is reached solely via its Private Endpoint.
-resource allowAzureServices 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = if (!isPrivate) {
+// SECURITY: 0.0.0.0-0.0.0.0 is "any Azure service in any tenant", not "my subscription". Gated
+// behind acknowledgePublicDatabaseAccess so it can never be created without a deliberate choice.
+resource allowAzureServices 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = if (allowPublicDatabaseAccess) {
   parent: postgres
   name: 'AllowAzureServices'
   properties: {

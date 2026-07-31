@@ -1044,6 +1044,84 @@ async def _state_identity(ctx: MissionContext) -> dict[str, Any] | None:
     }
 
 
+# ------------------------------------------------------------------- Entra posture
+def _entra_tenant(ctx: MissionContext) -> str:
+    """The tenant comes from the RESOLVED CONNECTION, never from the principal alone."""
+    return (ctx.connection or {}).get("tenant_id") or ctx.tenant_id or "default"
+
+
+def _entra_headline(analysis: dict[str, Any]) -> tuple[str, int, bool]:
+    score = analysis.get("score") or {}
+    counts = score.get("findings_by_severity") or {}
+    criticals = int(counts.get("critical") or 0)
+    highs = int(counts.get("high") or 0)
+    coverage = float(score.get("coverage") or 0.0)
+    value = int(score.get("score") or 0)
+    # The coverage is part of the headline on purpose: a 95/100 at 30% coverage is not a
+    # good posture, it is an unmeasured one, and Mission Control must not imply otherwise.
+    head = f"{value}/100 at {coverage:.0%} coverage · {criticals} critical · {highs} high"
+    return head, value, bool(criticals or highs)
+
+
+async def _run_entra(ctx: MissionContext, *, force: bool, progress=None) -> SystemResult:
+    from app.entra import scanners as entra_scanners
+    from app.entra import snapshot as entra_snapshot
+
+    link = "/entra"
+    if ctx.connection is None:
+        return SystemResult(status="skipped", headline="No Azure connection", link=link)
+    tenant_id = _entra_tenant(ctx)
+
+    async def report(level: str, message: str) -> None:  # noqa: ARG001
+        if progress:
+            await progress(message)
+
+    if progress:
+        await progress("Collecting Entra ID posture…")
+    outcome = await entra_snapshot.refresh(
+        tenant_id, ctx.connection, domains=None,
+        connection_id=ctx.connection_id or "", progress=report,
+    )
+    if not outcome.get("ok"):
+        error = str(outcome.get("error") or "Microsoft Graph error")
+        return SystemResult(status="fail", headline=error[:140], error=error,
+                            attention=True, link=link)
+
+    snap = entra_snapshot.analyse(tenant_id, force=True)
+    analysis = snap.get("_analysis") or {}
+    head, value, attention = _entra_headline(analysis)
+
+    # Run the due scanners off the snapshot we just took, so the findings inbox and the
+    # delta notifications stay in step with Mission Control rather than lagging a day.
+    try:
+        ctxs = entra_snapshot.context_from_settings(tenant_id)
+        entra_scanners.sweep(tenant_id, analysis, snap.get("domains") or {}, ctxs)
+        entra_scanners.update_ledger(tenant_id, analysis.get("findings") or [])
+    except Exception:  # noqa: BLE001 - scanning is a bonus; posture is the deliverable
+        logger.exception("entra scanner sweep failed during mission run")
+
+    return SystemResult(status="done", headline=head, score=value, attention=attention,
+                        link=link, result_ref={"kind": "entra", "tenant_id": tenant_id})
+
+
+async def _state_entra(ctx: MissionContext) -> dict[str, Any] | None:
+    from app.entra import snapshot as entra_snapshot
+
+    tenant_id = _entra_tenant(ctx)
+    snap = entra_snapshot.analyse(tenant_id)
+    if not snap.get("loaded"):
+        return None
+    head, value, attention = _entra_headline(snap.get("_analysis") or {})
+    age = None
+    from app.entra import cache as entra_cache
+
+    seconds = entra_cache.age_seconds(str(snap.get("generated_at") or ""))
+    if seconds is not None:
+        age = int(seconds)
+    return {"status": "done", "headline": head, "score": value, "attention": attention,
+            "age_seconds": age, "link": "/entra"}
+
+
 # --------------------------------------------------------------------------- registry
 SYSTEMS: list[SystemDef] = [
     SystemDef(key="architecture", label="AI Architecture", icon="🗺️", run=_run_architecture, last_state=_state_architecture, informational=True, ai_heavy=True),
@@ -1061,6 +1139,7 @@ SYSTEMS: list[SystemDef] = [
     SystemDef(key="inventory", label="Inventory Scanning", icon="🗂️", run=_run_inventory, last_state=_state_inventory, informational=True),
     SystemDef(key="rbac", label="RBAC Access Review", icon="🔐", run=_run_rbac, last_state=_state_rbac, informational=True),
     SystemDef(key="identity", label="Identity Findings", icon="🪪", run=_run_identity, last_state=_state_identity),
+    SystemDef(key="entra", label="Entra ID Posture", icon="🛡️", run=_run_entra, last_state=_state_entra),
 ]
 
 _BY_KEY: dict[str, SystemDef] = {s.key: s for s in SYSTEMS}

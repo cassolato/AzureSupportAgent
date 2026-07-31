@@ -1,3 +1,20 @@
 node_modules
 dist
 .vite
+
+# --- Never copy VCS metadata or secrets into an image layer -------------------
+.git
+.gitignore
+**/.env
+**/.env.*
+!**/.env.example
+**/.pgpass
+**/.pgname
+**/.pgloc
+**/*.pem
+**/*.pfx
+**/*.p12
+**/*.key
+**/secret.key
+**/.azure
+**/*.log

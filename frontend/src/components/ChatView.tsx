@@ -37,7 +37,7 @@ import {
   CHANGEEXPLORER_TAB_IDS,
   RBAC_TAB_IDS,
   OWNERSHIP_TAB_IDS,
-  IDENTITY_TAB_IDS,
+  ENTRA_TAB_IDS,
   type AdminSection,
   type AutomationsSection,
   type PolicyTab,
@@ -46,7 +46,7 @@ import {
   type ChangeExplorerTab,
   type RbacTab,
   type OwnershipTab,
-  type IdentityTab,
+  type EntraTab,
 } from "./navConfig";
 import { useAuth } from "./AuthContext";
 import { formatDuration, formatTimestamp } from "../utils/format";
@@ -153,8 +153,8 @@ const PolicyPanel = lazy(() =>
 const RbacPanel = lazy(() =>
   import("./RbacView").then((m) => ({ default: m.RbacPanel })),
 );
-const IdentityPanel = lazy(() =>
-  import("./IdentityView").then((m) => ({ default: m.IdentityPanel })),
+const EntraPanel = lazy(() =>
+  import("./EntraView").then((m) => ({ default: m.EntraPanel })),
 );
 const MonitoringCoveragePanel = lazy(() =>
   import("./MonitoringCoverageView").then((m) => ({ default: m.MonitoringCoveragePanel })),
@@ -588,12 +588,12 @@ export default function ChatView() {
     const seg = location.pathname.split("/")[2] as RbacTab | undefined;
     return seg && RBAC_TAB_IDS.has(seg) ? seg : "overview";
   })();
-  // Identity posture dashboard (admin-only).
-  const inIdentity = location.pathname.startsWith("/identity");
-  // Identity sub-tab lives in the URL (/identity/:tab) so a refresh restores the same view.
-  const identityTab: IdentityTab = (() => {
-    const seg = location.pathname.split("/")[2] as IdentityTab | undefined;
-    return seg && IDENTITY_TAB_IDS.has(seg) ? seg : "overview";
+  // Entra ID Support Agent — tenant posture, Conditional Access and the findings inbox.
+  // It also absorbed the former standalone Identity screen; /identity/* now redirects here.
+  const inEntra = location.pathname.startsWith("/entra");
+  const entraTab: EntraTab = (() => {
+    const seg = location.pathname.split("/")[2] as EntraTab | undefined;
+    return seg && ENTRA_TAB_IDS.has(seg) ? seg : "posture";
   })();
   // Monitoring Coverage (AMBA) dashboard (admin-only).
   const inCoverage = location.pathname.startsWith("/coverage");
@@ -717,7 +717,7 @@ export default function ChatView() {
   }, [inAutomations, inCustomAgents]);
   // Ownership, Architectures and Estate Graph now live UNDER Proactive Support, so opening
   // any of them (or the /proactive landing) keeps the group expanded.
-  const inAnyProactive = inInventory || inPolicy || inAssessments || inRbac || inIdentity
+  const inAnyProactive = inInventory || inPolicy || inAssessments || inRbac || inEntra
     || inCoverage || inAlertsManager || inTelemetry || inBackupDr || inBackupManager || inEvidence || inRadar || inReservations
     || inTeleIntel || inPerformance || inTagIntel || inChangeExplorer
     || inOwnership || inArchitectures || inKnowMe || inFmea || inGraph || inProactive || inQuota || inCapability || inCases || inInsights;
@@ -2606,7 +2606,7 @@ export default function ChatView() {
             "backup-manager": BackupIcon,
             capability: CoverageIcon,
             inventory: InventoryIcon, tagintel: TagIcon, "change-explorer": ChangeIcon,
-            policy: PolicyIcon, identity: IdentityIcon, rbac: RbacIcon,
+            policy: PolicyIcon, entra: IdentityIcon, rbac: RbacIcon,
             radar: RadarIcon, reservations: ReservationIcon,
             quota: PerformanceIcon,
             "telemetry-intel": TelemetryIntelIcon, evidence: EvidenceIcon,
@@ -2620,7 +2620,7 @@ export default function ChatView() {
             "backup-manager": inBackupManager,
             capability: inCapability,
             inventory: inInventory, tagintel: inTagIntel, "change-explorer": inChangeExplorer,
-            policy: inPolicy, identity: inIdentity, rbac: inRbac,
+            policy: inPolicy, entra: inEntra, rbac: inRbac,
             radar: inRadar, reservations: inReservations,
             quota: inQuota,
             "telemetry-intel": inTeleIntel, evidence: inEvidence,
@@ -3190,11 +3190,11 @@ export default function ChatView() {
             </Suspense>
           </PanelErrorBoundary>
         </main>
-      ) : inIdentity ? (
+      ) : inEntra ? (
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <PanelErrorBoundary name="Identity">
+          <PanelErrorBoundary name="Entra ID">
             <Suspense fallback={<PanelLoading />}>
-              <IdentityPanel tab={identityTab} />
+              <EntraPanel tab={entraTab} />
             </Suspense>
           </PanelErrorBoundary>
         </main>

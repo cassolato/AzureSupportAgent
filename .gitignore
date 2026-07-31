@@ -31,6 +31,15 @@ secret.key
 uvicorn.out.log
 uvicorn.err.log
 
+# Postgres throw-away resource gorup admin credential + server identifiers (never commit these).
+.pgpass
+**/.pgpass
+*.pgpass
+.pgname
+**/.pgname
+.pgloc
+**/.pgloc
+
 # --- Internal / non-distributable assets -------------------------------------
 sap.txt
 

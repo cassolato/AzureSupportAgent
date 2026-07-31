@@ -5595,6 +5595,255 @@ export const api = {
       "/identity/ticket",
       { method: "POST", body: JSON.stringify(body) },
     ),
+
+  // ---------------------------------------------------------------- Entra ID Support Agent
+  // Every read is cache-only: a cold cache returns meta.loaded=false, never a 500 and never
+  // a silent live tenant scan. `entraRefresh` is the only call that touches Microsoft Graph.
+  entraStatus: (connectionId?: string | null) =>
+    http<EntraStatus>(`/entra/status${entraQs(connectionId)}`),
+  entraRefresh: (connectionId?: string | null, domains?: string[]) =>
+    http<{ job: EntraJob; key: string }>(`/entra/refresh${entraQs(connectionId)}`, {
+      method: "POST",
+      body: JSON.stringify({ domains: domains ?? [], force: true }),
+    }),
+  entraDiagnostics: (connectionId?: string | null) =>
+    http<Record<string, unknown> & { meta: EntraMeta }>(`/entra/diagnostics${entraQs(connectionId)}`),
+  entraSetup: (connectionId?: string | null) =>
+    http<EntraSetup>(`/entra/setup/checklist${entraQs(connectionId)}`),
+  // Re-reads the connection's permissions from Microsoft without collecting anything, so a
+  // scope granted after the last refresh can be confirmed immediately.
+  entraRecheckPermissions: (connectionId?: string | null) =>
+    http<EntraPermissionRecheck>(`/entra/permissions/recheck${entraQs(connectionId)}`,
+      { method: "POST" }),
+
+  entraPosture: (connectionId?: string | null) =>
+    http<EntraPosture>(`/entra/posture${entraQs(connectionId)}`),
+  entraPosturePillar: (pillar: string, connectionId?: string | null) =>
+    http<{ meta: EntraMeta; pillar: EntraPillar; signals: (EntraSignal & { findings: number; measured: boolean; not_measured_reason: string })[]; findings: EntraFinding[] }>(
+      `/entra/posture/pillar/${encodeURIComponent(pillar)}${entraQs(connectionId)}`),
+  entraPostureDiff: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; new: EntraFinding[]; resolved: EntraFinding[]; persisting_count: number; counts: Record<string, number> }>(
+      `/entra/posture/diff${entraQs(connectionId)}`),
+
+  entraFindings: (
+    params: { severity?: string; pillar?: string; signal?: string; state?: string; search?: string; offset?: number; limit?: number },
+    connectionId?: string | null,
+  ) => http<EntraFindingsResponse>(`/entra/findings${entraQs(connectionId, params)}`),
+  entraSetFindingState: (
+    fingerprint: string,
+    body: { state: string; reason?: string; assignee?: string; note?: string },
+    connectionId?: string | null,
+  ) => http<{ ok: boolean; fingerprint: string; state: string }>(
+    `/entra/findings/${encodeURIComponent(fingerprint)}/state${entraQs(connectionId)}`,
+    { method: "POST", body: JSON.stringify(body) },
+  ),
+  entraSignalCatalogue: () =>
+    http<{ pillars: { key: string; label: string; weight: number; blurb: string }[]; signals: EntraSignal[]; registry_version: number }>(
+      "/entra/signals"),
+
+  entraCaPolicies: (connectionId?: string | null, params: { state?: string; search?: string } = {}) =>
+    http<{ meta: EntraMeta; policies: EntraCaPolicy[]; counts: Record<string, number>; named_locations: unknown[]; auth_strengths: unknown[] }>(
+      `/entra/ca/policies${entraQs(connectionId, params)}`),
+  entraCaPolicy: (policyId: string, connectionId?: string | null) =>
+    http<{ meta: EntraMeta; policy: EntraCaPolicy; effective_sample: { id: string; name: string }[]; excluded_sample: { id: string; name: string }[]; conflicts: EntraCaConflict[] }>(
+      `/entra/ca/policy/${encodeURIComponent(policyId)}${entraQs(connectionId)}`),
+  entraCaCoverage: (connectionId?: string | null) =>
+    http<EntraCaCoverage>(`/entra/ca/coverage${entraQs(connectionId)}`),
+  entraCaCoverageCell: (
+    params: { cohort: string; app_class: string; control: string },
+    connectionId?: string | null,
+  ) => http<{ meta: EntraMeta; cohort: string; cell: EntraCaCell; uncovered: { id: string; name: string; mfa_registered: boolean | null }[] }>(
+    `/entra/ca/coverage/cell${entraQs(connectionId, params)}`),
+  entraCaConflicts: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; conflicts: EntraCaConflict[]; by_kind: Record<string, number> }>(
+      `/entra/ca/conflicts${entraQs(connectionId)}`),
+  entraCaBreakGlass: (connectionId?: string | null) =>
+    http<EntraBreakGlass>(`/entra/ca/breakglass${entraQs(connectionId)}`),
+  entraCaConfirmBreakGlass: (
+    body: { user_id: string; confirmed: boolean; note?: string },
+    connectionId?: string | null,
+  ) => http<{ ok: boolean; user_id: string; confirmed: boolean }>(
+    `/entra/ca/breakglass/confirm${entraQs(connectionId)}`,
+    { method: "POST", body: JSON.stringify(body) },
+  ),
+  entraCaExport: (format: "json" | "markdown", connectionId?: string | null) =>
+    http<{ meta: EntraMeta; format: string; content: unknown }>(
+      `/entra/ca/export${entraQs(connectionId, { format })}`),
+  entraSeedDemo: () => http<{ tenant_id: string; score: number; findings: number }>(
+    "/entra/demo/seed", { method: "POST" }),
+
+  // ---- Privileged Access Mission Control (P3) ----------------------------------
+  entraPrivilegedOverview: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; counts: Record<string, number>; capabilities: Record<string, boolean>;
+           azure_link: EntraAzureLinkMeta; findings: EntraFinding[] }>(
+      `/entra/privileged/overview${entraQs(connectionId)}`),
+  entraPrivilegedAssignments: (
+    params: { kind?: string; tier?: string; principal_type?: string; search?: string },
+    connectionId?: string | null,
+  ) => http<{ meta: EntraMeta; assignments: EntraPrivAssignment[]; total: number;
+              capabilities: Record<string, boolean> }>(
+    `/entra/privileged/assignments${entraQs(connectionId, params)}`),
+  entraPrivilegedPimPolicies: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; controls: { key: string; label: string }[]; policies: EntraPimPolicy[];
+           capabilities: Record<string, boolean>; domain: EntraDomainMeta }>(
+      `/entra/privileged/pim-policies${entraQs(connectionId)}`),
+  entraPrivilegedActivity: (days: number, connectionId?: string | null) =>
+    http<{ meta: EntraMeta; activations: (Record<string, unknown> & {
+             id: string; created_at: string; principal_name: string; role_name: string;
+             action: string; duration_hours: number | null; justification: string;
+             justification_length: number; ticket_number: string })[];
+           total: number; counts: Record<string, number>; capabilities: Record<string, boolean> }>(
+      `/entra/privileged/activity${entraQs(connectionId, { days })}`),
+  entraActivations: (params: {
+    days?: number; plane?: string; tier?: string; q?: string; history?: boolean;
+    utcOffsetHours?: number;
+  }, connectionId?: string | null) =>
+    http<EntraActivationsResult>(
+      `/entra/privileged/activations${entraQs(connectionId, {
+        days: params.days, plane: params.plane, tier: params.tier, q: params.q,
+        history: params.history === false ? "false" : undefined,
+        utc_offset_hours: params.utcOffsetHours,
+      })}`),
+  entraActivationActions: (sessionId: string, connectionId?: string | null, refresh?: boolean) =>
+    http<EntraActivationActionsResult>(
+      `/entra/privileged/activations/${encodeURIComponent(sessionId)}/actions${
+        entraQs(connectionId, { refresh: refresh ? "true" : undefined })}`),
+  entraActivationsExport: (days: number, connectionId?: string | null) =>
+    http<Record<string, unknown>>(
+      `/entra/privileged/activations-export${entraQs(connectionId, { days })}`),
+  entraPrivilegedCrossPlane: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; rows: EntraCrossPlaneRow[]; total: number; azure_link: EntraAzureLinkMeta }>(
+      `/entra/privileged/cross-plane${entraQs(connectionId)}`),
+  entraPrivilegedPrincipal: (principalId: string, connectionId?: string | null) =>
+    http<Record<string, unknown> & { meta: EntraMeta }>(
+      `/entra/privileged/principal/${encodeURIComponent(principalId)}${entraQs(connectionId)}`),
+
+  // ---- Application 360 (P4) -----------------------------------------------------
+  entraApps: (
+    params: { search?: string; tier?: string; ownerless?: boolean; risk_min?: number; offset?: number; limit?: number },
+    connectionId?: string | null,
+  ) => http<{ meta: EntraMeta; apps: EntraAppRow[]; total: number; offset: number; limit: number;
+              counts: Record<string, number>; capabilities: Record<string, boolean>;
+              risk_components: { key: string; label: string; weight: number }[] }>(
+    `/entra/apps${entraQs(connectionId, params as Record<string, string | number | undefined>)}`),
+  entraApp360: (objectId: string, connectionId?: string | null) =>
+    http<EntraApp360>(`/entra/apps/${encodeURIComponent(objectId)}${entraQs(connectionId)}`),
+  entraAppsConsent: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; authorization_policy: Record<string, unknown>;
+           admin_consent_policy: Record<string, unknown>;
+           all_principals_grants: { client: string; resource: string; scopes: string[]; max_tier: string }[];
+           counts: Record<string, number> }>(`/entra/apps-consent${entraQs(connectionId)}`),
+
+  // ---- CA Change Simulator (P5) -------------------------------------------------
+  entraSimulate: (
+    body: { changes: Record<string, unknown>[]; contexts?: string[]; cohorts?: string[];
+            sample_size?: number; save?: boolean; label?: string },
+    connectionId?: string | null,
+  ) => http<{ meta: EntraMeta; result: EntraSimulationResult; saved_id: string }>(
+    `/entra/ca/simulate${entraQs(connectionId)}`, { method: "POST", body: JSON.stringify(body) }),
+  entraSimulateContexts: () =>
+    http<{ contexts: { key: string; label: string; client_app: string; platform: string;
+                       location: string; device_compliant: boolean; app_class: string; sign_in_risk: string }[];
+           always_full_cohorts: string[]; limitations: string[] }>("/entra/ca/simulate/contexts"),
+  entraSimulations: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; simulations: EntraSavedSimulation[] }>(
+      `/entra/ca/simulations${entraQs(connectionId)}`),
+  entraSimulation: (id: string, connectionId?: string | null) =>
+    http<{ meta: EntraMeta; simulation: { id: string; label: string; at: string; result: EntraSimulationResult };
+           stale: boolean }>(`/entra/ca/simulations/${encodeURIComponent(id)}${entraQs(connectionId)}`),
+  entraSimulationRerun: (id: string, connectionId?: string | null) =>
+    http<{ meta: EntraMeta; result: EntraSimulationResult; simulation_id: string }>(
+      `/entra/ca/simulations/${encodeURIComponent(id)}/rerun${entraQs(connectionId)}`,
+      { method: "POST", body: "{}" }),
+
+  // ---- Risk & sign-in intelligence (P6) -----------------------------------------
+  entraSignalsOverview: (connectionId?: string | null) =>
+    http<EntraSignalsOverview>(`/entra/signals/overview${entraQs(connectionId)}`),
+  entraAuthMethods: (connectionId?: string | null) =>
+    http<EntraAuthMethods>(`/entra/signals/auth-methods${entraQs(connectionId)}`),
+  entraLegacyAuth: (connectionId?: string | null) =>
+    http<EntraLegacyAuth>(`/entra/signals/legacy-auth${entraQs(connectionId)}`),
+  entraFailures: (connectionId?: string | null) =>
+    http<EntraFailures>(`/entra/signals/failures${entraQs(connectionId)}`),
+  entraRiskyUsers: (
+    params: { level?: string; state?: string }, connectionId?: string | null,
+  ) => http<EntraRiskyUsers>(`/entra/signals/risky-users${entraQs(connectionId, params)}`),
+  entraPatterns: (connectionId?: string | null) =>
+    http<EntraPatterns>(`/entra/signals/patterns${entraQs(connectionId)}`),
+
+  // ---- Governance hub (P6) -------------------------------------------------------
+  entraGovernanceOverview: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; counts: Record<string, number>;
+           capabilities: Record<string, boolean>; findings: EntraFinding[];
+           domain: EntraDomainMeta }>(`/entra/governance/overview${entraQs(connectionId)}`),
+  entraReviews: (overdue: boolean, connectionId?: string | null) =>
+    http<{ meta: EntraMeta; reviews: EntraAccessReview[]; total: number;
+           capabilities: Record<string, boolean> }>(
+      `/entra/governance/reviews${entraQs(connectionId, { overdue: overdue ? "true" : undefined })}`),
+  entraEntitlement: (expiringDays: number, connectionId?: string | null) =>
+    http<EntraEntitlement>(
+      `/entra/governance/entitlement${entraQs(connectionId, { expiring_days: expiringDays })}`),
+  entraLifecycle: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; workflows: EntraWorkflow[]; missing_categories: string[];
+           capabilities: Record<string, boolean> }>(
+      `/entra/governance/lifecycle${entraQs(connectionId)}`),
+  entraGovernanceCoverage: (connectionId?: string | null) =>
+    http<EntraGovernanceCoverage>(`/entra/governance/coverage${entraQs(connectionId)}`),
+
+  // ---- Blast-radius graph (P7) ---------------------------------------------------
+  entraGraphScopes: () =>
+    http<{ scopes: { kind: string; label: string; blurb: string }[];
+           primitives: EntraEscalationPrimitive[]; node_kinds: string[];
+           edge_kinds: string[]; max_nodes: number }>("/entra/graph/scopes"),
+  entraGraph: (scopeKind: string, scopeId: string, connectionId?: string | null) =>
+    http<EntraGraphResult>(
+      `/entra/graph${entraQs(connectionId, { scope_kind: scopeKind, scope_id: scopeId || undefined })}`),
+  entraGraphEscalations: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; escalations: EntraEscalation[]; total: number;
+           by_primitive: Record<string, number>;
+           primitives: EntraEscalationPrimitive[] }>(
+      `/entra/graph/escalations${entraQs(connectionId)}`),
+  entraGraphTargets: (connectionId?: string | null, q?: string) =>
+    http<{ meta: EntraMeta;
+           query: string;
+           principals: { id: string; label: string; privileged: boolean }[];
+           principal_total: number;
+           applications: { id: string; label: string; risk_score: number }[];
+           application_total: number;
+           roles: { id: string; label: string; tier: string }[];
+           role_total: number;
+           policies: { id: string; label: string; enforced: boolean }[] }>(
+      `/entra/graph/targets${entraQs(connectionId, { q })}`),
+
+  // ---- Proactive hub (P8) --------------------------------------------------------
+  entraScanners: (connectionId?: string | null) =>
+    http<{ meta: EntraMeta; scanners: EntraScanner[]; always_immediate: string[];
+           severity_order: string[] }>(`/entra/scanners${entraQs(connectionId)}`),
+  entraRunScanners: (
+    body: { scanner_ids?: string[]; force?: boolean; notify?: boolean },
+    connectionId?: string | null,
+  ) => http<{ meta: EntraMeta; ran: EntraScannerRun[];
+              skipped: { scanner_id: string; reason: string }[]; new_total: number;
+              immediate: EntraFinding[]; notified: number }>(
+    `/entra/scanners/run${entraQs(connectionId)}`, { method: "POST", body: JSON.stringify(body) }),
+  // Read-only: shows what a scanner reports now WITHOUT recording a run, so opening the
+  // results does not consume the new/resolved delta the next real run depends on.
+  entraScannerFindings: (scannerId: string, connectionId?: string | null, limit = 200) =>
+    http<EntraScannerFindings>(
+      `/entra/scanners/${encodeURIComponent(scannerId)}/findings${entraQs(connectionId)}&limit=${limit}`),
+  entraInbox: (
+    params: { severity?: string; pillar?: string; state?: string; ageing_days?: number;
+              unassigned?: boolean; search?: string; offset?: number; limit?: number },
+    connectionId?: string | null,
+  ) => http<EntraInbox>(
+    `/entra/inbox${entraQs(connectionId, params as Record<string, string | number | undefined>)}`),
+  entraInboxBulk: (
+    body: { fingerprints: string[]; state: string; reason?: string; assignee?: string;
+            note?: string; snooze_days?: number },
+    connectionId?: string | null,
+  ) => http<{ ok: boolean; updated: number; state: string; snoozed_until: string }>(
+    `/entra/inbox/bulk${entraQs(connectionId)}`, { method: "POST", body: JSON.stringify(body) }),
+
   // PIM / JIT lifecycle review — server-cached; visiting reads, refresh recomputes.
   pimOverview: (connectionId?: string | null) => {
     const q = new URLSearchParams();
@@ -9142,6 +9391,654 @@ export async function streamRbacRefresh(
   if (params.display_name) q.set("display_name", params.display_name);
   if (params.connection_id) q.set("connection_id", params.connection_id);
   const res = await fetch(`${API_BASE}/rbac/refresh/stream?${q.toString()}`, {
+    method: "GET",
+    credentials: "include",
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b?.detail) detail = b.detail;
+    } catch {
+      /* ignore */
+    }
+    handlers.onError?.(detail);
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    let value: Uint8Array | undefined;
+    let done = false;
+    try {
+      ({ value, done } = await reader.read());
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
+      throw err;
+    }
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split(/\r\n\r\n|\n\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const rawLine of frame.split(/\r\n|\n/)) {
+        if (rawLine.startsWith("event:")) event = rawLine.slice(6).trim();
+        else if (rawLine.startsWith("data:")) data += rawLine.slice(5).trim();
+      }
+      if (!data) continue;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (event === "start") handlers.onStart?.(parsed as never);
+      else if (event === "progress") handlers.onProgress?.(parsed as never);
+      else if (event === "done") handlers.onDone?.(parsed as never);
+      else if (event === "error") handlers.onError?.((parsed.message as string) ?? "Refresh failed.");
+    }
+  }
+}
+
+// ---- Entra ID Support Agent -----------------------------------------------------
+// Tenant-wide identity posture. Every response carries `meta`, which the UI renders BEFORE
+// the data so a blind or unlicensed pillar can never be silently presented as clean.
+/**
+ * One thing stopping a domain from being fully measured.
+ *
+ * `kind` is what makes it triageable: consent and azure_role the operator can fix today,
+ * licence costs money, cap is a deliberate bound and needs no action at all.
+ */
+export type EntraBlocker = {
+  kind: "consent" | "azure_role" | "licence" | "cap";
+  text: string;
+  scope: string;
+  subject: string;
+  impact: string;
+  domains?: string[];
+};
+
+export type EntraDomainMeta = {
+  name: string;
+  status: "ok" | "partial" | "blind" | "unlicensed" | "error" | "stale" | "not_collected";
+  generated_at: string;
+  item_count: number;
+  duration_ms: number;
+  error: string;
+  missing_permissions: string[];
+  truncated: boolean;
+  notes: string[];
+  blockers?: EntraBlocker[];
+};
+
+export type EntraLicences = {
+  p1: boolean; p2: boolean; governance: boolean; workload_id_premium: boolean;
+  detected: boolean; reason: string;
+  skus?: { sku: string; enabled_units: number; consumed_units: number; service_plans: number }[];
+};
+
+export type EntraMeta = {
+  tenant_id: string;
+  connection_id: string;
+  loaded: boolean;
+  generated_at: string;
+  age_seconds: number | null;
+  ttl_s: number;
+  stale: boolean;
+  coverage: number | null;
+  domains: Record<string, EntraDomainMeta>;
+  licences: EntraLicences;
+  blockers?: EntraBlocker[];
+  permissions_summary: {
+    token_ok: boolean | null;
+    token_error: string;
+    granted_count: number;
+    blind_domains: string[];
+    missing: string[];
+  };
+  truncated: boolean;
+  last_full: string;
+};
+
+export type EntraPillar = {
+  key: string; label: string; blurb: string; weight: number;
+  score: number | null;
+  state: "measured" | "partial" | "blind" | "unlicensed" | "error" | "not_collected" | "not_implemented";
+  reason: string;
+  findings: number; measured_signals: number; total_signals: number;
+  measured_fraction: number; penalty_units: number; max_units: number;
+  not_measured: { signal_id: string; title: string; reason: string }[];
+};
+
+export type EntraWin = {
+  signal_id: string; title: string; pillar: string; severity: string;
+  findings: number; units: number; points: number; remediation: string;
+};
+
+export type EntraScore = {
+  score: number;
+  grade: string;
+  grade_label: string;
+  grade_withheld_reason: string;
+  coverage: number;
+  measured_weight: number;
+  total_weight: number;
+  pillars: EntraPillar[];
+  top_wins: EntraWin[];
+  findings_by_severity: Record<string, number>;
+  findings_total: number;
+  measured_signals: number;
+  total_signals: number;
+  not_measured: { signal_id: string; reason: string }[];
+  registry_version: number;
+};
+
+export type EntraPosture = {
+  meta: EntraMeta;
+  score: EntraScore;
+  tenant: { id?: string; display_name?: string; primary_domain?: string; domains?: unknown[] };
+  counts: Record<string, Record<string, number>>;
+  trend: {
+    previous_score: number | null;
+    delta: number | null;
+    points: { at: string; score: number; coverage: number }[];
+  };
+};
+
+export type EntraFinding = {
+  signal_id: string; severity: string; pillar: string;
+  object_kind: string; object_id: string; object_name: string;
+  title: string; detail: string;
+  evidence: Record<string, unknown>;
+  portal_link: string; fingerprint: string;
+  state?: string; assignee?: string; note?: string; ticket?: string; first_seen?: string;
+};
+
+export type EntraSignal = {
+  id: string; title: string; question: string; why: string; pillar: string;
+  severity: string; weight: number; object_kind: string;
+  domains: string[]; requires: string[]; licence: string; benchmarks: string[];
+  remediation: string; remediation_steps: string[]; doc_link: string; tags: string[];
+};
+
+export type EntraFindingsResponse = {
+  meta: EntraMeta;
+  findings: EntraFinding[];
+  total: number; offset: number; limit: number;
+  by_severity: Record<string, number>;
+  signals: Record<string, EntraSignal>;
+  suppressed_count: number;
+};
+
+export type EntraCaPolicy = {
+  id: string; display_name: string; state: string; created_at: string; modified_at: string;
+  fingerprint: string;
+  conditions: Record<string, unknown>;
+  grant: { operator: string; controls: string[]; auth_strength_name: string; present: boolean };
+  session: Record<string, unknown>;
+  controls: string[];
+  is_block: boolean; is_enforced: boolean; is_report_only: boolean; is_disabled: boolean;
+  app_classes: string[]; targets_all_apps: boolean; blocks_legacy: boolean;
+  include_all_users: boolean;
+  effective_user_count: number; excluded_user_count: number;
+};
+
+export type EntraCaCell = {
+  state: "enforced" | "partial" | "report_only" | "none";
+  covered: number; size: number; policies: string[]; uncovered_total: number;
+};
+
+export type EntraCaCoverage = {
+  meta: EntraMeta;
+  cohorts: { key: string; label: string; size: number }[];
+  app_classes: { key: string; label: string }[];
+  controls: { key: string; label: string }[];
+  matrix: { cohort: string; label: string; size: number; cells: Record<string, EntraCaCell> }[];
+  headline: {
+    uncovered_users: number; uncovered_apps: number; total_users: number; total_apps: number;
+    privileged_uncovered: number;
+    uncovered_user_sample: { id: string; name: string }[];
+    privileged_uncovered_sample: { id: string; name: string }[];
+    uncovered_app_sample: { app_id: string; name: string }[];
+    assumptions: string[];
+  };
+};
+
+export type EntraCaConflict = {
+  kind: string; policy_id: string; policy_name: string; policy_state: string;
+  other_id: string; other_name: string; detail: string; affected: number; sample: string[];
+};
+
+export type EntraBreakGlass = {
+  meta: EntraMeta;
+  candidates: {
+    user_id: string; upn: string; display_name: string; score: number; reasons: string[];
+    confirmed: boolean | null; note: string; is_global_admin: boolean;
+    excluded_from: string[]; covered_by: string[];
+    mfa_registered: boolean | null; lockout_risk: boolean;
+  }[];
+  confirmed_ids: string[]; confirmed_count: number; candidate_count: number;
+  over_covered: { user_id: string; upn: string }[];
+  heuristic_note: string;
+};
+
+export type EntraSetup = {
+  meta: EntraMeta;
+  tiers: { tier: number; name: string; scopes: string[]; unlocks: string; granted: string[]; missing: string[]; complete: boolean }[];
+  granted: string[];
+  granted_known: boolean;
+  claim_error: string;
+  domains: Record<string, EntraPermissionDomain>;
+  licence_value: Record<string, string>;
+  app_registration: { client_id: string; tenant_id: string; portal_url: string };
+  consent_url: string;
+};
+
+export type EntraPermissionDomain = {
+  ok: boolean; missing: string[]; reason: string;
+  probe_status?: number; probe_verdict?: string;
+  licence_blocked?: boolean; licence_reason?: string;
+};
+
+export type EntraPermissionRecheck = {
+  meta: EntraMeta;
+  granted: string[];
+  gained: string[];
+  revoked: string[];
+  blind_domains: string[];
+  licence_blocked: string[];
+  domains: Record<string, EntraPermissionDomain>;
+  needs_refresh: boolean;
+};
+
+export type EntraStatus = {
+  meta: EntraMeta;
+  domains: EntraDomainMeta[];
+  collectable: string[];
+  job: EntraJob | null;
+  refreshing: boolean;
+};
+
+export type EntraJob = {
+  id: string; key: string; scope: string; domains: string[]; status: string;
+  started_at: string; finished_at: string | null; progress_count: number;
+  last_message: string; error: string;
+};
+
+export type EntraProgress = { seq: number; ts: string; level: "info" | "ok" | "warn" | "error"; message: string };
+
+// ---- Privileged Access Mission Control (P3) ------------------------------------
+export type EntraPrivAssignment = {
+  id: string; role_id: string; role_name: string; role_tier: string; role_privileged: boolean;
+  principal_id: string; principal_type: string; principal_name: string; principal_upn: string;
+  assignment_kind: string; source: string; source_group_name?: string;
+  permanent: boolean | null; permanence_known: boolean; end: string;
+  last_activation: string;
+};
+
+export type EntraPimPolicy = {
+  role_id: string; role_name: string; role_tier: string; policy_id: string;
+  approval_required: boolean; approver_count: number;
+  mfa_on_activation: boolean; auth_context_required: boolean;
+  justification_required: boolean; ticket_required: boolean;
+  max_activation_hours: number | null; eligibility_expires: boolean | null;
+  notification_recipients: number; score: number; failed_controls: string[];
+};
+
+export type EntraAzureLinkMeta = {
+  available: boolean; reason: string; generated_at: string; stale: boolean;
+  age_seconds?: number | null; counts: Record<string, number>;
+};
+
+export type EntraCrossPlaneRow = {
+  principal_id: string; name: string; kind: string;
+  entra_roles: string[]; entra_permissions: string[];
+  azure_roles: string[]; azure_all_roles: number;
+  azure_broad_scopes: string[]; azure_subscriptions: string[]; both_planes: boolean;
+};
+
+// ---- Application 360 (P4) -------------------------------------------------------
+export type EntraAppRow = {
+  object_id: string; sp_object_id: string; app_id: string; display_name: string;
+  has_registration: boolean; sp_type: string; enabled: boolean; multi_tenant: boolean;
+  verified_publisher: string; is_external: boolean;
+  owner_count: number; owners_known: boolean;
+  granted_permissions: number; max_permission_tier: string;
+  consent_grant_capable: boolean; tenant_wide: boolean;
+  credential_count: number; expiring_credentials: number; expired_credentials: number;
+  assigned_principals: number; orphaned: boolean; risk_score: number;
+  platform_managed: boolean;
+};
+
+export type EntraRiskComponent = {
+  key: string; label: string; weight: number; factor: number; points: number;
+  not_applicable?: string;
+};
+
+export type EntraApp360 = {
+  meta: EntraMeta;
+  app: EntraAppRow & { created_at: string; sign_in_audience: string; notes: string; sso_mode: string;
+                       assignment_required: boolean; app_owner_tenant_id: string };
+  owners: { id: string; name: string }[];
+  credentials: { id: string; display_name: string; kind: string; start: string; end: string;
+                 days_left: number | null; lifetime_days: number | null; expired: boolean }[];
+  federated_credentials: { id: string; name: string; issuer: string; subject: string;
+                           trusted: boolean; wildcard_subject: boolean }[];
+  granted_application_permissions: { permission: string; resource: string; tier: string;
+                                     flags: Record<string, boolean> }[];
+  granted_delegated: { consent_type: string; resource: string; scopes: string[]; max_tier: string }[];
+  requested_not_granted: { permission: string; resource: string; tier: string }[];
+  redirect_uris: { uri: string; type: string; risk: string }[];
+  provisioning: { id: string; template: string; code: string; quarantine: boolean; last_execution: string }[];
+  conditional_access: { covered_by: string[]; enforced_policies: number };
+  azure_reach: { roles: string[]; role_count: number; subscriptions: string[]; stale: boolean; generated_at: string };
+  risk: { score: number; components: EntraRiskComponent[]; delegated_all_principals: number };
+  findings: EntraFinding[];
+};
+
+// ---- CA Change Simulator (P5) ---------------------------------------------------
+export type EntraSimulationCase = {
+  principal_id: string; principal: string; kind: string; cohorts: string[];
+  context: string; context_label: string;
+  from: string; to: string; category: string; missing: string[];
+  policies_before: string[]; policies_after: string[]; mfa_unknown: boolean;
+};
+
+export type EntraSimulationResult = {
+  generated_at: string;
+  changes: string[];
+  counts: {
+    newly_blocked: number; newly_challenged: number; newly_granted: number;
+    protection_lost: number; unchanged: number;
+  };
+  break_glass_impact: EntraSimulationCase[];
+  break_glass_affected: number;
+  by_cohort: Record<string, Record<string, number>>;
+  by_context: Record<string, Record<string, number>>;
+  cases: EntraSimulationCase[];
+  case_total: number;
+  sampling: { total_principals: number; evaluated: number; sampled: boolean;
+              always_full_cohorts: string[]; sample_size: number; contexts: string[];
+              case_budget_exhausted: boolean };
+  assumptions: { mfa_unknown_principals: number; mfa_unknown_note: string };
+  limitations: string[];
+  baseline_enforced: number;
+  proposed_enforced: number;
+  confidence: string;
+  confidence_label: string;
+  fingerprint: string;
+};
+
+export type EntraSavedSimulation = {
+  id: string; label: string; at: string; actor: string;
+  counts: Record<string, number>; break_glass_affected: number; stale: boolean;
+};
+
+// ---- Risk & sign-in intelligence (P6) ---------------------------------------------
+export type EntraSignInAggregates = {
+  window_start: string; window_end: string; lookback_days: number; sampled: boolean;
+  total: number; success: number; failure: number; interactive: number;
+  mfa_challenged: number; failure_rate: number; mfa_metric?: string;
+  by_day: { day: string; total: number; success: number; failure: number; mfa: number }[];
+  by_app: { app_id: string; display_name: string; total: number; failure: number;
+            users: number; failure_rate: number; last_seen: string }[];
+  by_user_top: { user_id: string; upn: string; total: number; failure: number; last_seen: string }[];
+  by_client_app: Record<string, number>;
+  by_country: Record<string, number>;
+  by_ca_result: Record<string, number>;
+  by_failure_code: { code: string; meaning: string; count: number; users: number; sample: string }[];
+  legacy: { protocol: string; total: number; success: number; users: number; apps: number;
+            last_success: string }[];
+  legacy_success_users: number;
+  report_only_impact: { policy_id: string; display_name: string; would_block: number;
+                        would_challenge: number; would_pass: number; users: number }[];
+  device_compliance: Record<string, number>;
+  unmanaged_signin_users: { user_id: string; upn: string; count: number; device: string;
+                            last_seen: string }[];
+};
+
+export type EntraSignalsOverview = {
+  meta: EntraMeta; signins: EntraSignInAggregates; capabilities: Record<string, boolean>;
+  thresholds: Record<string, number>; counts: Record<string, number>; sampled: boolean;
+  domain: EntraDomainMeta;
+};
+
+export type EntraAuthSlice = {
+  total: number; registered: number; capable: number; passwordless: number; sspr: number;
+  phishing_resistant: number; weak_only: number; none: number;
+};
+
+export type EntraAuthMethods = {
+  meta: EntraMeta; known: boolean; overall: EntraAuthSlice; privileged: EntraAuthSlice;
+  distribution: Record<string, number>;
+  gap: { id: string; upn: string; display_name: string; privileged: boolean; last_signin: string }[];
+  gap_total: number;
+  enabled_total: number;
+  unreported: number;
+};
+
+// ---- Privileged activation sessions -------------------------------------------------
+/** One elevation: a principal taking a role they are eligible for, for a bounded window. */
+export type EntraActivationSession = {
+  id: string; plane: "entra" | "azure"; source: string;
+  principal_id: string; principal_name: string; principal_upn: string; principal_type: string;
+  role_id: string; role_name: string; tier: string;
+  scope_type: string; scope_id: string; scope_name: string; subscription_id: string;
+  action: string; status: string; granted: boolean;
+  requested_at: string; start: string; end: string; granted_hours: number | null;
+  justification: string; ticket_number: string; ticket_system: string;
+  requestor_id: string; self_service: boolean;
+  /** False when the source cannot carry a justification at all — not the same as blank. */
+  detail_known: boolean;
+  label: string; justification_length: number;
+  justification_quality: "ok" | "weak" | "missing" | "unknown";
+  start_local: string; in_business_hours: boolean | null;
+};
+
+export type EntraActivationsResult = {
+  meta: EntraMeta;
+  sessions: EntraActivationSession[];
+  total: number;
+  lookback_days: number;
+  capabilities: {
+    entra_requests?: boolean; entra_instances?: boolean; azure_requests?: boolean;
+    azure_subscriptions?: number; azure_reason?: string; detail?: boolean;
+  };
+  ledger: { total: number; earliest: string; latest: string; first_seen: string;
+            last_write: string; trimmed: number };
+  facets: Record<string, number>;
+};
+
+export type EntraActivationAction = {
+  plane: "entra" | "azure"; at: string; operation: string; category: string;
+  result: string; target: string; target_type: string; correlation_id: string;
+  subscription_id?: string; actor_ip?: string;
+  attribution: "required_activation" | "possible_without" | "unclassified";
+};
+
+export type EntraActivationActionsResult = {
+  meta: EntraMeta;
+  session: EntraActivationSession;
+  actions: EntraActivationAction[];
+  counts: Record<string, number>;
+  standing_entra_roles: string[];
+  standing_azure_roles: string[];
+  azure_link_available: boolean;
+  window: { start: string; end: string; pad_minutes: number };
+  notes: string[];
+  collected_at: string;
+  cached: boolean;
+};
+
+export type EntraLegacyAuth = {
+  meta: EntraMeta; capabilities: Record<string, boolean>; sampled: boolean;
+  protocols: EntraSignInAggregates["legacy"];
+  successful_users: number;
+  blocking_policies: { id: string; display_name: string; is_enforced: boolean; state: string }[];
+  policy_gap: boolean;
+};
+
+export type EntraFailures = {
+  meta: EntraMeta; capabilities: Record<string, boolean>; sampled: boolean;
+  codes: EntraSignInAggregates["by_failure_code"];
+  by_day: EntraSignInAggregates["by_day"];
+  failure_rate: number; total: number;
+  apps: EntraSignInAggregates["by_app"];
+};
+
+export type EntraRiskyUser = {
+  id: string; upn: string; name: string; level: string; state: string; detail: string;
+  last_updated: string; privileged: boolean; mfa_registered: boolean | null;
+  can_self_remediate: boolean; enabled: boolean; portal_link: string;
+};
+
+export type EntraRiskyUsers = {
+  meta: EntraMeta; capabilities: Record<string, boolean>; users: EntraRiskyUser[]; total: number;
+  detections: { id: string; type: string; level: string; state: string; user_id: string;
+                upn: string; detected_at: string; ip: string; country: string; activity: string }[];
+  detection_counts: Record<string, number>;
+  workload_identities: { id: string; app_id: string; name: string; level: string; state: string;
+                         detail: string; last_updated: string; enabled: boolean }[];
+};
+
+export type EntraPattern = {
+  kind: string; key: string; label: string; rule: string; count: number;
+  evidence: Record<string, unknown>;
+};
+
+export type EntraPatterns = {
+  meta: EntraMeta; capabilities: Record<string, boolean>; sampled: boolean;
+  patterns: EntraPattern[]; thresholds: Record<string, number>;
+};
+
+// ---- Governance hub (P6) ------------------------------------------------------------
+export type EntraAccessReview = {
+  id: string; display_name: string; status: string; created_at: string; last_modified: string;
+  scope: { kind: string; target: string; query: string };
+  reviewer_count: number; self_review: boolean; recurrence: string; auto_apply: boolean;
+  default_decision: string; default_decision_enabled: boolean; justification_required: boolean;
+  instances: { id: string; status: string; start: string; end: string }[];
+  days_overdue: number; quality_flags: string[];
+};
+
+export type EntraEntitlement = {
+  meta: EntraMeta;
+  packages: { id: string; display_name: string; description: string; catalog_id: string;
+              resource_scopes: number; no_review: boolean; no_expiry: boolean;
+              policies: { id: string; display_name: string; allowed_targets: string;
+                          approval_required: boolean; review_required: boolean;
+                          expires: boolean }[] }[];
+  expiring: { id: string; package_name: string; principal_name: string; principal_type: string;
+              expires_at: string; days_left: number }[];
+  assignments_total: number;
+  capabilities: Record<string, boolean>;
+};
+
+export type EntraWorkflow = {
+  id: string; display_name: string; category: string; enabled: boolean;
+  scheduling_enabled: boolean; task_count: number; last_modified: string;
+  runs: { total: number; failed: number; successful: number }; failure_rate: number;
+};
+
+export type EntraGovernanceCoverage = {
+  meta: EntraMeta;
+  rows: { key: string; label: string; why: string; count: number; reviewed: number;
+          governed: number; gap: number; objects: string[] }[];
+  classes: { key: string; label: string; why: string }[];
+  capabilities: Record<string, boolean>;
+  governance_readable: boolean;
+};
+
+// ---- Blast-radius graph (P7) --------------------------------------------------------
+export type EntraGraphNode = {
+  id: string; kind: string; label: string; data: Record<string, any>;
+  badges: Record<string, any>; expandable: boolean;
+};
+
+export type EntraGraphEdge = {
+  id: string; source: string; target: string; kind: string; label: string;
+  data?: Record<string, any>;
+};
+
+export type EntraGraphResult = {
+  meta: EntraMeta; scope_kind: string; scope_id: string;
+  nodes: EntraGraphNode[]; edges: EntraGraphEdge[];
+  stats: { node_count: number; edge_count: number; by_kind: Record<string, number>;
+           dropped_edges: number };
+  truncated: boolean; note: string;
+};
+
+export type EntraEscalationPrimitive = {
+  key: string; name: string; rule: string; confidence: string;
+};
+
+export type EntraEscalation = {
+  source: string; target: string; primitive: string; name: string; reason: string;
+  confidence: string; rule: string; fan_out_total?: number; also_via?: string[];
+};
+
+// ---- Proactive hub (P8) -------------------------------------------------------------
+export type EntraScanner = {
+  id: string; name: string; description: string; cadence: string; severity_floor: string;
+  pillars: string[]; tags: string[]; signal_ids: string[]; only_critical: boolean;
+  requires_domains: string[]; enabled: boolean; signal_count: number;
+  last_run: string; last_counts: Record<string, number>; blocked: string;
+};
+
+export type EntraScannerRun = {
+  scanner_id: string; name: string; at: string; blocked: string;
+  counts: { total: number; new: number; resolved: number; persisting: number };
+  by_severity: Record<string, number>;
+  new: EntraFinding[]; resolved_fingerprints: string[]; immediate: EntraFinding[];
+  first_run: boolean;
+};
+
+export type EntraScannerFindings = {
+  meta: EntraMeta; scanner_id: string; name: string; blocked: string; total: number;
+  by_severity: Record<string, number>; last_run: string;
+  findings: (EntraFinding & { is_new: boolean })[]; truncated: boolean;
+};
+
+export type EntraInboxRow = EntraFinding & {
+  state: string; assignee: string; note: string; ticket: string; snoozed_until: string;
+  first_seen: string; age_days: number | null;
+};
+
+export type EntraInbox = {
+  meta: EntraMeta; findings: EntraInboxRow[]; total: number; offset: number; limit: number;
+  by_severity: Record<string, number>; by_state: Record<string, number>;
+  recently_resolved: { fingerprint: string; signal_id: string; severity: string;
+                       first_seen: string; last_seen: string; resolved_at: string }[];
+  suppressed_count: number; ledger_size: number;
+};
+
+function entraQs(connectionId?: string | null, extra: Record<string, string | number | undefined> = {}): string {
+  const q = new URLSearchParams();
+  if (connectionId) q.set("connection_id", connectionId);
+  for (const [k, v] of Object.entries(extra)) {
+    if (v !== undefined && v !== "" && v !== null) q.set(k, String(v));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+/** Follow the background Entra collection over SSE. The server job keeps running even if
+ *  this stream disconnects — re-calling re-attaches and replays the log from the start. */
+export async function streamEntraRefresh(
+  handlers: {
+    onStart?: (d: EntraJob) => void;
+    onProgress?: (d: EntraProgress) => void;
+    onDone?: (d: { key: string; domains: string[] }) => void;
+    onError?: (msg: string) => void;
+  },
+  connectionId?: string | null,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/entra/refresh/stream${entraQs(connectionId)}`, {
     method: "GET",
     credentials: "include",
     signal,

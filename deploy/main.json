@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.44.1.10279",
-      "templateHash": "8138321196323360539"
+      "templateHash": "9926749449610323461"
     }
   },
   "parameters": {
@@ -58,10 +58,9 @@
     },
     "postgresAdminPassword": {
       "type": "securestring",
-      "defaultValue": "[format('Azsup!{0}2026', uniqueString(subscription().id, resourceGroup().id, parameters('appName')))]",
       "minLength": 16,
       "metadata": {
-        "description": "Auto-generated PostgreSQL administrator password. Leave unchanged unless you need to supply your own."
+        "description": "PostgreSQL administrator password. Supply a strong, random value — this is a real credential and there is deliberately no default."
       }
     },
     "postgresDatabaseName": {
@@ -110,6 +109,16 @@
         "description": "Deploy backing storage AND PostgreSQL behind Private Endpoints inside a VNet (Yes) or use the simple public deployment (No). This is a create-time choice and cannot be toggled on an existing deployment."
       }
     },
+    "acknowledgePublicDatabaseAccess": {
+      "type": "string",
+      "allowedValues": [
+        "Yes",
+        "No"
+      ],
+      "metadata": {
+        "description": "PUBLIC MODE ONLY — acknowledge that the PostgreSQL server will accept connections from ANY Azure tenant, via the AllowAzureServices 0.0.0.0 rule, because Container Apps egress IPs are not stable. Choose No only when Private networking = Yes, or when you will add your own scoped firewall rules; otherwise the app cannot reach its database. Ignored when Private networking = Yes."
+      }
+    },
     "vnetAddressSpace": {
       "type": "string",
       "defaultValue": "10.42.0.0/22",
@@ -134,6 +143,7 @@
   },
   "variables": {
     "isPrivate": "[equals(parameters('privateNetworking'), 'Yes')]",
+    "allowPublicDatabaseAccess": "[and(not(variables('isPrivate')), equals(parameters('acknowledgePublicDatabaseAccess'), 'Yes'))]",
     "normalizedAppName": "[toLower(parameters('appName'))]",
     "unique": "[uniqueString(resourceGroup().id, variables('normalizedAppName'))]",
     "compactAppName": "[replace(variables('normalizedAppName'), '-', '')]",
@@ -396,7 +406,7 @@
       ]
     },
     {
-      "condition": "[not(variables('isPrivate'))]",
+      "condition": "[variables('allowPublicDatabaseAccess')]",
       "type": "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules",
       "apiVersion": "2024-08-01",
       "name": "[format('{0}/{1}', variables('postgresServerName'), 'AllowAzureServices')]",

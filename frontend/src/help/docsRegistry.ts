@@ -56,7 +56,9 @@ export const DOCUMENTATION_TARGETS: Readonly<Record<string, DocumentationTarget>
   "/change-explorer": target("Change Explorer", "/user-guide/estate-intelligence/change-explorer", "/how-to/estate-intelligence/change-explorer"),
 
   "/policy": target("Azure Policy", "/user-guide/governance-identity/azure-policy", "/how-to/governance-identity"),
-  "/identity": target("Identity", "/user-guide/governance-identity/identity", "/how-to/governance-identity/identity-reviews"),
+  // The Identity screen was absorbed by Entra ID, so its documentation is now the Entra help
+  // target. /identity itself redirects and never reaches this lookup.
+  "/entra": target("Entra ID", "/user-guide/governance-identity/identity", "/how-to/governance-identity/identity-reviews"),
   "/rbac": target("RBAC", "/user-guide/governance-identity/rbac", "/how-to/governance-identity/rbac-access-reviews"),
 
   "/radar": target("Retirement Radar", "/user-guide/lifecycle-investigation/retirement-radar", "/how-to/lifecycle-investigation/retirement-radar"),

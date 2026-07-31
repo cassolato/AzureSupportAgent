@@ -37,6 +37,29 @@ NS = {
     "md": "urn:oasis:names:tc:SAML:2.0:metadata",
 }
 
+# SECURITY (CVE-2017-11427 / "SAML is Broken" class): an XML comment inside an element splits
+# its text, and lxml's ``.text`` returns only the run before the first child node — a comment
+# IS a child. So ``<NameID>admin@corp.com<!--x-->.attacker.example</NameID>`` reads back as
+# ``admin@corp.com``, while exclusive c14n digests the comment away so the IdP's signature
+# still verifies. The attacker authenticates as a different user.
+#
+# Two independent defenses, because either alone is sufficient and neither is expensive:
+#  1. ``_SAML_PARSER`` removes comments at parse time (verified: lxml merges the surrounding
+#     text nodes rather than dropping the tail), and is passed to signxml's verify() — whose
+#     own default parser keeps comments.
+#  2. ``_text()`` concatenates every text node instead of reading ``.text``.
+_SAML_PARSER = etree.XMLParser(resolve_entities=False, remove_comments=True, remove_pis=True)
+
+
+def _text(el: Any) -> str:
+    """Read an element's full text content, immune to comment-splitting.
+
+    Never use ``.text`` on a security-relevant SAML field — use this instead.
+    """
+    if el is None:
+        return ""
+    return "".join(el.itertext()).strip()
+
 # How long an in-flight SP-initiated request stays valid (the AuthnRequest ID is carried
 # in an encrypted, single-use cookie so the ACS can bind the response via InResponseTo).
 RELAY_TTL_SECONDS = 600
@@ -215,7 +238,7 @@ def validate_response(
     # Verify the XML signature against the configured cert. We require EXACTLY ONE signed
     # reference; multiple signatures are a classic wrapping vector.
     try:
-        result = XMLVerifier().verify(raw, x509_cert=cert_pem)
+        result = XMLVerifier().verify(raw, x509_cert=cert_pem, parser=_SAML_PARSER)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"SAML signature validation failed: {exc}") from exc
     if isinstance(result, list):
@@ -250,7 +273,7 @@ def validate_response(
     # Issuer check (read from the verified assertion).
     issuer_el = assertion.find("saml:Issuer", NS)
     expected_issuer = idp_cfg.get("entity_id", "")
-    if expected_issuer and (issuer_el is None or (issuer_el.text or "").strip() != expected_issuer):
+    if expected_issuer and (issuer_el is None or _text(issuer_el) != expected_issuer):
         raise RuntimeError("SAML issuer mismatch.")
 
     # Conditions: validity window + audience restriction.
@@ -263,9 +286,9 @@ def validate_response(
         if na and now >= _parse(na) + _CLOCK_SKEW:
             raise RuntimeError("SAML assertion expired.")
         audiences = [
-            (a.text or "").strip()
+            _text(a)
             for a in cond.findall(".//saml:AudienceRestriction/saml:Audience", NS)
-            if (a.text or "").strip()
+            if _text(a)
         ]
         if sp_entity_id and audiences and sp_entity_id not in audiences:
             raise RuntimeError("SAML audience restriction does not include this service provider.")
@@ -289,16 +312,16 @@ def validate_response(
 
     # NameID (subject) — read from the verified subtree only.
     nameid_el = assertion.find(".//saml:Subject/saml:NameID", NS)
-    name_id = (nameid_el.text or "").strip() if nameid_el is not None else ""
+    name_id = _text(nameid_el)
 
     # Attributes (verified subtree).
     attrs: dict[str, list[str]] = {}
     for attr in assertion.findall(".//saml:AttributeStatement/saml:Attribute", NS):
         name = attr.get("Name") or attr.get("FriendlyName") or ""
         vals = [
-            (v.text or "").strip()
+            _text(v)
             for v in attr.findall("saml:AttributeValue", NS)
-            if (v.text or "").strip()
+            if _text(v)
         ]
         if name:
             attrs[name] = vals

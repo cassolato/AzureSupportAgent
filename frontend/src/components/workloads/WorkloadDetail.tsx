@@ -410,7 +410,7 @@ function DeepLinkTab({ id, navigate, kind, profile }: { id: string; navigate: Re
         { label: "Ownership", to: "/ownership", desc: "Accountable owners and teams for this workload.", scoped: true },
         { label: "Azure Policy compliance", to: "/policy", desc: "Compliance against the baseline + assignment gaps.", scoped: false },
         { label: "RBAC access review", to: "/rbac", desc: "Who has role assignments across your estate.", scoped: false },
-        { label: "Identity exposure", to: "/identity", desc: "Secrets, expiry and MFA gaps across the tenant.", scoped: false },
+        { label: "Identity exposure", to: "/entra/findings?sub=hygiene", desc: "Secrets, expiry and MFA gaps across the tenant.", scoped: false },
       ]
     : [
         { label: "Retirement Radar", to: "/radar", desc: `${profile?.risk.retirements_total ?? "—"} retirements impacting this workload.`, scoped: true },

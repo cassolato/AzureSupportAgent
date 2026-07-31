@@ -56,7 +56,7 @@ export const DESTINATIONS: Destination[] = [
   { label: "Performance Profiler", path: "/performance", group: "Proactive Support", icon: "⚡", keywords: "heatmap bottleneck metrics", adminOnly: true },
   { label: "Retirement Radar", path: "/radar", group: "Proactive Support", icon: "📡", keywords: "retirement breaking change deprecation", adminOnly: true },
   { label: "Reservations Monitor", path: "/reservations", group: "Proactive Support", icon: "🏷️", keywords: "reserved instances savings plan", adminOnly: true },
-  { label: "Identity", path: "/identity", group: "Proactive Support", icon: "🔑", keywords: "entra aad mfa secrets certificates", adminOnly: true },
+  { label: "Entra ID", path: "/entra", group: "Proactive Support", icon: "🔑", keywords: "entra aad identity mfa secrets certificates conditional access pim privileged app registrations", adminOnly: true },
   { label: "RBAC / Access Review", path: "/rbac", group: "Proactive Support", icon: "🛂", keywords: "roles access who can do what", adminOnly: true },
   { label: "Telemetry Intelligence", path: "/telemetry-intel", group: "Proactive Support", icon: "📈", keywords: "log analytics noise cost", adminOnly: true },
   { label: "Evidence Locker", path: "/evidence", group: "Proactive Support", icon: "🗄️", keywords: "snapshot forensic audit hash", adminOnly: true },

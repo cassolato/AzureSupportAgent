@@ -51,6 +51,24 @@ CAPABILITIES: list[dict[str, str]] = [
      "desc": "Query Log Analytics / App Insights logs (KQL) on the data plane."},
     {"key": "key_vault_data", "label": "Key Vault data",
      "desc": "Read Key Vault secret / certificate metadata on the data plane (expiry checks)."},
+    {"key": "entra_bulk_read", "label": "Entra bulk directory read",
+     "desc": "Page users, groups, applications and service principals tenant-wide for the Entra ID "
+             "Support Agent. Needs Directory.Read.All (or User/Group/Application.Read.All)."},
+    {"key": "entra_ca_read", "label": "Entra Conditional Access",
+     "desc": "Read Conditional Access policies, named locations and authentication strengths. "
+             "Needs Policy.Read.All and an Entra ID P1 licence."},
+    {"key": "entra_roles_read", "label": "Entra directory roles",
+     "desc": "Read role definitions and assignments for the privileged-access analysis. "
+             "Needs RoleManagement.Read.Directory."},
+    {"key": "entra_pim_read", "label": "Entra PIM schedules",
+     "desc": "Read PIM eligibility / assignment schedules and role management policies. "
+             "Needs PrivilegedAccess.Read.AzureAD and an Entra ID P2 licence."},
+    {"key": "entra_logs_read", "label": "Entra sign-in & audit logs",
+     "desc": "Read sign-in activity, the MFA registration report and directory audits. "
+             "Needs AuditLog.Read.All and an Entra ID P1 licence."},
+    {"key": "entra_governance_read", "label": "Entra risk & governance",
+     "desc": "Read Identity Protection risk, access reviews and entitlement management. "
+             "Needs the P2-tier scopes and an Entra ID P2 licence."},
     {"key": "writes", "label": "Gated writes",
      "desc": "Execute approved mutating operations (remediation, tagging, deployments)."},
 ]
@@ -85,6 +103,70 @@ def _entra_directory_cell(conn: dict[str, Any]) -> dict[str, str]:
     return _cell(BLIND, err,
                  "Add a service-principal connection (client id + secret or certificate) granted "
                  "Directory.Read.All / Application.Read.All.")
+
+
+# Entra columns -> the collector domain(s) whose permission state decides the cell, and the
+# licence tier the feature needs. Driven by the cached probe written by the last Entra
+# refresh, so the matrix and the /entra screens can never disagree.
+_ENTRA_COLUMNS: dict[str, tuple[tuple[str, ...], str]] = {
+    "entra_bulk_read": (("people", "apps"), ""),
+    "entra_ca_read": (("ca",), "p1"),
+    "entra_roles_read": (("roles",), ""),
+    "entra_pim_read": (("pim",), "p2"),
+    "entra_logs_read": (("people",), "p1"),
+    "entra_governance_read": (("risk", "governance"), "p2"),
+}
+
+
+def _entra_cells(conn: dict[str, Any], graph_token_ok: bool) -> dict[str, dict[str, str]]:
+    """Capability cells for the Entra ID Support Agent columns.
+
+    Before the first refresh we can only say "depends on the consent granted to this app" —
+    claiming FULL there would be a guess. Once a refresh has run, the per-domain permission
+    probe and the detected licence tier give a definitive answer per column.
+    """
+    from app.entra import cache as entra_cache  # local import: avoids an import cycle
+    from app.entra.licences import licence_label
+
+    remediation = ("Grant the read-only Microsoft Graph application permissions listed in "
+                   "docs/ENTRA_SETUP.md, then run an Entra refresh.")
+    if not graph_token_ok:
+        return {
+            key: _cell(BLIND, "This connection cannot mint a Microsoft Graph token.", remediation)
+            for key in _ENTRA_COLUMNS
+        }
+
+    index = entra_cache.tenant_index(str(conn.get("tenant_id") or ""))
+    permissions = index.get("permissions") or {}
+    licences = index.get("licences") or {}
+    domains = permissions.get("domains") or {}
+    if not domains:
+        return {
+            key: _cell(DEGRADED,
+                       "A Microsoft Graph token is available, but the granted permissions have not "
+                       "been probed yet.",
+                       "Open the Entra ID area and run a refresh to discover what this connection can read.")
+            for key in _ENTRA_COLUMNS
+        }
+
+    out: dict[str, dict[str, str]] = {}
+    for key, (needed, licence) in _ENTRA_COLUMNS.items():
+        missing: list[str] = []
+        for domain in needed:
+            state = domains.get(domain) or {}
+            if not state.get("ok", False):
+                missing.extend(state.get("missing") or [])
+        if missing:
+            out[key] = _cell(BLIND, "Missing " + "; ".join(sorted(set(missing))), remediation)
+            continue
+        if licence and licences.get("detected") and not licences.get(licence):
+            out[key] = _cell(
+                DEGRADED, f"Requires {licence_label(licence)}, which this tenant does not have.",
+                "The rest of the Entra analysis still works; this pillar is reported as not measured.",
+            )
+            continue
+        out[key] = _cell(FULL, "Verified against the granted Microsoft Graph permissions.")
+    return out
 
 
 def _static_caps(conn: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -123,6 +205,7 @@ def _static_caps(conn: dict[str, Any]) -> dict[str, dict[str, str]]:
         caps["key_vault_data"] = _cell(
             FULL, "Can mint a Key Vault data-plane token (subject to each vault's access policy / RBAC)."
         )
+        caps.update(_entra_cells(conn, graph_token_ok=True))
         caps["writes"] = (
             _cell(DISABLED, "Connection is marked read-only.",
                   "Turn off read-only on the connection to allow gated writes.")
@@ -170,6 +253,7 @@ def _static_caps(conn: dict[str, Any]) -> dict[str, dict[str, str]]:
             "A pasted ARM token cannot read the Key Vault data plane, so secret / certificate "
             "expiry can't be checked.",
             "Use a service-principal or managed-identity connection for Key Vault data-plane reads.")
+        caps.update(_entra_cells(conn, graph_token_ok=caps["graph_directory"]["status"] == FULL))
         caps["writes"] = (
             _cell(DISABLED, "Connection is marked read-only.",
                   "Turn off read-only on the connection to allow gated writes.")
@@ -233,6 +317,7 @@ async def _live_overlay(conn: dict[str, Any], caps: dict[str, dict[str, str]]) -
         caps["graph_directory"] = _cell(
             BLIND, (graph_err or "Could not acquire a Microsoft Graph token.")[:300],
             caps.get("graph_directory", {}).get("remediation", ""))
+    caps.update(_entra_cells(conn, graph_token_ok=bool(graph_tok)))
 
 
 def _score(caps: dict[str, dict[str, str]]) -> int:

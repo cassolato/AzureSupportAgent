@@ -229,6 +229,21 @@ DEFAULTS: dict[str, Any] = {
     # credentials / API permissions / owners). The UI surfaces a "first N (capped)" notice when
     # the live listing hits this. Raise for large tenants at the cost of a slower refresh.
     "app_registrations_limit": 500,
+    # --- Entra ID Support Agent ----------------------------------------------------
+    # Server-side cache TTL (seconds) for the per-domain Entra snapshot. Reads never
+    # collect; this only decides when the UI shows a "stale" badge. Default 6h.
+    "entra_cache_ttl_s": 21600,
+    # Dormancy threshold (days) for stale users, guests, applications and admins.
+    "entra_stale_days": 90,
+    # Credential expiry window (days) for the secret / certificate expiry signals.
+    "entra_expiry_window_days": 90,
+    # Sign-in aggregation window (days). Bounded by the tenant's log retention (7d free, 30d P1).
+    "entra_signin_lookback_days": 30,
+    # Safety cap on user collection. Hitting it marks the domain truncated and the UI says so.
+    "entra_max_users": 250000,
+    # Allow Microsoft Graph beta endpoints (CA what-if evaluate, risky workload identities,
+    # workload-identity sign-ins). Turning this off keeps the product fully functional on v1.0.
+    "entra_enable_beta_endpoints": True,
     # --- AMBA Monitoring Coverage --------------------------------------------------
     # Server-side cache TTL (seconds) for coverage snapshots — the Resource Graph scans
     # are slow, so the dashboard serves a cached snapshot until it ages past this (6h).
@@ -475,6 +490,13 @@ def save_settings(updates: dict[str, Any]) -> dict[str, Any]:
     current["identity_cache_ttl_s"] = max(0, min(604800, int(current.get("identity_cache_ttl_s", 21600) or 21600)))
     current["identity_mfa_scan_cap"] = max(1, min(2000, int(current.get("identity_mfa_scan_cap", 50) or 50)))
     current["app_registrations_limit"] = max(50, min(5000, int(current.get("app_registrations_limit", 500) or 500)))
+    # Entra ID Support Agent: clamp cache TTL, windows and the collection cap.
+    current["entra_cache_ttl_s"] = max(0, min(604800, int(current.get("entra_cache_ttl_s", 21600) or 21600)))
+    current["entra_stale_days"] = max(1, min(730, int(current.get("entra_stale_days", 90) or 90)))
+    current["entra_expiry_window_days"] = max(1, min(365, int(current.get("entra_expiry_window_days", 90) or 90)))
+    current["entra_signin_lookback_days"] = max(1, min(90, int(current.get("entra_signin_lookback_days", 30) or 30)))
+    current["entra_max_users"] = max(100, min(2000000, int(current.get("entra_max_users", 250000) or 250000)))
+    current["entra_enable_beta_endpoints"] = bool(current.get("entra_enable_beta_endpoints", True))
     # AMBA: clamp cache TTL + tolerance; coerce the misconfig flag.
     current["amba_cache_ttl_s"] = max(0, min(604800, int(current.get("amba_cache_ttl_s", 21600) or 21600)))
     current["amba_misconfig_counts_as_gap"] = bool(current.get("amba_misconfig_counts_as_gap", True))

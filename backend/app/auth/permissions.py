@@ -68,6 +68,8 @@ PERMISSION_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ("policy.write", "Generate policy rollouts and IaC"),
         ("rbac.read", "View the Azure RBAC access review"),
         ("identity.read", "View identity security findings and app registrations"),
+        ("entra.read", "View the Entra ID tenant posture, policies and identities"),
+        ("entra.admin", "Refresh Entra collection, manage findings state and confirm break-glass accounts"),
         ("evidence.read", "View the Evidence Locker (investigation snapshots) and diffs"),
         ("evidence.write", "Create, attach, share, and export evidence snapshots"),
     ]),
