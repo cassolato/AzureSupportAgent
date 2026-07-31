@@ -22,6 +22,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -96,8 +97,21 @@ def _tenant_bucket(data: dict[str, Any], tenant_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- sidecar I/O
+def _safe_segment(value: str, fallback: str = "default") -> str:
+    """Reduce an identifier to a single, inert path segment.
+
+    ``tenant_id`` reaches here from a stored Azure connection record. It is normally a
+    GUID, but nothing on the write path guarantees that, and it is interpolated straight
+    into a filesystem path below. A value like ``../../..`` would place cache blobs
+    outside the cache root (CWE-22). ``scope`` is already neutralised by ``_scope_hash``;
+    this does the same job for the tenant segment.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", value or "").strip("._")
+    return cleaned[:64] or fallback
+
+
 def _blob_path(tenant_id: str, scope: str) -> Path:
-    return _BLOBS / (tenant_id or "default") / f"{_scope_hash(scope)}.json.gz"
+    return _BLOBS / _safe_segment(tenant_id) / f"{_scope_hash(scope)}.json.gz"
 
 
 def _write_blob(tenant_id: str, scope: str, payload: dict[str, Any]) -> None:

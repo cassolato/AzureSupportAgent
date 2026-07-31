@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from mdash import dedupe, sarif
+from mdash import dedupe, prove, sarif
 from mdash.agents import (
     AUTHN,
     DEBATE_SCHEMA,
@@ -454,3 +456,54 @@ def test_repo_config_parses_and_is_consistent():
     assert cfg.auditor.deployment and cfg.debater.deployment and cfg.escalation.deployment
     assert cfg.include, "scope.include must not be empty"
     assert cfg.prove is False
+
+
+# --------------------------------------------------------------- prove-stage sandboxing
+def test_network_guard_blocks_instance_metadata_and_allows_loopback(tmp_path):
+    """The sandbox preamble must deny outbound connections, IMDS above all.
+
+    The PoC that runs in the sandbox is model-written from a prompt containing repository
+    source, so on a cloud runner an unguarded outbound request to 169.254.169.254 turns a
+    prompt injection into a credential.
+    """
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        prove._NETWORK_GUARD
+        + "import socket\n"
+        "for host in ('169.254.169.254', 'example.com', '10.0.0.5'):\n"
+        "    try:\n"
+        "        socket.socket().connect((host, 80))\n"
+        "        print('REACHED', host)\n"
+        "    except PermissionError as exc:\n"
+        "        assert 'outbound network denied' in str(exc)\n"
+        "        print('BLOCKED', host)\n"
+        "try:\n"
+        "    socket.create_connection(('169.254.169.254', 80))\n"
+        "    print('REACHED create_connection')\n"
+        "except PermissionError:\n"
+        "    print('BLOCKED create_connection')\n",
+        encoding="utf-8",
+    )
+    out = subprocess.run(
+        [sys.executable, "-I", str(probe)], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert out.returncode == 0, out.stderr
+    assert "REACHED" not in out.stdout, out.stdout
+    assert out.stdout.count("BLOCKED") == 4, out.stdout
+
+
+def test_network_guard_is_prepended_to_generated_scripts():
+    """_execute must never run the raw model output on its own."""
+    state, detail = prove._execute("import socket\nprint('SAFE')\n", timeout=60)
+    assert state == ProofState.DISPROVEN.value
+    # The guard imports socket itself; a syntax or name error in it would surface here.
+    assert "SAFE" in detail
+
+
+def test_sanitise_for_log_strips_crlf():
+    """Model-authored titles must not be able to forge extra log records (CWE-117)."""
+    forged = "Real finding\r\nERROR  mdash  fabricated administrative event"
+    cleaned = prove._sanitise_for_log(forged)
+    assert "\n" not in cleaned and "\r" not in cleaned
+    assert cleaned.startswith("Real finding ERROR")
+    assert len(prove._sanitise_for_log("x" * 500, 70)) == 70

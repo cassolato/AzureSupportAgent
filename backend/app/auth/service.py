@@ -214,6 +214,23 @@ async def revoke_all_for_user(db: AsyncSession, user_id: str) -> int:
     return len(rows)
 
 
+async def revoke_sessions_for_user_except(db: AsyncSession, user_id: str, keep_sid: str | None) -> int:
+    """Revoke every live session for a user except ``keep_sid``. Returns the count revoked.
+
+    Used on password change: the credential that authorised the old sessions is gone, so
+    they must not outlive it, but the caller's own session is kept so changing a password
+    doesn't log you out of the browser you're sitting in.
+    """
+    stmt = select(Session).where(Session.user_id == user_id, Session.revoked.is_(False))
+    if keep_sid:
+        stmt = stmt.where(Session.id != keep_sid)
+    rows = (await db.execute(stmt)).scalars().all()
+    for s in rows:
+        s.revoked = True
+    await db.commit()
+    return len(rows)
+
+
 async def purge_stale_sessions(db: AsyncSession, retain_days: int = 7) -> int:
     """Hard-delete sessions that are revoked, absolute-expired, or idle-dead.
 

@@ -23,6 +23,7 @@ from app.auth.service import (
     find_user_by_login,
     primary_role,
     revoke_session,
+    revoke_sessions_for_user_except,
 )
 from app.auth.settings import load_auth_settings
 from app.core.config import get_settings
@@ -337,6 +338,7 @@ async def change_password(
     body: ChangePwBody,
     principal: Principal = Depends(get_principal),
     db: AsyncSession = Depends(get_db),
+    azsupagent_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ):
     cfg = load_auth_settings()
     if len(body.new_password) < int(cfg["password_min_length"]):
@@ -358,7 +360,13 @@ async def change_password(
     user.password_hash = hash_password(body.new_password)
     user.must_change_password = False
     await db.commit()
-    await _audit(db, user.username, "auth.password_changed", {})
+    # Changing a password is the standard way a user recovers from a stolen session
+    # cookie, so every OTHER session for this account has to die with the old password.
+    # Without this a hijacked session outlives the credential it was obtained with and
+    # stays valid until its own absolute expiry (CWE-613). The caller's own session is
+    # deliberately kept so the user is not logged out of the browser they just used.
+    revoked = await revoke_sessions_for_user_except(db, user.id, azsupagent_session)
+    await _audit(db, user.username, "auth.password_changed", {"other_sessions_revoked": revoked})
     return {"ok": True}
 
 
