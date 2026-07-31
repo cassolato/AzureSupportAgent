@@ -59,7 +59,35 @@ See the in-app **Trust & Security** page (Help → Trust & Security) and
 backend/    FastAPI app — API, agent orchestrator, MCP layer, coverage detectors
 frontend/   React + TypeScript + Vite SPA
 deploy/     Bicep + compiled ARM template for one-click Azure deploy
+scripts/    Operational and validation scripts (PowerShell + Bash)
 docs/        ← you are here
 ```
 
 A deeper map of the backend modules and frontend views is in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## 🛡️ Security engineering & MDASH readiness
+
+Contributor-facing security documentation, produced while preparing the repository for
+**Codename MDASH — Agentic code scanner** (Microsoft Defender / Security Exposure
+Management).
+
+| If you want to… | Read |
+| --- | --- |
+| Understand MDASH readiness, blockers, and the scan plan | [mdash-readiness.md](mdash-readiness.md) |
+| Validate the Azure subscription, resource group, and Foundry project | [azure-validation.md](azure-validation.md) |
+| Review conventional security findings and the remediation backlog | [security-review.md](security-review.md) |
+| Review AI/agent-specific risks (prompt injection, tool abuse, autonomy) | [ai-security-threat-model.md](ai-security-threat-model.md) |
+| See which paths to scan first, and why | [recommended-scan-scope.md](recommended-scan-scope.md) |
+
+Run the read-only environment validation before onboarding MDASH:
+
+```powershell
+./scripts/validate-azure-mdash-readiness.ps1 -SetContext   # PowerShell
+```
+
+```bash
+./scripts/validate-azure-mdash-readiness.sh --set-context  # Bash (needs az + jq)
+```
+
+For product security *operations* (approvals, credential handling, auditing), see the
+user-facing [Security section]({{ site.baseurl }}/security/).
