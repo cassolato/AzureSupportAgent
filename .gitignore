@@ -141,12 +141,23 @@ docs/_journey_render/
 # --- Per-section performance/UX improvement plans (review scratch, not shipped) ---
 docs/improvement-plans/
 
+# --- Agentic security scan output (regenerated every run) --------------------
+mdash-results/
+
 # --- Workspace agent customization (local-only, not shipped) -----------------
 # The whole .github folder stays local: it holds the workspace custom agents
 # (.github/agents/documentation-regenerator.agent.md, .github/agents/ui-test-pilot.agent.md)
 # and their design notes (.github/UITestAgent.md) — internal tooling, not product code.
 # Public documentation under docs/ remains tracked.
 .github/
+# ...except CI workflows, which have to be committed under .github/workflows to run at all.
+# Git will not descend into an excluded directory, so each level is re-included in turn
+# before the specific files can be.
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/mdash-scan.yml
 .docs-work/
 docs/.jekyll-cache/
 docs/.sass-cache/
