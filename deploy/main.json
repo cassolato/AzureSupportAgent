@@ -58,10 +58,9 @@
     },
     "postgresAdminPassword": {
       "type": "securestring",
-      "defaultValue": "[format('Azsup!{0}2026', uniqueString(subscription().id, resourceGroup().id, parameters('appName')))]",
       "minLength": 16,
       "metadata": {
-        "description": "Auto-generated PostgreSQL administrator password. Leave unchanged unless you need to supply your own."
+        "description": "PostgreSQL administrator password. Must be supplied at deployment time — generate a strong random value (for example: openssl rand -base64 24). Do not reuse the bootstrap admin password."
       }
     },
     "postgresDatabaseName": {

@@ -24,7 +24,7 @@ import re
 import socket
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -99,9 +99,10 @@ def _egress_check(host: str) -> str | None:
 def _resolve_safe_target(host: str) -> tuple[list[str], str | None]:
     """Validate + DNS-resolve a host, blocking SSRF targets. Returns (ips, error).
 
-    Note: there's a residual DNS-rebind window (we validate the resolved IPs, but the
-    eventual connection re-resolves). Acceptable for an admin-gated internal tool with a
-    kill-switch; the metadata IP and private ranges are still blocked at resolution time.
+    Callers that then open a connection MUST connect to one of the returned IPs (see
+    ``_pinned_request``) rather than re-passing the hostname, otherwise the HTTP client
+    performs its own second resolution and a short-TTL DNS-rebinding record can swing the
+    target to 169.254.169.254 or an internal address between check and connect.
     """
     host = (host or "").strip()
     if not host:
@@ -129,6 +130,44 @@ def _resolve_safe_target(host: str) -> tuple[list[str], str | None]:
     return ips, None
 
 
+def _pin_url_to_ip(url: str, ip: str) -> str:
+    """Rewrite ``url``'s host to the already-validated ``ip``, preserving everything else.
+
+    IPv6 literals get bracketed. The original hostname is restored on the wire via the
+    ``Host`` header and the TLS ``sni_hostname`` extension by :func:`_pinned_request`.
+    """
+    p = urlparse(url)
+    literal = f"[{ip}]" if ":" in ip else ip
+    netloc = f"{literal}:{p.port}" if p.port else literal
+    return urlunparse(p._replace(netloc=netloc))
+
+
+async def _pinned_request(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    ips: list[str],
+    host: str,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """Issue a request pinned to a vetted IP, closing the DNS-rebinding TOCTOU window.
+
+    ``_resolve_safe_target`` validates the addresses a hostname resolves to, but handing
+    the hostname to httpx makes it resolve again at connect time — an attacker-controlled
+    short-TTL record can return a benign IP for the check and 169.254.169.254 (cloud
+    instance metadata) for the connection. Connecting to the vetted IP directly, while
+    sending the original ``Host`` header and SNI so virtual hosting and TLS still work,
+    guarantees the socket lands on the address that was actually validated.
+    """
+    hdrs = {**(headers or {}), "Host": host}
+    return await client.request(
+        method,
+        _pin_url_to_ip(url, ips[0]),
+        headers=hdrs,
+        extensions={"sni_hostname": host},
+    )
+
+
 def _host_of_url(url: str) -> tuple[str, str | None]:
     try:
         p = urlparse(url)
@@ -147,25 +186,29 @@ async def _web_fetch(_config: dict[str, Any], args: dict[str, Any]) -> dict[str,
     host, herr = _host_of_url(url)
     if herr:
         return err(herr)
-    _, serr = _resolve_safe_target(host)
+    ips, serr = _resolve_safe_target(host)
     if serr:
         return err(serr)
     strip_html = bool(args.get("strip_html", True))
     timeout = _timeout(args)
+    ua = {"User-Agent": "AzureSupportAgent/1.0"}
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.get(url, headers={"User-Agent": "AzureSupportAgent/1.0"})
+            resp = await _pinned_request(client, "GET", url, ips, host, ua)
             hops = 0
             while resp.is_redirect and hops < 5:
                 loc = resp.headers.get("location", "")
-                nxt = str(httpx.URL(resp.url).join(loc))
+                # Join against the ORIGINAL url, not resp.url — the latter carries the
+                # pinned IP, which would corrupt a relative Location.
+                nxt = str(httpx.URL(url).join(loc))
                 nh, nerr = _host_of_url(nxt)
                 if nerr:
                     return err(f"Blocked redirect: {nerr}")
-                _, nserr = _resolve_safe_target(nh)
+                nips, nserr = _resolve_safe_target(nh)
                 if nserr:
                     return err(f"Blocked redirect to '{nh}': {nserr}")
-                resp = await client.get(nxt, headers={"User-Agent": "AzureSupportAgent/1.0"})
+                url, host, ips = nxt, nh, nips
+                resp = await _pinned_request(client, "GET", url, ips, host, ua)
                 hops += 1
     except httpx.HTTPError as exc:
         return err(f"Fetch failed: {exc}")
@@ -191,13 +234,15 @@ async def _http_request(_config: dict[str, Any], args: dict[str, Any]) -> dict[s
     host, herr = _host_of_url(url)
     if herr:
         return err(herr)
-    _, serr = _resolve_safe_target(host)
+    ips, serr = _resolve_safe_target(host)
     if serr:
         return err(serr)
     timeout = _timeout(args)
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-            resp = await client.request(method, url, headers={"User-Agent": "AzureSupportAgent/1.0"})
+            resp = await _pinned_request(
+                client, method, url, ips, host, {"User-Agent": "AzureSupportAgent/1.0"}
+            )
     except httpx.HTTPError as exc:
         return err(f"Request failed: {exc}")
     headers = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())

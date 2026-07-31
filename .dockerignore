@@ -13,6 +13,18 @@
 frontend/dist
 .env
 **/.env
+**/.env.*
+!**/.env.example
+# Credential/deployment scratch — must never be baked into an image layer.
+**/.pgpass
+**/.pgname
+**/.pgloc
+**/*.pem
+**/*.pfx
+**/*.p12
+**/*.key
+**/secret.key
+**/.azure
 *.log
 **/*.log
 docs/

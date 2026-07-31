@@ -8,7 +8,7 @@ param location string = 'westus3'
 @maxLength(40)
 param appName string = 'azure-support-agent'
 
-@description('Container image to deploy. Defaults to the public Docker Hub image, :latest tag, so the one-click button always provisions the newest published release. Switch to GHCR after the GitHub package is made public.')
+@description('Container image to deploy. Defaults to the public Docker Hub image, :latest tag, so the one-click button always provisions the newest published release. SECURITY: a mutable :latest tag means the deployed code can change without a template change and cannot be attested; for production, pin an immutable digest (docker.io/zmustafa/azure-support-agent@sha256:...) or a versioned tag. Switch to GHCR after the GitHub package is made public.')
 param containerImage string = 'docker.io/zmustafa/azure-support-agent:latest'
 
 @description('Bootstrap local admin username for first login.')
@@ -25,10 +25,15 @@ param adminPassword string
 @maxLength(63)
 param postgresAdminLogin string = 'azsupadmin'
 
-@description('Auto-generated PostgreSQL administrator password. Leave unchanged unless you need to supply your own.')
+// SECURITY: this parameter deliberately has NO default value. A previous default derived the
+// password from uniqueString(subscription id, resource group id, appName) — a deterministic,
+// documented hash of identifiers that are not secret, so anyone who knew them could recompute the
+// database administrator password offline (CWE-330: use of insufficiently random values).
+// Supply a strong, randomly generated password at deployment time instead.
+@description('PostgreSQL administrator password. Must be supplied at deployment time — generate a strong random value (for example: openssl rand -base64 24). Do not reuse the bootstrap admin password.')
 @secure()
 @minLength(16)
-param postgresAdminPassword string = 'Azsup!${uniqueString(subscription().id, resourceGroup().id, appName)}2026'
+param postgresAdminPassword string
 
 @description('PostgreSQL database name used by the app.')
 @minLength(1)
@@ -331,6 +336,13 @@ resource postgresDatabase 'Microsoft.DBforPostgreSQL/flexibleServers/databases@2
 
 // Firewall rules are a public-access construct — only meaningful in public mode. In private mode
 // the server has public access disabled and is reached solely via its Private Endpoint.
+//
+// SECURITY (CWE-284): the special 0.0.0.0-0.0.0.0 rule is Azure's "Allow public access from any
+// Azure service within Azure to this server" switch. It is NOT scoped to your subscription — it
+// admits traffic from ANY Azure tenant. It is required in public mode because Container Apps
+// egress addresses are not stable, but it means the server's only remaining protection is the
+// administrator credential + TLS. Prefer `privateNetworking: 'Yes'`, which disables public access
+// entirely and reaches PostgreSQL over a Private Endpoint, for any deployment holding real data.
 resource allowAzureServices 'Microsoft.DBforPostgreSQL/flexibleServers/firewallRules@2024-08-01' = if (!isPrivate) {
   parent: postgres
   name: 'AllowAzureServices'

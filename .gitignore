@@ -28,6 +28,15 @@ secret.key
 .acrname
 .stgname
 .imgdigest
+# PostgreSQL deployment scratch. `.pgpass` holds a live database password — these are
+# per-deployment machine state and must NEVER be committed.
+.pgpass
+**/.pgpass
+*.pgpass
+.pgname
+**/.pgname
+.pgloc
+**/.pgloc
 uvicorn.out.log
 uvicorn.err.log
 

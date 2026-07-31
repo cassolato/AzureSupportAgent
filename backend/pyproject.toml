@@ -17,17 +17,30 @@ dependencies = [
     "sse-starlette>=2.1",
     "openai>=1.54",
     "mcp>=1.28.1,<2",
-    "python-multipart>=0.0.12",
+    # >=0.0.18: 0.0.12-0.0.17 are affected by CVE-2024-53981 (DoS via malformed
+    # multipart boundaries).
+    "python-multipart>=0.0.18",
     "croniter>=2.0",
     "tzdata>=2024.1",
     "boto3>=1.35",
-    "asyncssh>=2.14",
+    # >=2.14.2: fixes CVE-2023-46445/46446 (Rogue Extension Negotiation and
+    # Rogue Session Attack in the SSH binary packet protocol).
+    "asyncssh>=2.14.2",
     "azure-servicebus>=7.12",
     "argon2-cffi>=23.1",
-    "PyJWT>=2.10",
-    "cryptography>=42.0",
-    "lxml>=5.0",
+    # >=2.10.1: fixes CVE-2024-53861 (issuer claim comparison bypass).
+    "PyJWT>=2.10.1",
+    # >=44.0.1: fixes GHSA-79v4-65xg-pq4g (vulnerable OpenSSL bundled in wheels)
+    # plus the earlier 42.x/43.x NULL-deref and PKCS#7 issues.
+    "cryptography>=44.0.1",
+    # >=5.3.0: fixes CVE-2024-52425 / the HTML parser data-loss issues; the RSS
+    # feed parser in app/radar/feed.py relies on lxml for safe (entity-free) XML.
+    "lxml>=5.3.0",
     "xhtml2pdf>=0.2.17",
+    # Transitively required by fastapi. Floored explicitly so a resolver cannot
+    # pick a release affected by CVE-2024-47874 (multipart DoS) or the earlier
+    # path-traversal issues in StaticFiles.
+    "starlette>=0.40.0",
 ]
 
 [project.optional-dependencies]

@@ -88,6 +88,17 @@ RUN python -m venv /opt/eidmcp \
     && /opt/eidmcp/bin/pip install --no-cache-dir \
         "cryptography>=48.0.1" azure-core azure-identity "mcp[cli]>=1.28.1,<2" msgraph-core msgraph-sdk fastmcp python-dotenv
 
+# Drop root. The app shells out to the Azure CLI, `npx @azure/mcp` and the networking
+# CLIs with operator-/model-influenced arguments, so any RCE in that path would otherwise
+# land as UID 0. Everything the runtime writes to (the .data state dir, the Azure CLI
+# config/extension dirs, the MCP venv and npm's cache) is chowned to the app user first.
+RUN useradd --system --create-home --uid 10001 --shell /usr/sbin/nologin app \
+    && mkdir -p /app/.data /home/app/.azure /home/app/.npm \
+    && chown -R app:app /app /opt/az-extensions /opt/eidmcp /home/app
+ENV HOME=/home/app \
+    NPM_CONFIG_CACHE=/home/app/.npm
+USER app
+
 EXPOSE 8000
 
 # Run DB migrations then start the API + SPA. All AI-provider sign-in flows are headless

@@ -6,15 +6,17 @@ an admin app-setting. The public Azure Updates RSS/Atom feed surfaces announceme
 they appear in a tenant's Service Health, but per the official template the workbook
 visibility can lag an announcement by up to ~2 weeks — so items here are advisory.
 
-Parsed defensively with the stdlib XML parser (no new dependency); network is via the
-already-present httpx. SSRF-guarded to https Azure/Microsoft hosts."""
+Parsed defensively with lxml (already a dependency, and unlike the stdlib parser it can
+refuse entity expansion outright); network is via the already-present httpx.
+SSRF-guarded to https Azure/Microsoft hosts."""
 from __future__ import annotations
 
 import logging
 import re
 from typing import Any
 from urllib.parse import urlparse
-from xml.etree import ElementTree as ET
+
+from lxml import etree
 
 log = logging.getLogger("app.radar.feed")
 
@@ -38,11 +40,29 @@ def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
+# Entity expansion is the risk here, not the parse itself: the feed URL is an admin
+# app-setting, so a misconfigured or hijacked host could serve a "billion laughs"
+# expansion bomb (CWE-776) or an XXE payload (CWE-611). lxml (already a dependency, used
+# by the SAML SP) can refuse both up front, which the stdlib parser cannot do portably.
+_SAFE_XML_PARSER = etree.XMLParser(
+    resolve_entities=False,  # never expand entities → no billion laughs, no XXE
+    no_network=True,         # never fetch an external DTD/entity
+    load_dtd=False,
+    dtd_validation=False,
+    huge_tree=False,         # keep libxml2's depth/size limits on
+    recover=False,
+)
+
+
 def _parse_rss(xml_text: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     try:
-        root = ET.fromstring(xml_text)  # noqa: S314 - trusted Microsoft feed, no entity expansion used
-    except ET.ParseError:
+        # Encode first: lxml refuses a str that carries its own encoding declaration.
+        root = etree.fromstring((xml_text or "").encode("utf-8"), parser=_SAFE_XML_PARSER)
+    except (etree.XMLSyntaxError, ValueError) as exc:
+        log.warning("Rejected malformed or unsafe updates-feed XML: %s", exc)
+        return out
+    if root is None:
         return out
     for item in root.iter("item"):
         title = (item.findtext("title") or "").strip()
