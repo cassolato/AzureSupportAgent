@@ -1,0 +1,73 @@
+# Configuration for the agentic security scanning harness (tools/mdash).
+#
+# Run it with:   python -m mdash --root . --out mdash-results
+# See tools/mdash/README.md for the full pipeline description.
+
+[panel]
+# Azure AI Foundry endpoint. Overridden by AZURE_OPENAI_ENDPOINT or --endpoint.
+# Any hostname for the resource works; it is rewritten to the *.openai.azure.com host,
+# because that is the only one that routes the Responses API.
+# endpoint = "https://<resource>.openai.azure.com/"
+#
+# The harness uses the Responses API, not Chat Completions. This is not a preference:
+# gpt-5.3-codex reports chatCompletion=false and serves only /responses. This api-version
+# is the oldest verified to route it.
+api_version = "2025-04-01-preview"
+
+# The three panel seats. Each is a *deployment* name in your Foundry resource.
+#
+# The roles matter more than the specific models: a code-heavy model audits, a cheap
+# high-volume model cross-examines, and an expensive reasoner is reserved for the cases
+# where those two disagree. That routing is where the cost saving comes from - the
+# expensive seat is reached only for contested findings, not once per file.
+#
+# reasoning_effort is the main quality/cost dial. The auditor thinks hard because it is
+# reading unfamiliar code; the debater is deliberately cheap because it runs on every
+# finding; the arbiter gets maximum effort because it is consulted least.
+#
+# MAI-Cyber-1-Flash is the auditor/debater tier in Microsoft's own MDASH deployment. It is
+# not available as a standalone Foundry endpoint (private preview, usable only inside
+# MDASH), so these are the generally available substitutes. If you are granted access,
+# change the deployment name here and nothing else needs to change.
+auditor = { deployment = "gpt-5.3-codex", max_output_tokens = 8000, reasoning_effort = "medium" }
+debater = { deployment = "gpt-5.4-mini", max_output_tokens = 4000, reasoning_effort = "low" }
+escalation = { deployment = "gpt-5.4", max_output_tokens = 6000, reasoning_effort = "high" }
+
+[scope]
+include = [
+    "backend/app/**/*.py",
+    "deploy/**/*.bicep",
+    "Dockerfile",
+    "*/Dockerfile",
+    "docker-compose.yml",
+    ".github/workflows/*.yml",
+]
+exclude = [
+    "**/tests/**",
+    "**/test_*.py",
+    "**/migrations/**",
+    "**/demo_*.py",
+    "**/*_demo.py",
+]
+# Empty means the full cohort: authn-authz, injection, ssrf-egress, secrets-crypto,
+# infra-supplychain.
+agents = []
+
+[limits]
+# Files are ranked by attack-surface score, so this is a budget, not an arbitrary cut:
+# raising it scans progressively less interesting code.
+max_targets = 40
+max_file_bytes = 120000
+concurrency = 6
+request_timeout = 240
+max_retries = 3
+# Findings below this confidence after debate are dropped rather than reported.
+min_confidence = 0.35
+prove_timeout = 20
+
+[stages]
+# Debate is what separates a finding from a triage backlog. Leave it on.
+debate = true
+# The prove stage EXECUTES MODEL-GENERATED CODE in a sandboxed subprocess. Off by default;
+# enable it in CI or a container, not on a workstation holding credentials.
+prove = false

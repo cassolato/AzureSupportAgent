@@ -1,0 +1,71 @@
+# CodeQL static analysis.
+#
+# Runs GitHub's semantic code analysis over the Python backend and the
+# TypeScript/React frontend. Findings appear under Security > Code scanning and, once
+# Codename MDASH is onboarded, sit alongside MDASH SARIF results in the same view.
+#
+# Requires no secrets: GITHUB_TOKEN is provided automatically by GitHub Actions.
+#
+# See docs/mdash-readiness.md and docs/recommended-scan-scope.md.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so advisories added after a merge are still caught.
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+# Least privilege: read the repo, write security events, nothing else.
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      security-events: write
+      # Required so the action can report status on pull requests from forks.
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            # backend/app — the orchestration, MCP, exec, auth, and credential paths
+            # ranked Critical in docs/recommended-scan-scope.md.
+            build-mode: none
+          - language: javascript-typescript
+            # frontend/src — renders agent output, so XSS is the primary concern.
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # security-extended adds lower-severity and higher-precision-cost queries.
+          # Worth the extra runtime for a repository that holds tenant credentials.
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}

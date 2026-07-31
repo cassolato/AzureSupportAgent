@@ -1,0 +1,52 @@
+# Dependency review.
+#
+# Blocks pull requests that introduce dependencies with known high-severity
+# vulnerabilities, and surfaces licence changes for review.
+#
+# This complements Dependabot: Dependabot fixes what is already merged, while this gate
+# stops new vulnerable dependencies from landing. PR #4 remediated npm transitive
+# advisories reaching the tree through vite-plugin-pwa; this workflow prevents a
+# recurrence going unnoticed.
+#
+# Requires no secrets: GITHUB_TOKEN is provided automatically by GitHub Actions.
+#
+# Note: the dependency-review API requires the Dependency Graph to be enabled on the
+# repository (Settings > Code security). It is enabled by default on public repositories.
+
+name: Dependency review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review dependency changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      # Needed to post the review summary comment on the pull request.
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          # Fail the check on high or critical advisories. Moderate and low are reported
+          # in the summary but do not block, to keep the gate actionable.
+          fail-on-severity: high
+          # Surface licence changes for human review rather than failing on them, since
+          # this repository vendors third-party code under mixed terms.
+          comment-summary-in-pr: on-failure
